@@ -30,7 +30,17 @@ REGION_P3 = [0.094, 0.128, 0.836, 0.24]
 
 # some PDFs like I3KG712/2-2-25.pdf have a blank page that should be kept (with frame, marginalia, etc.)
 
+BL = {
+    "W3KG218/W3KG218-I3KG749/2-40-7.pdf": 200, 
+    "W3KG218/W3KG218-I3KG749/2-40-8.pdf": 200, 
+    "W3KG218/W3KG218-I3KG749/2-40-9.pdf": 148, 
+    "W3KG218/W3KG218-I3KG785/4-6-1.pdf": 468
+}
+
 def get_total_nb_blank(pdf_file_name):
+    if pdf_file_name in BL:
+        print("ok!")
+        return BL[pdf_file_name], 0
     # get the total number of pages and the number of blank pages
     stats = {
         "unhandled_fonts": {},
@@ -90,21 +100,8 @@ def list_all_blank_pages(base_directory='W3KG218/'):
         for pdf_file in pdf_files:
             # Full path to the PDF
             pdf_path = os.path.join(full_subdir_path, pdf_file)
-            
-            # Count total pages and blank pages
             total_pages, blank_pages = get_total_nb_blank(pdf_path)
-            
-            cur_jpg_idx += total_pages - blank_pages
-            for i in range(blank_pages):
-                cur_jpg_idx += 1
-                blank_page_jpegs.append("%s/%s%04d.jpg" % (subdir, ilname, cur_jpg_idx))
-        break
-    
-    return blank_page_jpegs
+            print("%s/%s,%d,%d" % (subdir, pdf_file, total_pages, blank_pages))
 
 # Example usage
 blank_pages = list_all_blank_pages()
-print("Blank Page JPEGs:")
-for page in blank_pages:
-    print(page)
-
