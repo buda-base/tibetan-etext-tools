@@ -1,0 +1,7 @@
+Title = དཔེ་རྒྱུན་གཉིས་པ།
+Text_type = གླེགས་བམ།
+Author = མཁན་པོ།
+Publisher = Test Publisher
+Id = VOL2
+#div1 ལེའུ་གཉིས་པ།
+བྱང་ཆུབ་སེམས་དཔའ་རྣམས་ལ་ཕྱག་འཚལ་ལོ།
