@@ -1,6 +1,6 @@
 # NDL Text to TEI XML Converter
 
-This script converts Tibetan text files from the National Diet Library (NDL) format into TEI XML format and generates CSV outlines of the document structure.
+This script converts Tibetan text files from the Nitartha Digital Library (NDL) format into TEI XML format and generates CSV outlines of the document structure.
 
 ## Overview
 

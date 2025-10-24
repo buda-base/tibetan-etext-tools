@@ -8,12 +8,7 @@ import hashlib
 import re
 from pathlib import Path
 from xml.etree import ElementTree as ET
-
-
-def normalize_unicode(s):
-    """Normalize Unicode string (stub for actual implementation)."""
-    return s
-
+from normalization import normalize_unicode
 
 def parse_txt_file(txt_path):
     """Parse txt file and extract metadata and content sections."""
@@ -183,8 +178,8 @@ def create_xml(metadata, divisions, ve_lname, file_id, ie_lname, ut_lname, sha25
             # Create milestone and div for level 1
             milestone = ET.SubElement(body, f'{{{TEI_NS}}}milestone')
             milestone.set(f'{{{XML_NS}}}id', div_id)
+            milestone.set('unit', "section")
             current_div1 = ET.SubElement(body, f'{{{TEI_NS}}}div')
-            current_div1.set(f'{{{XML_NS}}}space', 'preserve')
             
             # Add head
             head = ET.SubElement(current_div1, f'{{{TEI_NS}}}head')
@@ -203,6 +198,7 @@ def create_xml(metadata, divisions, ve_lname, file_id, ie_lname, ut_lname, sha25
             if current_div1 is not None:
                 milestone = ET.SubElement(current_div1, f'{{{TEI_NS}}}milestone')
                 milestone.set(f'{{{XML_NS}}}id', div_id)
+                milestone.set('unit', "section")
                 current_div2 = ET.SubElement(current_div1, f'{{{TEI_NS}}}div')
                 
                 # Add head
@@ -221,6 +217,7 @@ def create_xml(metadata, divisions, ve_lname, file_id, ie_lname, ut_lname, sha25
             if parent is not None:
                 milestone = ET.SubElement(parent, f'{{{TEI_NS}}}milestone')
                 milestone.set(f'{{{XML_NS}}}id', div_id)
+                milestone.set('unit', "section")
                 sub_div = ET.SubElement(parent, f'{{{TEI_NS}}}div')
                 
                 # Add head
@@ -403,28 +400,35 @@ def process_ie_folder(input_folder, output_folder, ie_lname):
     
     # Generate CSV
     if ie_csv_data:
-        csv_output_path = ie_output_path / f"{ie_lname}.csv"
+        csv_output_path = Path(output_folder) / f"{ie_lname}.csv"
         generate_csv(ie_csv_data, csv_output_path)
         print(f"Generated CSV: {csv_output_path}")
 
 
 def main():
     """Main entry point."""
-    if len(sys.argv) < 4:
-        print("Usage: convert_ndl.py <input_folder> <output_folder> <ie_lname>")
-        print("Example: convert_ndl.py ./input ./output IE001")
+    if len(sys.argv) < 3:
+        print("Usage: convert_ndl.py <input_folder> <output_folder>")
+        print("Example: convert_ndl.py ./input ./output")
         sys.exit(1)
     
     input_folder = sys.argv[1]
     output_folder = sys.argv[2]
-    ie_lname = sys.argv[3]
     
     if not os.path.exists(input_folder):
         print(f"Error: Input folder does not exist: {input_folder}")
         sys.exit(1)
     
-    process_ie_folder(input_folder, output_folder, ie_lname)
-    print(f"Conversion complete for {ie_lname}")
+    # Iterate through all subfolders of input_folder
+    for subfolder in sorted(os.listdir(input_folder)):
+        subfolder_path = os.path.join(input_folder, subfolder)
+        if os.path.isdir(subfolder_path):
+            ie_lname = subfolder
+            print(f"Processing IE folder: {ie_lname}")
+            process_ie_folder(input_folder, output_folder, ie_lname)
+            print(f"Conversion complete for {ie_lname}")
+    
+    print("All conversions complete.")
 
 
 if __name__ == '__main__':
