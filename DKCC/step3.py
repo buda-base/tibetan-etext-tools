@@ -6,8 +6,30 @@ Reads files from W3KG218-step2_fsmarkup and writes to W3KG218-step3_tei.
 
 import re
 import hashlib
+import csv
 from pathlib import Path
 from natsort import natsorted
+
+
+def load_blank_pages_csv(csv_path):
+    """
+    Load blank pages CSV and return a dictionary mapping file paths to number of type2 blank pages.
+    
+    CSV format: filename,total_pages,type2_blank_pages,pages_by_pdf
+    Returns: dict mapping filename -> number of type2 blank pages at end
+    """
+    blank_pages = {}
+    try:
+        with open(csv_path, 'r', encoding='utf-8') as f:
+            reader = csv.reader(f)
+            for row in reader:
+                if len(row) >= 3:
+                    filename = row[0]  # e.g., W3KG218-I3KG693/1-1-11.pdf
+                    type2_blank_count = int(row[2])  # number of type2 blank pages at end
+                    blank_pages[filename] = type2_blank_count
+    except FileNotFoundError:
+        print(f"Warning: blank_pages.csv not found at {csv_path}")
+    return blank_pages
 
 
 def compute_sha256(file_path):
@@ -27,6 +49,89 @@ def escape_xml(text):
     text = text.replace('&', '&amp;')
     text = text.replace('<', '&lt;')
     text = text.replace('>', '&gt;')
+    return text
+
+
+def is_page_blank(page_content):
+    """
+    Check if a page is blank (contains only whitespace and markup tags).
+    A blank page should have no actual text content.
+    """
+    # Remove all markup tags and whitespace
+    cleaned = re.sub(r'<[^>]+>', '', page_content)
+    cleaned = cleaned.strip()
+    return len(cleaned) == 0
+
+
+def remove_trailing_pages(text, num_pages_to_remove, filename):
+    """
+    Remove a specified number of pages from the end of the text.
+    Returns the modified text and a list of errors if any non-blank pages were removed.
+    
+    Args:
+        text: The text content with ZZZZ page markers
+        num_pages_to_remove: Number of pages to remove from the end
+        filename: Name of the file being processed (for error messages)
+    
+    Returns:
+        (modified_text, errors) tuple
+    """
+    if num_pages_to_remove == 0:
+        return text, []
+    
+    errors = []
+    
+    # Split text by ZZZZ to get pages
+    pages = text.split('ZZZZ')
+    
+    if len(pages) <= num_pages_to_remove:
+        errors.append(f"ERROR: {filename} - Cannot remove {num_pages_to_remove} pages, file only has {len(pages)} pages")
+        return text, errors
+    
+    # Check if the pages to be removed are blank
+    pages_to_remove = pages[-num_pages_to_remove:]
+    for i, page in enumerate(pages_to_remove):
+        page_num = len(pages) - num_pages_to_remove + i
+        if not is_page_blank(page):
+            errors.append(f"ERROR: {filename} - Page {page_num} (to be removed) is not blank: {page[:100]}")
+    
+    # Remove the pages
+    pages = pages[:-num_pages_to_remove]
+    
+    # Rejoin with ZZZZ
+    modified_text = 'ZZZZ'.join(pages)
+    
+    return modified_text, errors
+
+
+def clean_empty_markup_lines(text):
+    """
+    Remove lines and pages that only contain font size markers (no actual content).
+    
+    This handles cases like:
+    - <hi rend="small"><lb/><lb/></hi> -> should be removed
+    - Pages with only <hi rend="small"></hi> or similar -> should be removed
+    
+    The goal is to remove <lb/> tags that appear inside <hi> tags when there's no actual text.
+    """
+    # Remove <lb/> tags that are inside <hi> tags with no actual text content
+    # Pattern: <hi rend="...">content</hi> where content is only <lb/> tags and whitespace
+    def clean_hi_tag(match):
+        rend = match.group(1)
+        content = match.group(2)
+        # Check if content only contains <lb/>, whitespace, and newlines
+        cleaned_content = re.sub(r'<lb/>|\s|\n', '', content)
+        if not cleaned_content:
+            # Content is empty, remove the entire <hi> tag
+            return ''
+        # Keep the tag as is
+        return match.group(0)
+    
+    text = re.sub(r'<hi rend="([^"]+)">(.*?)</hi>', clean_hi_tag, text, flags=re.DOTALL)
+    
+    # Remove multiple consecutive newlines that may have been created
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    
     return text
 
 
@@ -103,6 +208,28 @@ def convert_markup_to_tei(text):
     text = text.replace('</large>', '</hi>')
     text = text.replace('</small>', '</hi>')
     
+    # Clean up empty markup lines (lines/pages with only font markers)
+    text = clean_empty_markup_lines(text)
+    
+    # Remove ALL <lb/> tags before closing </hi> tags (with or without whitespace/newlines)
+    text = re.sub(r'(<lb/>[\s\n]*)+</hi>', r'</hi>', text)
+    
+    # Remove spurious <lb/> right before <pb/> tags (if any remain)
+    text = re.sub(r'<lb/>[\s\n]*<pb', r'<pb', text)
+    
+    # Transform \n</hi> into </hi>\n (move newlines after closing tags)
+    text = re.sub(r'\n(</hi>)', r'\1\n', text)
+    
+    # Transform <hi rend="...">\n<lb/> into \n<lb/><hi rend="...">
+    # This moves opening <hi> tags after <lb/> tags
+    text = re.sub(r'(<hi rend="[^"]+">)\n<lb/>', r'\n<lb/>\1', text)
+    
+    # Remove all spaces after <lb/> tags
+    text = re.sub(r'<lb/> +', r'<lb/>', text)
+    
+    # Clean up any double newlines that may have been created
+    text = re.sub(r'\n\n+', r'\n', text)
+    
     return text
 
 
@@ -166,12 +293,35 @@ def get_ut_id(ve_id, file_position):
     return f"UT{ve_id[2:]}_{file_position:04d}"
 
 
-def process_file(txt_file, output_file, pdf_file, folder_name, file_position):
-    """Process a single file and convert to TEI XML."""
+def process_file(txt_file, output_file, pdf_file, folder_name, file_position, blank_pages_dict):
+    """
+    Process a single file and convert to TEI XML.
+    
+    Args:
+        txt_file: Path to input txt file
+        output_file: Path to output XML file
+        pdf_file: Path to PDF file (for SHA256)
+        folder_name: Folder name
+        file_position: Position in file list
+        blank_pages_dict: Dictionary mapping PDF filenames to number of type2 blank pages
+    
+    Returns:
+        List of errors encountered during processing
+    """
+    errors = []
     
     # Read input file
     with open(txt_file, 'r', encoding='utf-8') as f:
         text = f.read()
+    
+    # Check if this file has type2 blank pages to remove
+    pdf_filename = f"{folder_name}/{txt_file.stem}.pdf"
+    num_pages_to_remove = blank_pages_dict.get(pdf_filename, 0)
+    
+    # Remove trailing pages if needed
+    if num_pages_to_remove > 0:
+        text, removal_errors = remove_trailing_pages(text, num_pages_to_remove, txt_file.name)
+        errors.extend(removal_errors)
     
     # Convert markup
     text = convert_markup_to_tei(text)
@@ -196,11 +346,14 @@ def process_file(txt_file, output_file, pdf_file, folder_name, file_position):
     output_file.parent.mkdir(parents=True, exist_ok=True)
     with open(output_file, 'w', encoding='utf-8') as f:
         f.write(tei_doc)
+    
+    return errors
 
 
 def process_files(input_dir='../W3KG218-step2_fsmarkup',
                   output_dir='../W3KG218-step3_tei',
-                  pdf_dir='../W3KG218'):
+                  pdf_dir='../W3KG218',
+                  blank_pages_csv='blank_pages.csv'):
     """Process all files and convert to TEI XML."""
     
     input_path = Path(input_dir)
@@ -210,6 +363,11 @@ def process_files(input_dir='../W3KG218-step2_fsmarkup',
     if not input_path.exists():
         print(f"Error: Input directory not found: {input_dir}")
         return
+    
+    # Load blank pages CSV
+    print(f"Loading blank pages CSV from {blank_pages_csv}...")
+    blank_pages_dict = load_blank_pages_csv(blank_pages_csv)
+    print(f"Loaded {len(blank_pages_dict)} entries from blank_pages.csv")
     
     # Create output directory
     output_path.mkdir(exist_ok=True)
@@ -221,6 +379,7 @@ def process_files(input_dir='../W3KG218-step2_fsmarkup',
     
     total_processed = 0
     total_errors = 0
+    all_removal_errors = []
     
     for folder in folders:
         folder_name = folder.name
@@ -250,7 +409,12 @@ def process_files(input_dir='../W3KG218-step2_fsmarkup',
                 output_file = output_path / output_folder_name / f"{ut_id}.xml"
                 
                 # Process file
-                process_file(txt_file, output_file, pdf_file, folder_name, idx)
+                file_errors = process_file(txt_file, output_file, pdf_file, folder_name, idx, blank_pages_dict)
+                
+                if file_errors:
+                    all_removal_errors.extend(file_errors)
+                    for error in file_errors:
+                        print(f"  {error}")
                 
                 processed += 1
                 
@@ -267,6 +431,11 @@ def process_files(input_dir='../W3KG218-step2_fsmarkup',
     print(f"Processing complete!")
     print(f"Total processed: {total_processed} files")
     print(f"Total errors: {total_errors} files")
+    print(f"Total page removal errors: {len(all_removal_errors)}")
+    if all_removal_errors:
+        print(f"\nPage removal errors:")
+        for error in all_removal_errors:
+            print(f"  {error}")
     print(f"Output directory: {output_path}")
     print(f"{'='*60}")
 
