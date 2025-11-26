@@ -135,7 +135,7 @@ def clean_empty_markup_lines(text):
     return text
 
 
-def convert_markup_to_tei(text):
+def convert_markup_to_tei(text, start_page_num=1):
     """
     Convert markup to TEI format.
     
@@ -144,9 +144,16 @@ def convert_markup_to_tei(text):
     - Line breaks -> <lb/>
     - ZZZZ -> <pb n="X"/>
     - First line break + ZZZZ is ignored (conversion artifact)
-    - First page starts with <pb n="1"/>
+    - First page starts with the provided start_page_num
     - No <lb/> before <pb/>
     - No <lb/> on empty pages
+    
+    Args:
+        text: Input text with markup
+        start_page_num: Starting page number for this file (default 1)
+    
+    Returns:
+        Converted text with TEI markup
     """
     # Remove the first line break + ZZZZ if present (conversion artifact)
     if text.startswith('\nZZZZ\n'):
@@ -156,8 +163,9 @@ def convert_markup_to_tei(text):
     elif text.startswith('\nZZZZ'):
         text = text[5:]  # Remove '\nZZZZ'
     
-    # Track page numbers
-    page_num = 1
+    # Track page numbers starting from the provided start_page_num
+    # The first page starts at start_page_num, and each ZZZZ marks the start of the next page
+    page_num = start_page_num + 1
     
     # Replace ZZZZ with a placeholder that includes page number
     def replace_page_break(match):
@@ -169,8 +177,8 @@ def convert_markup_to_tei(text):
     # Replace ZZZZ with placeholders
     text = re.sub(r'ZZZZ', replace_page_break, text)
     
-    # Add first page break at the beginning
-    text = '<<<PB0>>>\n' + text
+    # Add first page break at the beginning with the starting page number
+    text = f'<pb n="{start_page_num}"/>\n' + text
     
     # Replace line breaks with <lb/>
     # Each newline becomes <lb/> at the start of the new line
@@ -185,13 +193,8 @@ def convert_markup_to_tei(text):
     text = ''.join(result)
     
     # Replace page break placeholders with actual <pb/> tags
+    # No need to renumber since we're using the correct page numbers from the start
     text = re.sub(r'<<<PB(\d+)>>>', r'<pb n="\1"/>', text)
-    
-    # Fix page numbering (we added PB0, now renumber starting from 1)
-    def renumber_pages(match):
-        old_num = int(match.group(1))
-        return f'<pb n="{old_num + 1}"/>'
-    text = re.sub(r'<pb n="(\d+)"/>', renumber_pages, text)
     
     # Remove <lb/> before <pb/>
     text = re.sub(r'\n<lb/>\s*(?=<pb)', r'\n', text)
@@ -293,7 +296,15 @@ def get_ut_id(ve_id, file_position):
     return f"UT{ve_id[2:]}_{file_position:04d}"
 
 
-def process_file(txt_file, output_file, pdf_file, folder_name, file_position, blank_pages_dict):
+def count_pb_tags(text):
+    """
+    Count the number of <pb/> tags in the converted TEI text.
+    This gives us the actual number of pages in the output.
+    """
+    return text.count('<pb n=')
+
+
+def process_file(txt_file, output_file, pdf_file, folder_name, file_position, blank_pages_dict, start_page_num):
     """
     Process a single file and convert to TEI XML.
     
@@ -304,9 +315,10 @@ def process_file(txt_file, output_file, pdf_file, folder_name, file_position, bl
         folder_name: Folder name
         file_position: Position in file list
         blank_pages_dict: Dictionary mapping PDF filenames to number of type2 blank pages
+        start_page_num: Starting page number for this file in the volume
     
     Returns:
-        List of errors encountered during processing
+        Tuple of (errors, num_pages) where num_pages is the count of pages in this file (excluding type2 blanks)
     """
     errors = []
     
@@ -323,8 +335,12 @@ def process_file(txt_file, output_file, pdf_file, folder_name, file_position, bl
         text, removal_errors = remove_trailing_pages(text, num_pages_to_remove, txt_file.name)
         errors.extend(removal_errors)
     
-    # Convert markup
-    text = convert_markup_to_tei(text)
+    # Convert markup with the correct starting page number
+    text = convert_markup_to_tei(text, start_page_num)
+    
+    # Count the actual number of <pb/> tags in the output
+    # This is the accurate count of pages in this file
+    num_pages = count_pb_tags(text)
     
     # Generate TEI header
     tei_header = generate_tei_header(txt_file, pdf_file, folder_name, file_position)
@@ -347,13 +363,13 @@ def process_file(txt_file, output_file, pdf_file, folder_name, file_position, bl
     with open(output_file, 'w', encoding='utf-8') as f:
         f.write(tei_doc)
     
-    return errors
+    return errors, num_pages
 
 
-def process_files(input_dir='../W3KG218-step2_fsmarkup',
-                  output_dir='../W3KG218-step3_tei',
-                  pdf_dir='../W3KG218',
-                  blank_pages_csv='blank_pages.csv'):
+def process_files(input_dir='W3KG218-step2_fsmarkup',
+                  output_dir='W3KG218-step3_tei',
+                  pdf_dir='W3KG218',
+                  blank_pages_csv='DKCC/blank_pages.csv'):
     """Process all files and convert to TEI XML."""
     
     input_path = Path(input_dir)
@@ -381,7 +397,7 @@ def process_files(input_dir='../W3KG218-step2_fsmarkup',
     total_errors = 0
     all_removal_errors = []
     
-    for folder in folders:
+    for folder_idx, folder in enumerate(folders):
         folder_name = folder.name
         print(f"\nProcessing folder: {folder_name}")
         
@@ -396,6 +412,19 @@ def process_files(input_dir='../W3KG218-step2_fsmarkup',
         ve_id = get_ve_id_from_folder(folder_name)
         output_folder_name = f"IE3KG218-{ve_id}"
         
+        # Determine starting page number for this volume
+        # Volume number is based on folder order (alphabetically sorted)
+        # folder_idx 0 = volume 1, folder_idx 1 = volume 2, etc.
+        volume_num = folder_idx + 1
+        
+        # Volume 1 starts at page 6, all others start at page 4
+        if volume_num == 1:
+            current_page_num = 6
+        else:
+            current_page_num = 4
+        
+        print(f"  Volume {volume_num}, starting pagination at page {current_page_num}")
+        
         processed = 0
         errors = 0
         
@@ -408,8 +437,14 @@ def process_files(input_dir='../W3KG218-step2_fsmarkup',
                 ut_id = get_ut_id(ve_id, idx)
                 output_file = output_path / output_folder_name / f"{ut_id}.xml"
                 
-                # Process file
-                file_errors = process_file(txt_file, output_file, pdf_file, folder_name, idx, blank_pages_dict)
+                # Process file with current page number
+                file_errors, num_pages = process_file(
+                    txt_file, output_file, pdf_file, folder_name, idx, 
+                    blank_pages_dict, current_page_num
+                )
+                
+                # Update page number for next file
+                current_page_num += num_pages
                 
                 if file_errors:
                     all_removal_errors.extend(file_errors)
@@ -423,6 +458,7 @@ def process_files(input_dir='../W3KG218-step2_fsmarkup',
                 errors += 1
         
         print(f"  Processed: {processed} files, Errors: {errors}")
+        print(f"  Final page number: {current_page_num - 1}")
         total_processed += processed
         total_errors += errors
     
