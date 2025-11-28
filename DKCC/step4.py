@@ -15,9 +15,35 @@ Creates:
 This script copies files without regenerating them.
 """
 
+import re
 import shutil
 from pathlib import Path
 from natsort import natsorted
+
+
+def remove_pb_n_attributes(xml_content):
+    """
+    Remove all n attributes from <pb/> tags using string substitutions.
+    
+    Handles variations like:
+    - <pb n="123"/>
+    - <pb n='123'/>
+    - <pb n="123" />
+    - <pb n='123' />
+    
+    Args:
+        xml_content: XML file content as string
+    
+    Returns:
+        Modified XML content with n attributes removed from <pb/> tags
+    """
+    # Pattern to match <pb n="..." /> or <pb n='...' /> and replace with <pb/>
+    # Handles both double and single quotes, and optional whitespace before />
+    pattern = r'<pb\s+n=["\'][^"\']*["\']\s*/>'
+    replacement = r'<pb/>'
+    modified_content = re.sub(pattern, replacement, xml_content)
+    
+    return modified_content
 
 
 def copy_archive_files(tei_dir, archive_dir):
@@ -25,6 +51,7 @@ def copy_archive_files(tei_dir, archive_dir):
     Copy TEI XML files from W3KG218-step3_tei to IE3KG218/archive.
     
     Strips the 'IE3KG218-' prefix from folder names.
+    Removes all n attributes from <pb/> tags in the XML files.
     E.g., W3KG218-step3_tei/IE3KG218-VE1ER12/ -> IE3KG218/archive/VE1ER12/
     
     Args:
@@ -53,11 +80,22 @@ def copy_archive_files(tei_dir, archive_dir):
         dest_folder = archive_dir / ve_name
         dest_folder.mkdir(parents=True, exist_ok=True)
         
-        # Copy all XML files
+        # Copy all XML files, removing n attributes from <pb/> tags
         xml_files = list(folder.glob('*.xml'))
         for xml_file in xml_files:
             dest_file = dest_folder / xml_file.name
-            shutil.copy2(xml_file, dest_file)
+            
+            # Read XML file, remove pb n attributes, and write to destination
+            with open(xml_file, 'r', encoding='utf-8') as f:
+                content = f.read()
+            
+            # Remove n attributes from <pb/> tags
+            modified_content = remove_pb_n_attributes(content)
+            
+            # Write modified content to destination
+            with open(dest_file, 'w', encoding='utf-8') as f:
+                f.write(modified_content)
+            
             files_copied += 1
         
         folders_processed += 1
@@ -167,4 +205,7 @@ def organize_files(tei_dir='W3KG218-step3_tei',
 
 if __name__ == "__main__":
     organize_files()
+
+
+
 

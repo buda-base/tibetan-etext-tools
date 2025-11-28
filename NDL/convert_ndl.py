@@ -10,10 +10,60 @@ from pathlib import Path
 from xml.etree import ElementTree as ET
 from normalization import normalize_unicode
 
+
+def preprocess_div_markers(content):
+    """Ensure #div markers start at the beginning of lines."""
+    processed_lines = []
+    
+    for raw_line in content.split('\n'):
+        # Preserve exact blank lines
+        if raw_line == '':
+            processed_lines.append('')
+            continue
+        
+        line = raw_line
+        stripped = line.lstrip()
+        if stripped.startswith('#div'):
+            line = stripped
+        else:
+            line = raw_line
+        
+        segments = []
+        remaining = line
+        
+        while remaining:
+            idx = remaining.find('#div')
+            if idx == -1:
+                segments.append(remaining)
+                break
+            
+            if idx > 0:
+                before = remaining[:idx]
+                if before.strip():
+                    segments.append(before.rstrip())
+                remaining = remaining[idx:]
+                continue
+            
+            # idx == 0, isolate this #div block until the next occurrence
+            next_idx = remaining.find('#div', len('#div'))
+            if next_idx == -1:
+                segments.append(remaining)
+                remaining = ''
+            else:
+                segments.append(remaining[:next_idx].rstrip())
+                remaining = remaining[next_idx:]
+        
+        processed_lines.extend(segments if segments else [''])
+    
+    return '\n'.join(processed_lines)
+
+
 def parse_txt_file(txt_path):
     """Parse txt file and extract metadata and content sections."""
     with open(txt_path, 'r', encoding='utf-8') as f:
         content = f.read()
+    
+    content = preprocess_div_markers(content)
     
     lines = content.split('\n')
     metadata = {}
@@ -265,6 +315,14 @@ def collect_divisions_for_csv(divisions, volume_number):
             for j in range(i + 1, len(divisions)):
                 next_global_counter += 1
                 if divisions[j]['level'] == 1:
+                    end_id = f"1#div{divisions[j]['level']}_{next_global_counter:04d}"
+                    break
+        elif level == 2:
+            # Find next div1 or div2
+            next_global_counter = global_counter
+            for j in range(i + 1, len(divisions)):
+                next_global_counter += 1
+                if divisions[j]['level'] <= 2:
                     end_id = f"1#div{divisions[j]['level']}_{next_global_counter:04d}"
                     break
         

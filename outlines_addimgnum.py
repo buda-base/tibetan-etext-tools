@@ -91,8 +91,8 @@ def process_files(blank_pages_file, output_file):
                 new_row['imgnum_end'] = img_range[1]
                 result_rows.append(new_row)
         else:
-            print("complex case for %s" % subfolder)
-            print(volumes_data[subfolder])
+            print("complex case for %d %s " % (volnum, subfolder))
+            #print(volumes_data[subfolder])
             # Complex case: use page numbers
             for i, row in enumerate(subfolder_rows):
                 new_row = row.copy()

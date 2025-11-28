@@ -28,6 +28,51 @@ _UNICODE_SPACES = [
 _SPACE_TO_ASCII = {ord(ch): " " for ch in _UNICODE_SPACES}
 
 
+def normalize_spaces(
+    text: str,
+    collapse_internal_spaces: bool = True,
+    tibetan_specific: bool = True,
+) -> str:
+    """
+    Normalize spaces in text.
+
+    Steps:
+      1. Collapse multiple newlines to one.
+      2. Remove spaces next to newlines.
+      3. Collapse multiple spaces to one.
+      4. Apply Tibetan-specific space normalization rules.
+
+    Tibetan-specific rules:
+      - Remove space after tsheg (U+0F0B, U+0F0C, U+0FD2) if followed by
+        initial letter (U+0F40-U+0F6C) or shad (U+0F0D-U+0F11)
+      - Remove space between final letter (U+0F40-U+0FBC) and tsheg
+    """
+    if not text:
+        return ""
+
+    s = text
+
+    # 1) Collapse multiple newlines
+    s = re.sub(r"\n{2,}", "\n", s)
+
+    # 2) Remove spaces next to newlines
+    s = re.sub(r"[ ]+\n", "\n", s)
+    s = re.sub(r"\n[ ]+", "\n", s)
+
+    # 3) Collapse space runs
+    if collapse_internal_spaces:
+        s = re.sub(r" {2,}", " ", s)
+
+    # 4) Tibetan-specific space normalization
+    if tibetan_specific:
+        # Remove space after tsheg if followed by initial letter or shad
+        s = re.sub(r"([\u0f0b\u0f0c\u0fd2]) +([\u0f40-\u0f6c\u0f0d-\u0f11])", r"\1\2", s)
+        # Remove space between final letter and tsheg
+        s = re.sub(r"([\u0f40-\u0fbc]) +([\u0f0b\u0f0c\u0fd2])", r"\1\2", s)
+
+    return s
+
+
 def normalize_unicode(
     text: str,
     strip_control: bool = True,
@@ -42,9 +87,8 @@ def normalize_unicode(
       3. Remove zero-width / invisible characters (incl. all BOMs).
       4. Map Unicode spaces and tabs to plain ASCII space.
       5. Optionally remove control characters (except newline).
-      6. Collapse multiple spaces to one.
-      7. Collapse multiple newlines to one.
-      8. Trim spaces around line breaks and at the ends.
+      6. Normalize spaces (including Tibetan-specific rules).
+      7. Apply Tibetan Unicode normalization.
 
     Keeps ZWJ/ZWNJ (joiners) intact.
     """
@@ -70,17 +114,10 @@ def normalize_unicode(
             if ch == "\n" or (unicodedata.category(ch)[0] != "C")
         )
 
-    # 6) Collapse multiple newlines
-    s = re.sub(r"\n{2,}", "\n", s)
+    # 6) Normalize spaces
+    s = normalize_spaces(s, collapse_internal_spaces=collapse_internal_spaces)
 
-    # 7) Remove spaces next to newlines
-    s = re.sub(r"[ ]+\n", "\n", s)
-    s = re.sub(r"\n[ ]+", "\n", s)
-
-    # 8) Collapse space runs
-    if collapse_internal_spaces:
-        s = re.sub(r" {2,}", " ", s)
-
+    # 7) Tibetan Unicode normalization
     s = normalize_unicode_tib(s)
     # no graphical distinction between 0f0b and 0f0c
     s = s.replace("\u0f0c", "\u0f0b")

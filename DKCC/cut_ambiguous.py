@@ -17,9 +17,13 @@ from collections import defaultdict
 
 
 def get_ve_id_from_folder(folder_name):
-    """Extract VE ID from folder name (e.g., W3KG218-I3KG693 -> VE3KG693)."""
-    ve_id = folder_name.split('-')[1]  # I3KG693
-    return 'VE' + ve_id[1:]  # VE3KG693
+    """Extract VE ID from folder name (e.g., W3KG218-I3KG693 -> VE1ER13)."""
+    i_id = folder_name.split('-')[1]  # I3KG693
+    # Extract the numeric suffix (e.g., 693 from I3KG693)
+    num = int(i_id[4:])  # 693
+    # Convert to VE1ER format (subtract 680)
+    ve_num = num - 680  # 693 - 680 = 13
+    return f'VE1ER{ve_num}'  # VE1ER13
 
 
 def build_page_index(tei_dir):
