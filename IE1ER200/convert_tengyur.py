@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 """
-Convert Derge Kangyur (IE1ER199) text files to TEI XML.
+Convert Derge Tengyur (IE1ER200) text files to TEI XML.
 
-Usage: convert_derge.py <input_folder> <output_folder>
+Usage: convert_tengyur.py <input_folder> <output_folder>
 
 Input folder should contain:
-  - sources/text/*.txt files with [page], [page.line] markers
-  - toprocess/IE1ER199-VE*/ folders (VE identifiers from BDRC)
+  - sources/*.txt files with [page], [page.line] markers
+  - toprocess/IE1ER200-VE*/ folders (VE identifiers from BDRC)
 
 Output folder will contain:
   - archive/{ve_id}/{ut_id}.xml (TEI XML)
   - sources/{ve_id}/{filename}.txt (copied source files)
-  - IE1ER199.csv (outline)
+  - IE1ER200.csv (outline)
 """
 
 import os
@@ -35,7 +35,7 @@ def get_ve_ids_from_toprocess(toprocess_path: Path) -> list:
     """
     Get VE identifiers from the toprocess/ folder structure.
     
-    The toprocess folder contains subfolders named IE1ER199-VE1ER###
+    The toprocess folder contains subfolders named IE1ER200-VE1ER###
     Returns list of dicts with 've_id' and 'volume_number' keys.
     """
     volumes = []
@@ -43,14 +43,14 @@ def get_ve_ids_from_toprocess(toprocess_path: Path) -> list:
     if not toprocess_path.exists():
         return []
     
-    # Find all IE1ER199-VE* folders
+    # Find all IE1ER200-VE* folders
     ve_folders = sorted([
         d for d in toprocess_path.iterdir() 
-        if d.is_dir() and d.name.startswith('IE1ER199-VE')
+        if d.is_dir() and d.name.startswith('IE1ER200-VE')
     ])
     
     for i, folder in enumerate(ve_folders):
-        # Extract VE ID from folder name (e.g., IE1ER199-VE1ER148 -> VE1ER148)
+        # Extract VE ID from folder name (e.g., IE1ER200-VE1ER251 -> VE1ER251)
         ve_id = folder.name.split('-')[-1]
         volumes.append({
             've_id': ve_id,
@@ -85,7 +85,7 @@ def calculate_sha256(file_path: str) -> str:
 
 def parse_derge_file(file_path: str) -> dict:
     """
-    Parse a Derge Kangyur source file.
+    Parse a Derge Tengyur source file.
     
     Returns dict with:
       - 'pages': list of page dicts with 'page_num', 'lines' (list of line content)
@@ -422,20 +422,20 @@ def generate_csv_outline(all_milestones: list, output_path: str):
 # Main Conversion Logic
 # =============================================================================
 
-def convert_ie1er199(input_path: str, output_path: str):
+def convert_ie1er200(input_path: str, output_path: str):
     """
-    Main conversion function for IE1ER199 Derge Kangyur.
+    Main conversion function for IE1ER200 Derge Tengyur.
     
     Args:
-        input_path: Path to IE1ER199 folder containing sources/text/*.txt and toprocess/
-        output_path: Path where output folder will be created (e.g., ../IE1ER199/)
+        input_path: Path to IE1ER200 folder containing sources/*.txt and toprocess/
+        output_path: Path where output folder will be created (e.g., ../IE1ER200_output/)
     """
     input_path = Path(input_path)
     output_path = Path(output_path)
-    ie_id = 'IE1ER199'
+    ie_id = 'IE1ER200'
     
-    # Input paths
-    source_text_path = input_path / 'sources' / 'text'
+    # Input paths - sources are directly in sources/ for IE1ER200
+    source_path = input_path / 'sources'
     toprocess_path = input_path / 'toprocess'
     
     # Output paths
@@ -447,8 +447,11 @@ def convert_ie1er199(input_path: str, output_path: str):
     output_sources_path.mkdir(parents=True, exist_ok=True)
     output_archive_path.mkdir(parents=True, exist_ok=True)
     
-    # Get list of source files
-    source_files = sorted(source_text_path.glob('*.txt'))
+    # Get list of source files (excluding README.md)
+    source_files = sorted([
+        f for f in source_path.glob('*.txt')
+        if f.name != 'README.md'
+    ])
     num_volumes = len(source_files)
     
     print(f"Found {num_volumes} source files")
@@ -530,9 +533,8 @@ def convert_ie1er199(input_path: str, output_path: str):
     
     # Copy non-volume files from sources/ directory
     # README.md goes to sources root, other non-.txt files go to other_files/
-    sources_parent = input_path / 'sources'
-    if sources_parent.exists():
-        for f in sources_parent.iterdir():
+    if source_path.exists():
+        for f in source_path.iterdir():
             if f.is_file():
                 if f.name == 'README.md':
                     # Copy README.md to sources root
@@ -554,12 +556,12 @@ def convert_ie1er199(input_path: str, output_path: str):
 def main():
     """Main entry point."""
     if len(sys.argv) < 3:
-        print("Usage: convert_derge.py <input_folder> <output_folder>")
-        print("Example: convert_derge.py ./IE1ER199 ../output")
+        print("Usage: convert_tengyur.py <input_folder> <output_folder>")
+        print("Example: convert_tengyur.py ./IE1ER200 ../output")
         print()
         print("Input folder should contain:")
-        print("  - sources/text/*.txt (source text files)")
-        print("  - toprocess/IE1ER199-VE*/ (VE folders from BDRC)")
+        print("  - sources/*.txt (source text files)")
+        print("  - toprocess/IE1ER200-VE*/ (VE folders from BDRC)")
         sys.exit(1)
     
     input_path = Path(sys.argv[1])
@@ -573,8 +575,10 @@ def main():
     print(f"Output: {output_path}")
     print()
     
-    convert_ie1er199(str(input_path), str(output_path))
+    convert_ie1er200(str(input_path), str(output_path))
 
 
 if __name__ == '__main__':
     main()
+
+

@@ -334,3 +334,5 @@ def test_normalize_unicode():
 
 if __name__ == "__main__":
     test_normalize_unicode()
+
+
