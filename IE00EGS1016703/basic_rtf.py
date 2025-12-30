@@ -1,5 +1,4 @@
 import re
-import sys
 
 # AI generated code
 # 
@@ -12,39 +11,15 @@ class BasicRTF:
         self._streams = []
         self._raw_data = ""
         self._colors = []
-        self._show_progress = False
 
-    def _report_progress(self, current, total, message=""):
-        """Report parsing progress to stderr."""
-        if not self._show_progress:
-            return
-        percent = (current / total * 100) if total > 0 else 0
-        bar_len = 40
-        filled = int(bar_len * current / total) if total > 0 else 0
-        bar = '█' * filled + '░' * (bar_len - filled)
-        sys.stderr.write(f'\r  Parsing: [{bar}] {percent:5.1f}% {message}')
-        sys.stderr.flush()
-        if current >= total:
-            sys.stderr.write('\n')
-
-    def parse_file(self, file_path, show_progress=True):
-        """
-        Parse an RTF file.
-        
-        Args:
-            file_path: Path to the RTF file
-            show_progress: Whether to show progress bar (default: True)
-        """
+    def parse_file(self, file_path):
         self._fonts = []
         self._font_map = {}
         self._streams = []
         self._raw_data = ""
-        self._show_progress = show_progress
-        
         with open(file_path, encoding="utf-8", errors="ignore") as f:
             data = f.read()
         self._raw_data = data
-        data_len = len(data)
 
         font_id = 0
         font_size = 24  # default RTF size (half-points)
@@ -67,16 +42,7 @@ class BasicRTF:
             r'\pict': 'pict'
         }
 
-        # Progress tracking
-        progress_interval = max(1, data_len // 100)  # Update every 1%
-        last_progress = 0
-
         while i < len(data):
-            # Report progress periodically
-            if i - last_progress >= progress_interval:
-                self._report_progress(i, data_len)
-                last_progress = i
-            
             c = data[i]
             # Font table detection
             if data[i:i+9] == r'{\fonttbl':
@@ -218,8 +184,9 @@ class BasicRTF:
                 i += 1
                 char_start = i
             elif c == '\\':
-                # Handle \uN? unicode characters
-                m = re.match(r'\\u(-?\d+)\??', data[i:])
+                # Handle \uN unicode characters with fallback
+                # Fallback can be: single char (e.g. ?) or hex escape (e.g. \'ab)
+                m = re.match(r"\\u(-?\d+)(?:\\'[0-9a-fA-F]{2}|.)", data[i:])
                 if m:
                     codepoint = int(m.group(1))
                     # RTF \uN is always a 16-bit signed integer
@@ -284,10 +251,11 @@ class BasicRTF:
                     i += len(m.group(0))
                     char_start = i
                     continue
-                m = re.match(r'\\par', data[i:])
+                # Match \par only when NOT followed by more letters (avoid matching \pard, \pars, etc.)
+                m = re.match(r'\\par(?![a-zA-Z])', data[i:])
                 if m:
                     text += '\n'
-                    i += len(m.group(0))
+                    i += 4  # \par is always 4 chars
                     continue
                 # Updated: match unknown keywords as \[a-zA-Z0-9]+ (with optional space)
                 m = re.match(r'\\[a-zA-Z0-9]+\s?', data[i:])
@@ -310,9 +278,6 @@ class BasicRTF:
                 "char_start": char_start,
                 "char_end": char_end
             })
-        
-        # Final progress report
-        self._report_progress(data_len, data_len, f"Done! {len(self._streams)} streams")
 
     def get_streams(self):
         return self._streams
