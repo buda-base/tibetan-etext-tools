@@ -335,7 +335,9 @@ def convert_rtf_to_tei(rtf_path: Path, ve_id: str, ut_id: str, src_path: str) ->
     body_content = re.sub(r'\n\n+', '\n', body_content)
     
     # Convert newlines (from RTF \par) to <lb/> elements
-    body_content = body_content.replace('\n', '<lb/>\n')
+    # Put <lb/> at beginning of next line and remove surrounding spaces
+    body_content = body_content.replace('\n', '\n<lb/>')
+    body_content = re.sub(r' *<lb/> *', '\n<lb/>', body_content)
     body_content = body_content.strip()
     
     # Calculate SHA256 of RTF file (the source)
