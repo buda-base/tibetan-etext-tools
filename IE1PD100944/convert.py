@@ -55,35 +55,13 @@ from normalization import normalize_unicode, normalize_spaces
 import importlib.util
 import site
 
-def _import_char_converter():
-    """Import char_converter module directly."""
-    search_paths = []
-    try:
-        search_paths.extend(site.getsitepackages())
-    except AttributeError:
-        pass
-    try:
-        user_site = site.getusersitepackages()
-        if user_site:
-            search_paths.append(user_site)
-    except AttributeError:
-        pass
-    
-    for site_dir in search_paths:
-        if site_dir is None:
-            continue
-        char_converter_path = Path(site_dir) / "pytiblegenc" / "char_converter.py"
-        if char_converter_path.exists():
-            spec = importlib.util.spec_from_file_location("pytiblegenc_char_converter", str(char_converter_path))
-            module = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(module)
-            return module.convert_string
-    
-    raise ImportError("pytiblegenc.char_converter not found. Install with: pip install git+https://github.com/buda-base/py-tiblegenc.git")
-
-logger.info("Loading pytiblegenc char_converter...")
-convert_string = _import_char_converter()
-logger.info("char_converter loaded successfully")
+try:
+    from pytiblegenc import convert_string
+except ImportError as e:
+    raise ImportError(
+        "a new version of pytiblegenc is required. Install with:\n"
+        "  pip install -U git+https://github.com/buda-base/py-tiblegenc.git"
+    ) from e
 
 # =============================================================================
 # Configuration
