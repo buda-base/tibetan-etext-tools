@@ -11,6 +11,10 @@ import sys
 _RE_UNICODE = re.compile(r'\\u(-?\d+)\??')
 _RE_HEX_CHAR = re.compile(r"\\'([0-9a-fA-F]{2})")
 _RE_FONT_ID = re.compile(r'\\f(\d+)')
+
+_RE_AFONT = re.compile(r'\\af(\d+)')
+_RE_CHARSET = re.compile(r'\\(loch|hich|dbch)(?![a-zA-Z])')
+_RE_DIRCTX = re.compile(r'\\(ltrch|rtlch)(?![a-zA-Z])')
 _RE_FONT_SIZE = re.compile(r'\\fs(\d+)')
 _RE_PAR = re.compile(r'\\par(?![a-zA-Z])')  # Match \par but not \pard, \paragraph etc.
 _RE_CONTROL_WORD = re.compile(r'\\[a-zA-Z0-9]+\s?')
@@ -235,8 +239,17 @@ class BasicRTF:
         # Parse font table first with format-specific parser
         self._parse_font_table(data)
 
-        font_id = 0
+        # RTF font selection can come from \fN and also from \afN (ANSI/script font).
+        # Some documents (incl. this one) rely on \afN to select the active font for the text run.
         font_size = 24  # default RTF size (half-points)
+        charset = 'loch'   # loch/hich/dbch
+        dirctx = 'ltrch'   # ltrch/rtlch
+        eff = {
+            'ltrch': {'loch': 0, 'hich': 0, 'dbch': 0},
+            'rtlch': {'loch': 0, 'hich': 0, 'dbch': 0},
+        }
+        def get_fid():
+            return eff[dirctx][charset]
         stack = []
         text_parts = []  # Use list for O(1) appends
         i = 0
@@ -317,8 +330,8 @@ class BasicRTF:
                             self._streams.append({
                                 "text": block_text,
                                 "font": {
-                                    "id": font_id,
-                                    "name": self._font_map.get(font_id, {}).get("name", ""),
+                                    "id": get_fid(),
+                                    "name": self._font_map.get(get_fid(), {}).get("name", ""),
                                     "size": font_size // 2
                                 },
                                 "char_start": j,
@@ -351,7 +364,7 @@ class BasicRTF:
                 continue
 
             if c == '{':
-                stack.append((font_id, font_size))
+                stack.append((font_size, charset, dirctx, {k: v.copy() for k, v in eff.items()}))
                 i += 1
             elif c == '}':
                 if text_parts:
@@ -361,8 +374,8 @@ class BasicRTF:
                         self._streams.append({
                             "text": text,
                             "font": {
-                                "id": font_id,
-                                "name": self._font_map.get(font_id, {}).get("name", ""),
+                                "id": get_fid(),
+                                "name": self._font_map.get(get_fid(), {}).get("name", ""),
                                 "size": font_size // 2
                             },
                             "char_start": char_start,
@@ -370,7 +383,8 @@ class BasicRTF:
                         })
                     text_parts = []
                 if stack:
-                    font_id, font_size = stack.pop()
+                    font_size, charset, dirctx, eff_snapshot = stack.pop()
+                    eff = {k: v.copy() for k, v in eff_snapshot.items()}
                 i += 1
                 char_start = i
             elif c == '\\':
@@ -398,26 +412,213 @@ class BasicRTF:
                     continue
                 # Handle \{ and \} (escaped braces - literal { and } in text)
                 # IMPORTANT for Dedris fonts where } = སྔ (char 125)
-                if data.startswith(r'\{', i):
-                    text_parts.append('{')
-                    i += 2
-                    continue
-                if data.startswith(r'\}', i):
-                    text_parts.append('}')
-                    i += 2
-                    continue
-                # Handle \\ (escaped backslash)
-                if data.startswith(r'\\', i):
-                    text_parts.append('\\')
-                    i += 2
-                    continue
+                # Handle \{, \} and \\ (escaped control symbols).
+                # In some RTFs (incl. Word/LibreOffice "complex" output), immediate formatting controls
+                # like \hich\afN can appear *right after* the control symbol. LibreOffice applies that
+                # formatting to the emitted symbol; so we mimic that by looking ahead and consuming
+                # any immediate font/charset switches before emitting the symbol.
+                for sym, out_ch in ((r'\{', '{'), (r'\}', '}'), (r'\\', '\\')):
+                    if data.startswith(sym, i):
+                        j = i + 2
+                        saw_format = False
+
+                        # If formatting switches follow immediately, flush current run first so
+                        # the escaped symbol starts a new run under the new formatting.
+                        while True:
+                            m = _RE_DIRCTX.match(data, j)
+                            if m:
+                                if not saw_format and text_parts:
+                                    text = self._clean_text(''.join(text_parts))
+                                    if text.strip():
+                                        char_end = i
+                                        self._streams.append({
+                                            "text": text,
+                                            "font": {
+                                                "id": get_fid(),
+                                                "name": self._font_map.get(get_fid(), {}).get("name", ""),
+                                                "size": font_size // 2
+                                            },
+                                            "char_start": char_start,
+                                            "char_end": char_end
+                                        })
+                                    text_parts = []
+                                saw_format = True
+                                dirctx = m.group(1)
+                                j = m.end()
+                                continue
+
+                            m = _RE_CHARSET.match(data, j)
+                            if m:
+                                if not saw_format and text_parts:
+                                    text = self._clean_text(''.join(text_parts))
+                                    if text.strip():
+                                        char_end = i
+                                        self._streams.append({
+                                            "text": text,
+                                            "font": {
+                                                "id": get_fid(),
+                                                "name": self._font_map.get(get_fid(), {}).get("name", ""),
+                                                "size": font_size // 2
+                                            },
+                                            "char_start": char_start,
+                                            "char_end": char_end
+                                        })
+                                    text_parts = []
+                                saw_format = True
+                                charset = m.group(1)
+                                j = m.end()
+                                continue
+
+                            m = _RE_AFONT.match(data, j)
+                            if m:
+                                if not saw_format and text_parts:
+                                    text = self._clean_text(''.join(text_parts))
+                                    if text.strip():
+                                        char_end = i
+                                        self._streams.append({
+                                            "text": text,
+                                            "font": {
+                                                "id": get_fid(),
+                                                "name": self._font_map.get(get_fid(), {}).get("name", ""),
+                                                "size": font_size // 2
+                                            },
+                                            "char_start": char_start,
+                                            "char_end": char_end
+                                        })
+                                    text_parts = []
+                                saw_format = True
+                                eff[dirctx][charset] = int(m.group(1))
+                                j = m.end()
+                                continue
+
+                            m = _RE_FONT_ID.match(data, j)
+                            if m:
+                                if not saw_format and text_parts:
+                                    text = self._clean_text(''.join(text_parts))
+                                    if text.strip():
+                                        char_end = i
+                                        self._streams.append({
+                                            "text": text,
+                                            "font": {
+                                                "id": get_fid(),
+                                                "name": self._font_map.get(get_fid(), {}).get("name", ""),
+                                                "size": font_size // 2
+                                            },
+                                            "char_start": char_start,
+                                            "char_end": char_end
+                                        })
+                                    text_parts = []
+                                saw_format = True
+                                eff[dirctx][charset] = int(m.group(1))
+                                j = m.end()
+                                continue
+
+                            m = _RE_FONT_SIZE.match(data, j)
+                            if m:
+                                if not saw_format and text_parts:
+                                    text = self._clean_text(''.join(text_parts))
+                                    if text.strip():
+                                        char_end = i
+                                        self._streams.append({
+                                            "text": text,
+                                            "font": {
+                                                "id": get_fid(),
+                                                "name": self._font_map.get(get_fid(), {}).get("name", ""),
+                                                "size": font_size // 2
+                                            },
+                                            "char_start": char_start,
+                                            "char_end": char_end
+                                        })
+                                    text_parts = []
+                                saw_format = True
+                                font_size = int(m.group(1))
+                                j = m.end()
+                                continue
+
+                            break
+
+                        if saw_format:
+                            char_start = i  # new run starts at the escaped symbol
+
+                        text_parts.append(out_ch)
+                        i = j
+                        continue
                 # Handle \'hh (hex character)
                 m = _RE_HEX_CHAR.match(data, i)
                 if m:
                     text_parts.append(bytes.fromhex(m.group(1)).decode('latin1'))
                     i = m.end()
                     continue
-                # Font ID
+                # Direction context (Word often emits {\rtlch ... \ltrch ...} blocks)
+                m = _RE_DIRCTX.match(data, i)
+                if m:
+                    if text_parts:
+                        text = self._clean_text(''.join(text_parts))
+                        if text.strip():
+                            char_end = i
+                            self._streams.append({
+                                "text": text,
+                                "font": {
+                                    "id": get_fid(),
+                                    "name": self._font_map.get(get_fid(), {}).get("name", ""),
+                                    "size": font_size // 2
+                                },
+                                "char_start": char_start,
+                                "char_end": char_end
+                            })
+                        text_parts = []
+                    dirctx = m.group(1)
+                    i = m.end()
+                    char_start = i
+                    continue
+
+                # Charset selection (low/high/DBCS)
+                m = _RE_CHARSET.match(data, i)
+                if m:
+                    if text_parts:
+                        text = self._clean_text(''.join(text_parts))
+                        if text.strip():
+                            char_end = i
+                            self._streams.append({
+                                "text": text,
+                                "font": {
+                                    "id": get_fid(),
+                                    "name": self._font_map.get(get_fid(), {}).get("name", ""),
+                                    "size": font_size // 2
+                                },
+                                "char_start": char_start,
+                                "char_end": char_end
+                            })
+                        text_parts = []
+                    charset = m.group(1)
+                    i = m.end()
+                    char_start = i
+                    continue
+
+                # ANSI/script font (often the one that matters for text runs)
+                m = _RE_AFONT.match(data, i)
+                if m:
+                    if text_parts:
+                        text = self._clean_text(''.join(text_parts))
+                        if text.strip():
+                            char_end = i
+                            self._streams.append({
+                                "text": text,
+                                "font": {
+                                    "id": get_fid(),
+                                    "name": self._font_map.get(get_fid(), {}).get("name", ""),
+                                    "size": font_size // 2
+                                },
+                                "char_start": char_start,
+                                "char_end": char_end
+                            })
+                        text_parts = []
+                    eff[dirctx][charset] = int(m.group(1))
+                    i = m.end()
+                    char_start = i
+                    continue
+
+                # Font ID (fallback; treat as current effective font)
                 m = _RE_FONT_ID.match(data, i)
                 if m:
                     if text_parts:
@@ -427,15 +628,15 @@ class BasicRTF:
                             self._streams.append({
                                 "text": text,
                                 "font": {
-                                    "id": font_id,
-                                    "name": self._font_map.get(font_id, {}).get("name", ""),
+                                    "id": get_fid(),
+                                    "name": self._font_map.get(get_fid(), {}).get("name", ""),
                                     "size": font_size // 2
                                 },
                                 "char_start": char_start,
                                 "char_end": char_end
                             })
                         text_parts = []
-                    font_id = int(m.group(1))
+                    eff[dirctx][charset] = int(m.group(1))
                     i = m.end()
                     char_start = i
                     continue
@@ -449,8 +650,8 @@ class BasicRTF:
                             self._streams.append({
                                 "text": text,
                                 "font": {
-                                    "id": font_id,
-                                    "name": self._font_map.get(font_id, {}).get("name", ""),
+                                    "id": get_fid(),
+                                    "name": self._font_map.get(get_fid(), {}).get("name", ""),
                                     "size": font_size // 2
                                 },
                                 "char_start": char_start,
@@ -485,8 +686,8 @@ class BasicRTF:
                 self._streams.append({
                     "text": text,
                     "font": {
-                        "id": font_id,
-                        "name": self._font_map.get(font_id, {}).get("name", ""),
+                        "id": get_fid(),
+                        "name": self._font_map.get(get_fid(), {}).get("name", ""),
                         "size": font_size // 2
                     },
                     "char_start": char_start,
