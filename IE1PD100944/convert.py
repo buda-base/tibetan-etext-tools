@@ -48,7 +48,7 @@ script_dir = Path(__file__).parent
 sys.path.insert(0, str(script_dir))
 
 from basic_rtf import BasicRTF
-from normalization import normalize_unicode
+from normalization import normalize_unicode, normalize_spaces
 
 # Import char_converter directly to avoid pdfminer dependency issues in pytiblegenc.__init__
 # This imports the convert_string function without going through __init__.py
@@ -153,24 +153,27 @@ def get_ut_id_from_ve(ve_id: str) -> str:
 
 def is_volume_file(filename: str) -> bool:
     """
-    Check if this is a volume file (not a split part).
+    Check if this is a whole volume file (not a split part).
     
     Volume files (return True):
-        - KAMA-001.rtf (basic volume)
-        - KAMA-040-1.rtf (volume with integer suffix)
-        - KAMA-132-1.rtf (volume with integer suffix)
+        - KAMA-001.rtf (basic volume - no suffix)
+        - KAMA-017.rtf (basic volume - no suffix)
     
     Split files (return False):
         - KAMA-001-a.rtf (letter suffix = split)
         - KAMA-001-b.rtf (letter suffix = split)
-        - KAMA-001-a-1.rtf (has letter in suffix = split)
+        - KAMA-017-1.rtf (numeric suffix = split)
+        - KAMA-017-2.rtf (numeric suffix = split)
+        - KAMA-040-1.rtf (numeric suffix = split)
+        - KAMA-001-a-1.rtf (has suffix = split)
     
-    Logic: If filename contains any '-[a-zA-Z]' pattern, it's a split file.
+    Logic: Only files matching 'KAMA-NNN.ext' exactly (no suffix) are whole volumes.
     """
-    # Exclude if contains any letter suffix pattern (like -a, -b, -a-1, etc.)
-    if re.search(r'-[a-zA-Z]', filename):
-        return False
-    return True
+    # Only match files like KAMA-001.rtf, KAMA-017.rtf (no suffix after the number)
+    # Pattern: KAMA-NNN.ext where NNN is digits only, no additional suffix
+    if re.match(r'^KAMA-\d+\.(rtf|doc)$', filename, re.IGNORECASE):
+        return True
+    return False
 
 
 def get_volume_rtf_files(rtf_dir: Path = None) -> list:
@@ -198,6 +201,123 @@ def get_volume_rtf_files(rtf_dir: Path = None) -> list:
     return natsorted(volume_files, key=lambda p: p.name)
 
 
+def get_volume_base_name(rtf_path: Path) -> str:
+    """
+    Extract volume base name from RTF file path.
+    
+    For whole volume files like KAMA-001.rtf, returns KAMA-001.
+    This base name is used to find all related files (the whole file + all splits).
+    
+    Examples:
+        KAMA-001.rtf -> KAMA-001
+        KAMA-017.rtf -> KAMA-017
+    
+    The base name is then used by find_all_related_source_files() to find:
+        - KAMA-001.rtf, KAMA-001.doc (whole files)
+        - KAMA-001-a.rtf, KAMA-001-a.doc (split a)
+        - KAMA-001-1.rtf, KAMA-001-1.doc (split 1)
+        - etc.
+    """
+    return rtf_path.stem  # e.g., "KAMA-001"
+
+
+def find_all_related_source_files(volume_base: str, rtf_dir: Path = None, doc_dir: Path = None) -> list:
+    """
+    Find all source files related to a volume (main file + all splits).
+    
+    For volume "KAMA-001", finds:
+        - KAMA-001.rtf, KAMA-001.doc (main files)
+        - KAMA-001-a.rtf, KAMA-001-a.doc (split a)
+        - KAMA-001-b.rtf, KAMA-001-b.doc (split b)
+        - etc.
+    
+    Args:
+        volume_base: Base name of volume (e.g., "KAMA-001", "KAMA-040-1")
+        rtf_dir: Directory containing RTF files
+        doc_dir: Directory containing DOC files
+        
+    Returns:
+        List of Path objects for all related source files (both DOC and RTF)
+    """
+    if rtf_dir is None:
+        rtf_dir = RTF_DIR
+    if doc_dir is None:
+        doc_dir = SOURCE_DOC_DIR
+    
+    related_files = []
+    
+    # Pattern: volume_base followed by optional suffix (like -a, -b, -a-1)
+    # e.g., KAMA-001 matches KAMA-001.rtf, KAMA-001-a.rtf, KAMA-001-a-1.rtf
+    # but NOT KAMA-0010.rtf (that would be volume 10, not 001)
+    
+    # Find RTF files
+    if rtf_dir.exists():
+        for rtf_file in rtf_dir.glob(f"{volume_base}*.rtf"):
+            # Make sure it's an exact base match (not a different volume number)
+            # e.g., KAMA-001 should match KAMA-001-a but not KAMA-0010
+            name_without_ext = rtf_file.stem
+            if name_without_ext == volume_base or name_without_ext.startswith(f"{volume_base}-"):
+                related_files.append(rtf_file)
+    
+    # Find DOC files
+    if doc_dir.exists():
+        for doc_file in doc_dir.glob(f"{volume_base}*.doc"):
+            name_without_ext = doc_file.stem
+            if name_without_ext == volume_base or name_without_ext.startswith(f"{volume_base}-"):
+                related_files.append(doc_file)
+    
+    return natsorted(related_files, key=lambda p: p.name)
+
+
+def copy_sources_to_volume_folder(volume_base: str, ve_id: str, output_dir: Path = None,
+                                   rtf_dir: Path = None, doc_dir: Path = None) -> int:
+    """
+    Copy all source files (DOC and RTF, including splits) to the volume's sources folder.
+    
+    Creates structure:
+        output_dir/sources/{VE_ID}/KAMA-001.doc
+        output_dir/sources/{VE_ID}/KAMA-001.rtf
+        output_dir/sources/{VE_ID}/KAMA-001-a.doc
+        output_dir/sources/{VE_ID}/KAMA-001-a.rtf
+        ... (all related files)
+    
+    Args:
+        volume_base: Base name of volume (e.g., "KAMA-001")
+        ve_id: Volume Entity ID (e.g., "VE3KG466")
+        output_dir: Output directory (default: OUTPUT_DIR)
+        rtf_dir: RTF source directory (default: RTF_DIR)
+        doc_dir: DOC source directory (default: SOURCE_DOC_DIR)
+        
+    Returns:
+        Number of files copied
+    """
+    if output_dir is None:
+        output_dir = OUTPUT_DIR
+    if rtf_dir is None:
+        rtf_dir = RTF_DIR
+    if doc_dir is None:
+        doc_dir = SOURCE_DOC_DIR
+    
+    # Create volume-specific sources folder
+    sources_ve_dir = output_dir / "sources" / ve_id
+    sources_ve_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Find all related files
+    related_files = find_all_related_source_files(volume_base, rtf_dir, doc_dir)
+    
+    copied_count = 0
+    for src_file in related_files:
+        dest_file = sources_ve_dir / src_file.name
+        try:
+            shutil.copy2(src_file, dest_file)
+            copied_count += 1
+        except Exception as e:
+            logger.warning(f"Failed to copy {src_file.name}: {e}")
+    
+    logger.info(f"  Copied {copied_count} source files to sources/{ve_id}/")
+    return copied_count
+
+
 # =============================================================================
 # Dedris to Unicode Conversion
 # =============================================================================
@@ -208,7 +328,7 @@ def dedris_to_unicode(text: str, font_name: str) -> str:
     
     Args:
         text: Text in Dedris encoding
-        font_name: Font name from RTF (e.g., "Dedris", "Ededris-sym")
+        font_name: Font name from RTF (e.g., "Dedris-a", "Dedris-vowa")
         
     Returns:
         Unicode text
@@ -216,15 +336,47 @@ def dedris_to_unicode(text: str, font_name: str) -> str:
     if not text or not text.strip():
         return text
     
-    if not font_name:
-        font_name = "Ededris"  # Default fallback
+    # Skip non-Dedris fonts (e.g., Times New Roman, Arial)
+    # These fonts don't have Tibetan character mappings
+    if not font_name or not font_name.lower().startswith(('dedris', 'ededris')):
+        # Log non-Dedris text that contains potential Dedris characters
+        # (ASCII chars that might be legacy encoding in wrong font context)
+        has_suspicious = any(c in text for c in '{}0123456789.,;:!?@#$%^&*()[]<>')
+        if has_suspicious and len(text.strip()) > 0:
+            preview = text[:50].replace('\n', '\\n')
+            if "skipped_non_dedris" not in STATS:
+                STATS["skipped_non_dedris"] = []
+            if len(STATS["skipped_non_dedris"]) < 100:  # Limit to 100 samples
+                STATS["skipped_non_dedris"].append({
+                    "font": font_name or "(no font)",
+                    "text": preview,
+                    "chars": [f"'{c}'({ord(c)})" for c in text[:20] if ord(c) < 128]
+                })
+        return text
     
     try:
+        # DEBUG: Check if text contains brace characters BEFORE conversion
+        if '}' in text or '{' in text:
+            has_brace_before = True
+            brace_chars_before = [(c, ord(c)) for c in text if c in '{}']
+        else:
+            has_brace_before = False
+        
+        # Pass exact font name extracted from RTF - no fallback
         result = convert_string(text, font_name, STATS)
         if result is None:
-            # Font not in conversion tables, try with default Ededris
-            result = convert_string(text, "Ededris", STATS)
-        return result if result is not None else text
+            # Font not in conversion tables
+            preview = text[:50].replace('\n', '\\n')
+            logger.warning(f"UNHANDLED FONT: '{font_name}' | text: '{preview}'")
+            return text
+        
+        # DEBUG: Check if braces remain AFTER conversion (should be converted to Tibetan)
+        if has_brace_before and ('}' in result or '{' in result):
+            preview_in = text[:30].replace('\n', '\\n')
+            preview_out = result[:30].replace('\n', '\\n')
+            logger.warning(f"BRACE NOT CONVERTED: font='{font_name}' | in='{preview_in}' | out='{preview_out}'")
+        
+        return result
     except Exception as e:
         logger.warning(f"Error converting with font {font_name}: {e}")
         return text
@@ -317,6 +469,21 @@ def convert_rtf_to_tei(rtf_path: Path, doc_path: Path, ve_id: str) -> str:
     
     logger.info(f"Parsed {len(streams)} text streams")
     
+    # DEBUG: Log streams containing brace characters (} or {)
+    # These are important for Dedris fonts where } = སྔ (char 125)
+    brace_count = 0
+    for stream in streams:
+        text = stream.get("text", "")
+        font_name = stream.get("font", {}).get("name", "")
+        if '}' in text or '{' in text:
+            brace_count += 1
+            # Only log first 10 to avoid spam
+            if brace_count <= 10:
+                preview = text[:80].replace('\n', '\\n')
+                logger.info(f"DEBUG BRACE: font='{font_name}', text='{preview}...'")
+    if brace_count > 0:
+        logger.info(f"DEBUG: Found {brace_count} streams with brace characters")
+    
     # STEP 1: Convert all Dedris to Unicode first
     converted_streams = []
     for stream in streams:
@@ -396,14 +563,18 @@ def convert_rtf_to_tei(rtf_path: Path, doc_path: Path, ve_id: str) -> str:
     body_content = re.sub(r'\n\n+', '\n', body_content)
     body_content = body_content.strip()
     
+    # Apply final Tibetan space normalization to joined text
+    # This catches spurious spaces at stream boundaries (e.g., "འཕགས་པ་ རྟེན" -> "འཕགས་པ་རྟེན")
+    body_content = normalize_spaces(body_content, tibetan_specific=True)
+    
     # Generate UT ID from VE ID
     ut_id = get_ut_id_from_ve(ve_id)
     
     # Calculate SHA256 of original DOC file
     sha256 = calculate_sha256(doc_path)
     
-    # Source path (reference to original .doc)
-    src_path = f"sources/{doc_path.name}"
+    # Source path (reference to original .doc in volume folder)
+    src_path = f"sources/{ve_id}/{doc_path.name}"
     
     # Build TEI XML
     tei_xml = f'''<?xml version="1.0" encoding="UTF-8"?>
@@ -511,15 +682,144 @@ def convert_single_file(rtf_path: Path, ve_id: str, output_dir: Path = None):
     
     logger.info(f"  Output: {xml_path}")
     
-    # Copy RTF to sources
-    sources_dir = output_dir / "sources"
-    sources_dir.mkdir(parents=True, exist_ok=True)
-    
-    dest_rtf = sources_dir / rtf_path.name
-    shutil.copy2(rtf_path, dest_rtf)
-    logger.info(f"  Copied RTF to: {dest_rtf}")
+    # Copy all related source files (DOC + RTF, including splits) to sources/{VE_ID}/
+    volume_base = get_volume_base_name(rtf_path)
+    copy_sources_to_volume_folder(volume_base, ve_id, output_dir)
     
     return xml_path
+
+
+# =============================================================================
+# Debug Reporting
+# =============================================================================
+
+def _print_conversion_stats(output_dir: Path):
+    """
+    Print comprehensive debug information about the conversion.
+    
+    Outputs:
+    - Fonts that were handled (successfully converted)
+    - Fonts that were NOT handled (not in pytiblegenc tables)
+    - Unknown characters per font with sample context
+    - Writes a summary file to output directory
+    """
+    logger.info("")
+    logger.info("=" * 60)
+    logger.info("CONVERSION STATISTICS")
+    logger.info("=" * 60)
+    
+    # 1. Handled fonts
+    if STATS["handled_fonts"]:
+        logger.info("")
+        logger.info("HANDLED FONTS (successfully converted):")
+        for font, count in sorted(STATS["handled_fonts"].items()):
+            logger.info(f"  {font}: {count} characters")
+    else:
+        logger.info("")
+        logger.info("HANDLED FONTS: None recorded")
+    
+    # 2. Unhandled fonts (fonts not in conversion tables)
+    if STATS["unhandled_fonts"]:
+        logger.info("")
+        logger.info("UNHANDLED FONTS (not in pytiblegenc tables):")
+        for font, count in sorted(STATS["unhandled_fonts"].items()):
+            logger.info(f"  {font}: {count} characters NOT converted")
+    else:
+        logger.info("")
+        logger.info("UNHANDLED FONTS: None (all fonts were handled)")
+    
+    # 3. Unknown characters per font (chars that couldn't be mapped)
+    if STATS["unknown_characters"]:
+        logger.info("")
+        logger.info("UNKNOWN CHARACTERS BY FONT:")
+        logger.info("(Characters in handled fonts that have no mapping)")
+        for font, chars in sorted(STATS["unknown_characters"].items()):
+            # Show up to 20 sample characters with their codes
+            sample_chars = list(chars)[:20]
+            char_info = []
+            for c in sample_chars:
+                code = ord(c) if len(c) == 1 else 'multi'
+                char_info.append(f"'{c}'({code})")
+            sample_str = ", ".join(char_info)
+            if len(chars) > 20:
+                sample_str += f", ... (+{len(chars) - 20} more)"
+            logger.info(f"  {font}: {len(chars)} unknown chars")
+            logger.info(f"    Samples: {sample_str}")
+    else:
+        logger.info("")
+        logger.info("UNKNOWN CHARACTERS: None (all characters were mapped)")
+    
+    # 4. Skipped non-Dedris text with suspicious characters
+    if "skipped_non_dedris" in STATS and STATS["skipped_non_dedris"]:
+        logger.info("")
+        logger.info("SKIPPED NON-DEDRIS TEXT (potential wrong font context):")
+        logger.info("(ASCII chars in non-Dedris fonts that might be legacy encoding)")
+        for item in STATS["skipped_non_dedris"][:20]:  # Show first 20
+            logger.info(f"  Font: '{item['font']}'")
+            logger.info(f"    Text: '{item['text']}'")
+            logger.info(f"    ASCII chars: {', '.join(item['chars'][:10])}")
+        if len(STATS["skipped_non_dedris"]) > 20:
+            logger.info(f"  ... and {len(STATS['skipped_non_dedris']) - 20} more")
+    
+    # 5. Diffs with UTFC (for debugging pytiblegenc)
+    if STATS["diffs_with_utfc"]:
+        logger.info("")
+        logger.info(f"DIFFS WITH UTFC: {len(STATS['diffs_with_utfc'])} differences found")
+    
+    # 6. Error characters count
+    if STATS["error_characters"] > 0:
+        logger.info("")
+        logger.info(f"ERROR CHARACTERS: {STATS['error_characters']} conversion errors")
+    
+    logger.info("")
+    logger.info("=" * 60)
+    
+    # Write summary file to output directory
+    summary_path = output_dir / "conversion_stats.txt"
+    try:
+        with open(summary_path, 'w', encoding='utf-8') as f:
+            f.write("CONVERSION STATISTICS\n")
+            f.write("=" * 60 + "\n\n")
+            
+            f.write("HANDLED FONTS:\n")
+            if STATS["handled_fonts"]:
+                for font, count in sorted(STATS["handled_fonts"].items()):
+                    f.write(f"  {font}: {count} characters\n")
+            else:
+                f.write("  None recorded\n")
+            
+            f.write("\nUNHANDLED FONTS (not in pytiblegenc tables):\n")
+            if STATS["unhandled_fonts"]:
+                for font, count in sorted(STATS["unhandled_fonts"].items()):
+                    f.write(f"  {font}: {count} characters NOT converted\n")
+            else:
+                f.write("  None (all fonts were handled)\n")
+            
+            f.write("\nUNKNOWN CHARACTERS BY FONT:\n")
+            if STATS["unknown_characters"]:
+                for font, chars in sorted(STATS["unknown_characters"].items()):
+                    f.write(f"  {font}: {len(chars)} unknown characters\n")
+                    # Write all unknown chars for this font
+                    for c in sorted(chars, key=lambda x: ord(x) if len(x) == 1 else 0):
+                        code = ord(c) if len(c) == 1 else 'multi'
+                        f.write(f"    '{c}' (code {code})\n")
+            else:
+                f.write("  None (all characters were mapped)\n")
+            
+            f.write("\nSKIPPED NON-DEDRIS TEXT (potential wrong font context):\n")
+            if "skipped_non_dedris" in STATS and STATS["skipped_non_dedris"]:
+                for item in STATS["skipped_non_dedris"]:
+                    f.write(f"  Font: '{item['font']}'\n")
+                    f.write(f"    Text: '{item['text']}'\n")
+                    f.write(f"    ASCII chars: {', '.join(item['chars'][:10])}\n")
+            else:
+                f.write("  None\n")
+            
+            f.write(f"\nERROR CHARACTERS: {STATS['error_characters']}\n")
+            
+        logger.info(f"Stats written to: {summary_path}")
+    except Exception as e:
+        logger.warning(f"Could not write stats file: {e}")
 
 
 # =============================================================================
@@ -619,13 +919,8 @@ def convert_all_files(output_dir: Path = None):
     logger.info(f"  Output: {output_dir}")
     logger.info("=" * 60)
     
-    # Print stats
-    if STATS["unhandled_fonts"]:
-        logger.info(f"Unhandled fonts: {STATS['unhandled_fonts']}")
-    if STATS["unknown_characters"]:
-        logger.info("Unknown characters by font:")
-        for font, chars in STATS["unknown_characters"].items():
-            logger.info(f"  {font}: {len(chars)} unknown chars")
+    # Enhanced debug reporting
+    _print_conversion_stats(output_dir)
 
 
 # =============================================================================
