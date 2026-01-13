@@ -1,9 +1,6 @@
 #!/usr/bin/env python3
 """
-Batch RTF to TEI XML Converter with Multiprocessing.
-
-This script processes multiple IE collections in parallel, converting RTF files
-to TEI XML format. It auto-discovers collections and handles various folder structures.
+Improvised Batch RTF to TEI XML Converter with Multiprocessing.
 
 Input structure:
     rtf/{IE_ID}/{IE_ID}/toprocess/{IE_ID}-{VE_ID}/*.rtf
@@ -24,7 +21,6 @@ Usage:
 """
 
 import sys
-import os
 import re
 import hashlib
 import shutil
@@ -65,7 +61,7 @@ from normalization import normalize_unicode
 # =============================================================================
 
 # Default input directory containing all IE collections
-INPUT_DIR = Path(r"C:\Users\GANGA GYATSO\OneDrive\Documents\IE1PD100944\rtf")
+INPUT_DIR = Path(r"/Users/tenzinmonlam/Documents/dharmaduta/")
 
 # Number of parallel workers (default: CPU count - 1, min 1)
 DEFAULT_WORKERS = max(1, multiprocessing.cpu_count() - 1)
@@ -79,10 +75,10 @@ def discover_collections(input_dir: Path) -> list:
     """
     Discover all IE collections in the input directory.
     
-    
+    Returns:
         List of (ie_id, toprocess_dir, output_dir) tuples
     """
-    collectionsd = []
+    collections = []
     
     for ie_folder in input_dir.iterdir():
         if not ie_folder.is_dir():
@@ -186,6 +182,18 @@ def classify_font_sizes(streams: list) -> dict:
     
     return classifications
 
+# =============================================================================
+# Noise Filtering 
+# =============================================================================
+
+def remove_non_tibetan(text: str) -> str:
+    # Remove the PAGE MERGEFORMAT strings if they exist
+    non_tibetan = r"PAGE\s*\*?\s*MERGEFORMAT\s*\d*"
+    tibetan_only = re.sub(non_tibetan, "", text, flags=re.IGNORECASE)
+    # Remove all characters outside the Tibetan Unicode range and whitespace
+    tibetan_range = re.sub(r'[^\u0F00-\u0FFF\s]', '', tibetan_only)
+    
+    return tibetan_range.strip()
 
 # =============================================================================
 # RTF to TEI Conversion
@@ -196,18 +204,6 @@ def escape_xml(text: str) -> str:
     text = text.replace('&', '&amp;')
     text = text.replace('<', '&lt;')
     text = text.replace('>', '&gt;')
-    return text
-
-
-def clean_rtf_fallback_chars(text: str) -> str:
-    """Remove RTF Unicode fallback characters."""
-    tibetan_range = '[\u0F00-\u0FFF]'
-    text = re.sub(r'^([a-zA-Z?])(' + tibetan_range + ')', r'\2', text)
-    text = re.sub(r'\n([a-zA-Z?])(' + tibetan_range + ')', r'\n\2', text)
-    text = re.sub(r'\n([a-zA-Z?]) (' + tibetan_range + ')', r'\n\2', text)
-    text = re.sub(r'\n([a-zA-Z?])$', r'\n', text)
-    text = re.sub(r'^([a-zA-Z?])$', '', text, flags=re.MULTILINE)
-    text = re.sub(r'^([a-zA-Z?]) ', '', text, flags=re.MULTILINE)
     return text
 
 
@@ -222,10 +218,9 @@ def calculate_sha256(file_path: Path) -> str:
     except FileNotFoundError:
         return "FILE_NOT_FOUND"
 
-
 def convert_rtf_to_tei(rtf_path: Path, ie_id: str, ve_id: str, ut_id: str, src_path: str) -> str:
     """
-    Convert RTF file to TEI XML.
+    Convert RTF file to TEI XML with noise filtering.
     """
     # Parse RTF
     parser = BasicRTF()
@@ -233,10 +228,8 @@ def convert_rtf_to_tei(rtf_path: Path, ie_id: str, ve_id: str, ut_id: str, src_p
     streams = parser.get_streams()
     
     logger.info(f"  Parsed {len(streams)} text streams")
-    
     # Classify font sizes
     classifications = classify_font_sizes(streams)
-    
     # Process streams and build content
     tei_lines = []
     current_markup = None
@@ -244,11 +237,11 @@ def convert_rtf_to_tei(rtf_path: Path, ie_id: str, ve_id: str, ut_id: str, src_p
     for stream in streams:
         text = stream.get("text", "")
         font_size = stream.get("font", {}).get("size", 12)
-        
+    
+        # Skip standard RTF non-text elements
         if stream.get("type") in ("header", "footer", "pict"):
             continue
-        
-        cleaned_text = clean_rtf_fallback_chars(text)
+        cleaned_text = remove_non_tibetan(text)
         normalized_text = normalize_unicode(cleaned_text)
         
         if not normalized_text.strip():
@@ -258,9 +251,7 @@ def convert_rtf_to_tei(rtf_path: Path, ie_id: str, ve_id: str, ut_id: str, src_p
         classification = classifications.get(font_size, 'regular')
         
         if classification != current_markup:
-            if current_markup == 'small':
-                tei_lines.append('</hi>')
-            elif current_markup == 'large':
+            if current_markup in ('small', 'large'):
                 tei_lines.append('</hi>')
             
             if classification == 'small':
@@ -272,9 +263,7 @@ def convert_rtf_to_tei(rtf_path: Path, ie_id: str, ve_id: str, ut_id: str, src_p
         
         tei_lines.append(escaped_text)
     
-    if current_markup == 'small':
-        tei_lines.append('</hi>')
-    elif current_markup == 'large':
+    if current_markup in ('small', 'large'):
         tei_lines.append('</hi>')
     
     body_content = ''.join(tei_lines)
