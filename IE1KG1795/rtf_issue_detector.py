@@ -34,16 +34,12 @@ RTF_COMMAND_PATTERNS = [
     
     # New patterns for PAGE numbers
     (r'PAGE\s+\d+', 'PAGE followed by number'),
-    (r'<lb/>[^<]*[-–—]?\s*PAGE\s+\d+', '<lb/> followed by PAGE with dashes/punctuation'),
     # PAGE with dashes before and after (e.g., -PAGE 228-, --PAGE 229-)
     # Use negative lookahead to catch each occurrence separately even when adjacent
     (r'[-–—]+PAGE\s+\d+[-–—]+(?![–—]*PAGE)', 'PAGE with dashes before and after'),
     
     # Multiple PAGE numbers in one line
     (r'[^<]*PAGE\s+\d+[^<]*PAGE\s+\d+', 'Multiple PAGE numbers in one line'),
-    
-    # Lines with RTF-like words but no Tibetan
-    (r'^[^\u0F00-\u0FFF]*\b(PAGE|NUMPAGES|DATE|TIME)\b[^\u0F00-\u0FFF]*$', 'RTF-like words with no Tibetan'),
 ]
 
 # Spurious text patterns
@@ -88,7 +84,7 @@ def find_rtf_commands(text: str, file_path: Path) -> List[Tuple[int, str, str, s
                     line_num,
                     description,
                     match.group(0),
-                    context
+                    context  # Add context
                 ))
         
         # Check spurious patterns
@@ -104,7 +100,7 @@ def find_rtf_commands(text: str, file_path: Path) -> List[Tuple[int, str, str, s
                     line_num,
                     description,
                     match.group(0),
-                    context
+                    context  # Add context
                 ))
     
     return issues
@@ -133,3 +129,4 @@ def find_non_tibetan_lines(text: str, file_path: Path) -> List[Tuple[int, str]]:
                     ))
     
     return issues
+

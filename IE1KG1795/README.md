@@ -102,39 +102,14 @@ python rtf_check_fix.py --ie-id IE23636
 # Check only (no fixing)
 python rtf_check_fix.py --ie-id IE23636 --no-fix
 
-# Interactive review mode (review MEDIUM/LOW confidence issues)
-python rtf_check_fix.py --ie-id IE23636 --interactive
-
-# Auto-fix HIGH confidence issues, review others
-python rtf_check_fix.py --ie-id IE23636 --interactive --auto-fix-high
-
-# Only show HIGH confidence issues
-python rtf_check_fix.py --ie-id IE23636 --min-confidence HIGH
-
 # Save report
 python rtf_check_fix.py --ie-id IE23636 --output report.txt
 ```
 
-### Confidence Levels
-
-Issues are classified by confidence:
-- **HIGH**: Clearly RTF artifacts (e.g., "PAGE * MERGEFORMAT")
-- **MEDIUM**: Likely artifacts but ambiguous (e.g., "PAGE 2", "PAGE 3")
-- **LOW**: Suspicious but could be legitimate
-
-### Interactive Review
-
-Use `--interactive` to review each MEDIUM/LOW confidence issue:
-- `y` = approve (mark as spurious)
-- `n` = skip (keep as-is)
-- `a` = approve all similar patterns
-- `s` = skip all similar patterns
-- `q` = quit review
-
 ### Output
 
 - **Fixed files**: Written directly to `archive/` folder (replaces originals)
-- **Report file**: If `--output` specified (includes confidence levels)
+- **Report file**: If `--output` specified
 
 **Note:** Original files in `archive/` are replaced with fixed versions. No backups are created.
 
@@ -229,10 +204,6 @@ python export_outputs.py --ie-id IE23636 --output-dir /path/to/export
 
 2. **Check and fix issues:**
    ```bash
-   # Interactive review (recommended)
-   python rtf_check_fix.py --ie-id IE23636 --interactive --auto-fix-high
-   
-   # Or auto-fix all (legacy mode)
    python rtf_check_fix.py --ie-id IE23636
    ```
 

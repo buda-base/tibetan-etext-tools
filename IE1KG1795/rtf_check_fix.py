@@ -37,9 +37,7 @@ def clean_rtf_commands(text: str) -> Tuple[str, int]:
     cleaned = text
     removal_count = 0
     
-    # Extract pattern from (pattern, description) tuples
-    for pattern_info in RTF_COMMAND_PATTERNS:
-        pattern = pattern_info[0]  # First element is the pattern
+    for pattern, description in RTF_COMMAND_PATTERNS:
         matches = list(re.finditer(pattern, cleaned, re.IGNORECASE))
         if matches:
             for match in reversed(matches):
@@ -54,9 +52,7 @@ def clean_spurious_text(text: str) -> Tuple[str, int]:
     cleaned = text
     removal_count = 0
     
-    # Extract pattern from (pattern, description) tuples
-    for pattern_info in SPURIOUS_PATTERNS:
-        pattern = pattern_info[0]  # First element is the pattern
+    for pattern, description in SPURIOUS_PATTERNS:
         matches = list(re.finditer(pattern, cleaned, re.IGNORECASE))
         if matches:
             for match in reversed(matches):
@@ -236,7 +232,7 @@ def scan_collection(input_dir: Path, verbose: bool = False, ie_id_filter: str = 
             results['total_non_tibetan_lines'] += len(file_result['non_tibetan_lines'])
             
             for issue in file_result['rtf_commands']:
-                issue_type = issue[1]  # description is second element
+                issue_type = issue[1]
                 results['issues_by_type'][issue_type] += 1
     
     return results
@@ -321,24 +317,20 @@ def print_report(results: Dict, output_file: Path = None):
         if file_result['rtf_commands']:
             output_lines.append("RTF Commands Found:")
             for issue in file_result['rtf_commands']:
-                # Handle both (line_num, description, match, context) and (line_num, description, match, context, confidence)
-                if len(issue) >= 4:
-                    line_num, issue_type, match, context = issue[:4]
+                if len(issue) == 4:
+                    line_num, issue_type, match, context = issue
                     output_lines.append(f"  Line {line_num}: {issue_type}")
                     output_lines.append(f"    Match: {match}")
                     output_lines.append(f"    Context: ...{context}...")
                 else:
-                    line_num, issue_type, match = issue[:3]
+                    line_num, issue_type, match = issue
                     output_lines.append(f"  Line {line_num}: {issue_type}")
                     output_lines.append(f"    Match: {match}")
         
         if file_result['non_tibetan_lines']:
             output_lines.append("Non-Tibetan Lines Found:")
-            for issue in file_result['non_tibetan_lines']:
-                # Handle both (line_num, content) and (line_num, content, confidence)
-                if len(issue) >= 2:
-                    line_num, content = issue[:2]
-                    output_lines.append(f"  Line {line_num}: {content}")
+            for line_num, content in file_result['non_tibetan_lines']:
+                output_lines.append(f"  Line {line_num}: {content}")
         
         if 'error' in file_result:
             output_lines.append(f"  ERROR: {file_result['error']}")
