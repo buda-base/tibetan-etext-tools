@@ -49,6 +49,11 @@ sys.path.insert(0, str(script_dir))
 
 from basic_rtf import BasicRTF
 from normalization import normalize_unicode, normalize_spaces
+from tibetan_text_fixes import (
+    fix_flying_vowels_and_linebreaks,
+    fix_hi_tag_spacing,
+    count_tibetan_chars,
+)
 
 # Import char_converter directly to avoid pdfminer dependency issues in pytiblegenc.__init__
 # This imports the convert_string function without going through __init__.py
@@ -368,9 +373,15 @@ def classify_font_sizes(converted_streams: list) -> dict:
     """
     Classify font sizes into large, regular, and small categories.
     
-    Uses frequency analysis: the font size with the most Tibetan characters
-    is classified as 'regular' (body text). Larger sizes are 'large' (headings),
-    smaller sizes are 'small' (annotations/notes).
+    Simple classification based on top 2 most occurring font sizes:
+    1. Top 2 font sizes by character count = "regular" (body text)
+    2. Anything LARGER than both = "large" (headings)
+    3. Anything SMALLER than both = "small" (annotations)
+    
+    Example: If top 2 are 18pt and 36pt:
+        - Regular: 18pt, 36pt
+        - Large: anything > 36pt
+        - Small: anything < 18pt
     
     Args:
         converted_streams: List of dicts with 'text' (Unicode), 'font_size'
@@ -385,8 +396,8 @@ def classify_font_sizes(converted_streams: list) -> dict:
         text = item.get("text", "")
         font_size = item.get("font_size", 12)
         
-        # Count Tibetan characters (U+0F00-U+0FFF)
-        tibetan_chars = len([c for c in text if 0x0F00 <= ord(c) <= 0x0FFF])
+        # Count Tibetan characters using helper function
+        tibetan_chars = count_tibetan_chars(text)
         if tibetan_chars > 0:
             size_counts[font_size] += tibetan_chars
     
@@ -396,21 +407,52 @@ def classify_font_sizes(converted_streams: list) -> dict:
     sizes = sorted(size_counts.keys())
     total_chars = sum(size_counts.values())
     
-    # Find the most common font size by Tibetan character count - this is the body text
-    most_common = max(size_counts.items(), key=lambda x: x[1])[0]
+    # Only one font size - everything is regular (no tags needed)
+    if len(sizes) == 1:
+        logger.info(f"  Font size distribution: only one size ({sizes[0]}pt) - all regular")
+        return {sizes[0]: 'regular'}
     
     # Log the distribution for debugging
     logger.info(f"  Font size distribution (Tibetan chars): {dict(size_counts)}")
-    logger.info(f"  Most common size (body text): {most_common}pt with {size_counts[most_common]} chars ({100*size_counts[most_common]/total_chars:.1f}%)")
     
+    # Sort sizes by character count (descending) to find top 2 most common
+    sizes_by_count = sorted(size_counts.items(), key=lambda x: x[1], reverse=True)
+    
+    # Get top 2 most occurring font sizes - these are "regular"
+    top_2_sizes = [sizes_by_count[i][0] for i in range(min(2, len(sizes_by_count)))]
+    
+    # Boundaries: anything smaller than min or larger than max of top 2 gets tagged
+    regular_min = min(top_2_sizes)
+    regular_max = max(top_2_sizes)
+    
+    logger.info(f"  Top 2 sizes (regular): {sorted(top_2_sizes)}")
+    
+    # Classify all sizes
     classifications = {}
     for fs in sizes:
-        if fs == most_common:
+        if fs in top_2_sizes:
+            # One of the top 2 = regular
             classifications[fs] = 'regular'
-        elif fs > most_common:
+        elif fs > regular_max:
+            # Larger than both top 2 = large (headings)
             classifications[fs] = 'large'
-        else:
+        elif fs < regular_min:
+            # Smaller than both top 2 = small (annotations)
             classifications[fs] = 'small'
+        else:
+            # Between the two top sizes = regular
+            classifications[fs] = 'regular'
+    
+    # Log classification summary
+    small_sizes = [s for s, c in classifications.items() if c == 'small']
+    large_sizes = [s for s, c in classifications.items() if c == 'large']
+    regular_sizes = [s for s, c in classifications.items() if c == 'regular']
+    
+    if small_sizes:
+        logger.info(f"  Small sizes: {sorted(small_sizes)}")
+    if large_sizes:
+        logger.info(f"  Large sizes: {sorted(large_sizes)}")
+    logger.info(f"  Regular sizes: {sorted(regular_sizes)}")
     
     return classifications
 
@@ -427,9 +469,26 @@ def escape_xml(text: str) -> str:
     return text
 
 
+# =============================================================================
+# Staged Conversion Control
+# =============================================================================
+# Set these flags to control which stages are enabled:
+#   Stage 1: RTF parsing + Unicode conversion only (no normalization, no font tags)
+#   Stage 2: Add font size classification and <hi> tags
+#   Stage 3: Add careful normalization (flying vowels, Unicode normalization)
+
+ENABLE_FONT_CLASSIFICATION = True   # Stage 2: Add <hi rend="small/head"> tags
+ENABLE_NORMALIZATION = True         # Stage 3: Apply text normalization
+
+
 def convert_rtf_to_tei(rtf_path: Path, doc_path: Path, ve_id: str) -> str:
     """
     Convert RTF file to TEI XML.
+    
+    Staged conversion:
+    - Stage 1: Parse RTF + convert Dedris to Unicode (always enabled)
+    - Stage 2: Font size classification (ENABLE_FONT_CLASSIFICATION)
+    - Stage 3: Text normalization (ENABLE_NORMALIZATION)
     
     Args:
         rtf_path: Path to RTF file
@@ -439,7 +498,9 @@ def convert_rtf_to_tei(rtf_path: Path, doc_path: Path, ve_id: str) -> str:
     Returns:
         TEI XML string
     """
-    # Parse RTF
+    # =========================================================================
+    # STAGE 1: Parse RTF and Convert to Unicode
+    # =========================================================================
     logger.info(f"Parsing RTF file: {rtf_path.name}")
     parser = BasicRTF()
     parser.parse_file(str(rtf_path))
@@ -462,7 +523,7 @@ def convert_rtf_to_tei(rtf_path: Path, doc_path: Path, ve_id: str) -> str:
     if brace_count > 0:
         logger.info(f"DEBUG: Found {brace_count} streams with brace characters")
     
-    # STEP 1: Convert all Dedris to Unicode first
+    # Convert all Dedris to Unicode
     converted_streams = []
     for stream in streams:
         # Skip special types (headers, footers, etc.)
@@ -476,53 +537,62 @@ def convert_rtf_to_tei(rtf_path: Path, doc_path: Path, ve_id: str) -> str:
         # Convert Dedris to Unicode
         unicode_text = dedris_to_unicode(text, font_name)
         
-        # Normalize
-        normalized_text = normalize_unicode(unicode_text)
-        
-        if not normalized_text.strip():
+        # Keep streams even if they only have whitespace/newlines (for structure)
+        if not unicode_text:
             continue
         
         converted_streams.append({
-            "text": normalized_text,
+            "text": unicode_text,
             "font_size": font_size
         })
     
-    # STEP 2: Classify font sizes based on Unicode text
-    classifications = classify_font_sizes(converted_streams)
-    if classifications:
-        logger.info(f"Font size classifications: {classifications}")
+    logger.info(f"  Stage 1: Converted {len(converted_streams)} streams to Unicode")
     
-    # STEP 3: Build TEI content
+    # =========================================================================
+    # STAGE 2: Font Size Classification (optional)
+    # =========================================================================
+    if ENABLE_FONT_CLASSIFICATION:
+        classifications = classify_font_sizes(converted_streams)
+        if classifications:
+            logger.info(f"  Stage 2: Font classifications: {classifications}")
+    else:
+        classifications = {}
+        logger.info(f"  Stage 2: SKIPPED (font classification disabled)")
+    
+    # =========================================================================
+    # BUILD TEI CONTENT
+    # =========================================================================
     tei_lines = []
     current_markup = None  # 'small', 'large', or None
     
     for item in converted_streams:
-        normalized_text = item["text"]
+        text = item["text"]
         font_size = item["font_size"]
         
-        # Escape XML
-        escaped_text = escape_xml(normalized_text)
+        # Escape XML special characters
+        escaped_text = escape_xml(text)
         
-        # Determine markup based on font size
-        classification = classifications.get(font_size, 'regular')
-        
-        # Handle markup transitions
-        if classification != current_markup:
-            # Close previous markup
-            if current_markup == 'small':
-                tei_lines.append('</hi>')
-            elif current_markup == 'large':
-                tei_lines.append('</hi>')
+        if ENABLE_FONT_CLASSIFICATION and classifications:
+            # Determine markup based on font size
+            classification = classifications.get(font_size, 'regular')
             
-            # Open new markup
-            if classification == 'small':
-                tei_lines.append('<hi rend="small">')
-            elif classification == 'large':
-                tei_lines.append('<hi rend="head">')
-            
-            current_markup = classification if classification != 'regular' else None
+            # Handle markup transitions
+            if classification != current_markup:
+                # Close previous markup
+                if current_markup == 'small':
+                    tei_lines.append('</hi>')
+                elif current_markup == 'large':
+                    tei_lines.append('</hi>')
+                
+                # Open new markup
+                if classification == 'small':
+                    tei_lines.append('<hi rend="small">')
+                elif classification == 'large':
+                    tei_lines.append('<hi rend="head">')
+                
+                current_markup = classification if classification != 'regular' else None
         
-        # Add text content (keep newlines as-is for non-paginated format)
+        # Add text content (preserve newlines from RTF \par)
         tei_lines.append(escaped_text)
     
     # Close any open markup
@@ -531,30 +601,53 @@ def convert_rtf_to_tei(rtf_path: Path, doc_path: Path, ve_id: str) -> str:
     elif current_markup == 'large':
         tei_lines.append('</hi>')
     
-    # Build body content - join with no separator (text already has newlines)
+    # Join all content (text already has newlines from RTF \par)
     body_content = ''.join(tei_lines)
     
-    # Clean up: remove empty hi tags
-    body_content = re.sub(r'<hi rend="[^"]+"></hi>', '', body_content)
+    # Clean up empty hi tags
+    if ENABLE_FONT_CLASSIFICATION:
+        body_content = re.sub(r'<hi rend="[^"]+"></hi>', '', body_content)
     
-    # Clean up: normalize multiple newlines
-    body_content = re.sub(r'\n\n+', '\n', body_content)
+    # =========================================================================
+    # STAGE 3: Normalization (optional)
+    # =========================================================================
+    if ENABLE_NORMALIZATION:
+        logger.info(f"  Stage 3: Applying normalization...")
+        
+        # Fix flying vowels and improper line breaks
+        body_content = fix_flying_vowels_and_linebreaks(body_content)
+        
+        # Apply full Unicode normalization (includes Tibetan-specific reordering)
+        body_content = normalize_unicode(body_content)
+        
+        # Final space normalization 
+        body_content = normalize_spaces(body_content, tibetan_specific=True)
+        
+        # Fix spacing around <hi> tags based on Tibetan punctuation rules
+        body_content = fix_hi_tag_spacing(body_content)
+        
+        # Clean up multiple newlines
+        body_content = re.sub(r'\n\n+', '\n', body_content)
+    else:
+        logger.info(f"  Stage 3: SKIPPED (normalization disabled)")
+    
     body_content = body_content.strip()
     
-    # Apply final Tibetan space normalization to joined text
-    # This catches spurious spaces at stream boundaries (e.g., "འཕགས་པ་ རྟེན" -> "འཕགས་པ་རྟེན")
-    body_content = normalize_spaces(body_content, tibetan_specific=True)
+    # =========================================================================
+    # ADD LINE BREAK TAGS
+    # =========================================================================
+    # Put <lb/> at beginning of each new line and remove surrounding spaces
+    body_content = body_content.replace('\n', '\n<lb/>')
+    body_content = re.sub(r' *<lb/> *', '\n<lb/>', body_content)
+    body_content = body_content.strip()
     
-    # Generate UT ID from VE ID
+    # =========================================================================
+    # GENERATE TEI XML
+    # =========================================================================
     ut_id = get_ut_id_from_ve(ve_id)
-    
-    # Calculate SHA256 of original DOC file
     sha256 = calculate_sha256(doc_path)
-    
-    # Source path (reference to original .doc in volume folder)
     src_path = f"sources/{ve_id}/{doc_path.name}"
     
-    # Build TEI XML
     tei_xml = f'''<?xml version="1.0" encoding="UTF-8"?>
 <TEI xmlns="http://www.tei-c.org/ns/1.0">
 <teiHeader>
