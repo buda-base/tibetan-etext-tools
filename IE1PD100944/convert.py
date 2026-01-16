@@ -373,15 +373,8 @@ def classify_font_sizes(converted_streams: list) -> dict:
     """
     Classify font sizes into large, regular, and small categories.
     
-    Simple classification based on top 2 most occurring font sizes:
-    1. Top 2 font sizes by character count = "regular" (body text)
-    2. Anything LARGER than both = "large" (headings)
-    3. Anything SMALLER than both = "small" (annotations)
-    
-    Example: If top 2 are 18pt and 36pt:
-        - Regular: 18pt, 36pt
-        - Large: anything > 36pt
-        - Small: anything < 18pt
+    Uses frequency analysis: most common size is regular,
+    smaller sizes are 'small', larger sizes are 'large'.
     
     Args:
         converted_streams: List of dicts with 'text' (Unicode), 'font_size'
@@ -396,63 +389,26 @@ def classify_font_sizes(converted_streams: list) -> dict:
         text = item.get("text", "")
         font_size = item.get("font_size", 12)
         
-        # Count Tibetan characters using helper function
-        tibetan_chars = count_tibetan_chars(text)
+        # Count Tibetan characters (U+0F00-U+0FFF)
+        tibetan_chars = len([c for c in text if 0x0F00 <= ord(c) <= 0x0FFF])
         if tibetan_chars > 0:
             size_counts[font_size] += tibetan_chars
     
     if not size_counts:
         return {}
     
-    sizes = sorted(size_counts.keys())
-    total_chars = sum(size_counts.values())
+    # Find most frequently occurring font size - this is regular (body text)
+    most_common = max(size_counts.items(), key=lambda x: x[1])[0]
     
-    # Only one font size - everything is regular (no tags needed)
-    if len(sizes) == 1:
-        logger.info(f"  Font size distribution: only one size ({sizes[0]}pt) - all regular")
-        return {sizes[0]: 'regular'}
-    
-    # Log the distribution for debugging
-    logger.info(f"  Font size distribution (Tibetan chars): {dict(size_counts)}")
-    
-    # Sort sizes by character count (descending) to find top 2 most common
-    sizes_by_count = sorted(size_counts.items(), key=lambda x: x[1], reverse=True)
-    
-    # Get top 2 most occurring font sizes - these are "regular"
-    top_2_sizes = [sizes_by_count[i][0] for i in range(min(2, len(sizes_by_count)))]
-    
-    # Boundaries: anything smaller than min or larger than max of top 2 gets tagged
-    regular_min = min(top_2_sizes)
-    regular_max = max(top_2_sizes)
-    
-    logger.info(f"  Top 2 sizes (regular): {sorted(top_2_sizes)}")
-    
-    # Classify all sizes
+    # Classify all sizes relative to most common
     classifications = {}
-    for fs in sizes:
-        if fs in top_2_sizes:
-            # One of the top 2 = regular
+    for fs in size_counts.keys():
+        if fs == most_common:
             classifications[fs] = 'regular'
-        elif fs > regular_max:
-            # Larger than both top 2 = large (headings)
+        elif fs > most_common:
             classifications[fs] = 'large'
-        elif fs < regular_min:
-            # Smaller than both top 2 = small (annotations)
-            classifications[fs] = 'small'
         else:
-            # Between the two top sizes = regular
-            classifications[fs] = 'regular'
-    
-    # Log classification summary
-    small_sizes = [s for s, c in classifications.items() if c == 'small']
-    large_sizes = [s for s, c in classifications.items() if c == 'large']
-    regular_sizes = [s for s, c in classifications.items() if c == 'regular']
-    
-    if small_sizes:
-        logger.info(f"  Small sizes: {sorted(small_sizes)}")
-    if large_sizes:
-        logger.info(f"  Large sizes: {sorted(large_sizes)}")
-    logger.info(f"  Regular sizes: {sorted(regular_sizes)}")
+            classifications[fs] = 'small'
     
     return classifications
 
@@ -620,14 +576,14 @@ def convert_rtf_to_tei(rtf_path: Path, doc_path: Path, ve_id: str) -> str:
         # Apply full Unicode normalization (includes Tibetan-specific reordering)
         body_content = normalize_unicode(body_content)
         
-        # Final space normalization 
-        body_content = normalize_spaces(body_content, tibetan_specific=True)
+        # Final space normalization (commented out for now)
+        # body_content = normalize_spaces(body_content, tibetan_specific=True)
         
         # Fix spacing around <hi> tags based on Tibetan punctuation rules
         body_content = fix_hi_tag_spacing(body_content)
         
-        # Clean up multiple newlines
-        body_content = re.sub(r'\n\n+', '\n', body_content)
+        # Clean up multiple newlines (commented out for now)
+        # body_content = re.sub(r'\n\n+', '\n', body_content)
     else:
         logger.info(f"  Stage 3: SKIPPED (normalization disabled)")
     
