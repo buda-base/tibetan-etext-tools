@@ -242,11 +242,27 @@ def classify_font_sizes(streams: list) -> dict:
 # =============================================================================
 
 def remove_non_tibetan(text: str) -> str:
-    # Remove the PAGE MERGEFORMAT strings if they exist
-    non_tibetan = r"PAGE\s*\*?\s*MERGEFORMAT\s*\d*"
-    tibetan_only = re.sub(non_tibetan, "", text, flags=re.IGNORECASE)
-    # Remove all characters outside the Tibetan Unicode range and whitespace
-    tibetan_range = re.sub(r'[^\u0F00-\u0FFF\s]', '', tibetan_only)
+    # Remove PAGE patterns (both "PAGE MERGEFORMAT" and simple "PAGE N" patterns)
+    # Pattern 1: PAGE MERGEFORMAT with optional numbers
+    text = re.sub(r"PAGE\s*\*?\s*MERGEFORMAT\s*\d*", "", text, flags=re.IGNORECASE)
+    # Pattern 2: PAGE followed by numbers and dashes (e.g., "PAGE 10 --", "- PAGE 7 -")
+    text = re.sub(r"-?\s*PAGE\s+\d+\s*-+", "", text, flags=re.IGNORECASE)
+    
+    # Preserve year numbers (3-4 digits) by temporarily replacing them with placeholders
+    year_pattern = r'\b(\d{3,4})\b'
+    years = []
+    def save_year(match):
+        years.append(match.group(1))
+        return f"__YEAR{len(years)-1}__"
+    
+    text_with_placeholders = re.sub(year_pattern, save_year, text)
+    
+    # Remove all characters outside the Tibetan Unicode range, whitespace, and placeholder markers
+    tibetan_range = re.sub(r'[^\u0F00-\u0FFF\s_YEAR\d]', '', text_with_placeholders)
+    
+    # Restore the year numbers
+    for i, year in enumerate(years):
+        tibetan_range = tibetan_range.replace(f"__YEAR{i}__", year)
     
     return tibetan_range.strip()
 
