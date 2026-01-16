@@ -17,6 +17,7 @@ _RE_CHARSET = re.compile(r'\\(loch|hich|dbch)(?![a-zA-Z])')
 _RE_DIRCTX = re.compile(r'\\(ltrch|rtlch)(?![a-zA-Z])')
 _RE_FONT_SIZE = re.compile(r'\\fs(\d+)')
 _RE_PAR = re.compile(r'\\par(?![a-zA-Z])')  # Match \par but not \pard, \paragraph etc.
+_RE_LINE = re.compile(r'\\line(?![a-zA-Z])')  # Forced line break inside a paragraph
 _RE_CONTROL_WORD = re.compile(r'\\[a-zA-Z0-9]+\s?')
 _RE_FONTTBL_ENTRY = re.compile(r'{\\f(\d+)[^{}]*(?:{[^{}]*}[^{}]*)*;}')
 _RE_COLOR_RED = re.compile(r'\\red(\d+)')
@@ -255,6 +256,27 @@ class BasicRTF:
         i = 0
         char_start = 0
         char_end = 0
+
+        def flush_text(end_pos: int):
+            """Flush buffered text into a stream (if non-empty after cleaning)."""
+            nonlocal text_parts, char_start
+            if not text_parts:
+                char_start = end_pos
+                return
+            text = self._clean_text(''.join(text_parts))
+            if text.strip():
+                self._streams.append({
+                    "text": text,
+                    "font": {
+                        "id": get_fid(),
+                        "name": self._font_map.get(get_fid(), {}).get("name", ""),
+                        "size": font_size // 2
+                    },
+                    "char_start": char_start,
+                    "char_end": end_pos
+                })
+            text_parts = []
+            char_start = end_pos
 
         special_keywords = {
             r'\footnote': 'footnote',
@@ -665,8 +687,30 @@ class BasicRTF:
                 # Paragraph
                 m = _RE_PAR.match(data, i)
                 if m:
-                    text_parts.append('\n')
+                    # RTF paragraph break: end the current paragraph structurally.
+                    # Do NOT store as a literal newline in a text run; that tends to get
+                    # dropped/reshuffled when groups close.
+                    flush_text(i)
+                    self._streams.append({
+                        "type": "par_break",
+                        "char_start": i,
+                        "char_end": m.end()
+                    })
                     i = m.end()
+                    char_start = i
+                    continue
+
+                # Forced line break inside a paragraph
+                m = _RE_LINE.match(data, i)
+                if m:
+                    flush_text(i)
+                    self._streams.append({
+                        "type": "line_break",
+                        "char_start": i,
+                        "char_end": m.end()
+                    })
+                    i = m.end()
+                    char_start = i
                     continue
                 # Other control words - skip
                 m = _RE_CONTROL_WORD.match(data, i)

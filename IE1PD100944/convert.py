@@ -499,7 +499,8 @@ def convert_rtf_to_tei(rtf_path: Path, doc_path: Path, ve_id: str) -> str:
         
         converted_streams.append({
             "text": unicode_text,
-            "font_size": font_size
+            "font_size": font_size,
+            "type": stream.get("type")
         })
     
     logger.info(f"  Stage 1: Converted {len(converted_streams)} streams to Unicode")
@@ -522,6 +523,10 @@ def convert_rtf_to_tei(rtf_path: Path, doc_path: Path, ve_id: str) -> str:
     current_markup = None  # 'small', 'large', or None
     
     for item in converted_streams:
+        type = item.get("type")
+        if type and type.endswith("break"):
+            tei_lines.append("<lb/>")
+
         text = item["text"]
         font_size = item["font_size"]
         
