@@ -68,9 +68,6 @@ IE1PD105896_output/
                     ├── 01.rtf
                     └── ...
 ```
-## Key Updates 
-- ### Normalization:
-    - Implements specific character fixes, replacing \u0F34 (༴) with the standard Tsheg (་) to correct input element.
 
 ## Usage
 ```

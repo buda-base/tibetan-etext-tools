@@ -247,8 +247,7 @@ def remove_non_tibetan(text: str) -> str:
     tibetan_only = re.sub(non_tibetan, "", text, flags=re.IGNORECASE)
     # Remove all characters outside the Tibetan Unicode range and whitespace
     tibetan_range = re.sub(r'[^\u0F00-\u0FFF\s]', '', tibetan_only)
-    # Remove spurious Tibetan mark U+0F34 (༴)
-    tibetan_range = tibetan_range.replace('\u0F34','་')
+    
     
     return tibetan_range
 
