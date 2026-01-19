@@ -248,7 +248,7 @@ def remove_non_tibetan(text: str) -> str:
     # Remove all characters outside the Tibetan Unicode range and whitespace
     tibetan_range = re.sub(r'[^\u0F00-\u0FFF\s]', '', tibetan_only)
     
-    return tibetan_range.strip()
+    return tibetan_range
 
 # =============================================================================
 # RTF to TEI Conversion

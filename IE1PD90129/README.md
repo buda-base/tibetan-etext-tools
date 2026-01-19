@@ -69,18 +69,8 @@ IE1PD105896_output/
                     └── ...
 ```
 ## Key Updates 
-
-This version includes a Robust Noise Filtering system designed to distinguish between valid historical dates and modern metadata artifacts.
-
-### 1. Text Filtering (remove_non_tibetan)
- - Tibetan Character Retention: Prioritizes keeping all characters in the Tibetan Unicode range (\u0F00-\u0FFF).
- - RTF Artifact Removal: Automatically strips common RTF noise such as PAGE MERGEFORMAT, PAGE <num>, and internal styling codes.
- - Metadata Cleaning: Removes dimensions (e.g., 10x25) and price decimals.
-
-### 2. Preserving Historical year
-- Year validation: Accepts 3-4 digit numbers only if they fall within the historical range of 600 to 2100.
-
-- ISBN Exclusion: Explicitly ignores numbers starting with 978 or 979 (common ISBN prefixes) to prevent them from being appearing as dates in the text body.
+- ### Normalization:
+    - Implements specific character fixes, replacing \u0F34 (༴) with the standard Tsheg (་) to correct input element.
 
 ## Usage
 ```
