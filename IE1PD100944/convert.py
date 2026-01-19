@@ -348,13 +348,6 @@ def dedris_to_unicode(text: str, font_name: str) -> str:
     effective_font = font_name if is_dedris else 'Dedris-a'
     
     try:
-        # DEBUG: Check if text contains brace characters BEFORE conversion
-        if '}' in text or '{' in text:
-            has_brace_before = True
-            brace_chars_before = [(c, ord(c)) for c in text if c in '{}']
-        else:
-            has_brace_before = False
-        
         # Pass effective font (handles font attribution errors)
         result = convert_string(text, effective_font, STATS)
         if result is None:
@@ -373,12 +366,6 @@ def dedris_to_unicode(text: str, font_name: str) -> str:
                     "text": text[:30],
                     "result": result[:30]
                 })
-        
-        # DEBUG: Check if braces remain AFTER conversion (should be converted to Tibetan)
-        if has_brace_before and ('}' in result or '{' in result):
-            preview_in = text[:30].replace('\n', '\\n')
-            preview_out = result[:30].replace('\n', '\\n')
-            logger.warning(f"BRACE NOT CONVERTED: font='{effective_font}' | in='{preview_in}' | out='{preview_out}'")
         
         return result
     except Exception as e:
@@ -484,21 +471,6 @@ def convert_rtf_to_tei(rtf_path: Path, doc_path: Path, ve_id: str) -> str:
     streams = parser.get_streams()
     
     logger.info(f"Parsed {len(streams)} text streams")
-    
-    # DEBUG: Log streams containing brace characters (} or {)
-    # These are important for Dedris fonts where } = སྔ (char 125)
-    brace_count = 0
-    for stream in streams:
-        text = stream.get("text", "")
-        font_name = stream.get("font", {}).get("name", "")
-        if '}' in text or '{' in text:
-            brace_count += 1
-            # Only log first 10 to avoid spam
-            if brace_count <= 10:
-                preview = text[:80].replace('\n', '\\n')
-                logger.info(f"DEBUG BRACE: font='{font_name}', text='{preview}...'")
-    if brace_count > 0:
-        logger.info(f"DEBUG: Found {brace_count} streams with brace characters")
     
     # Convert all Dedris to Unicode
     converted_streams = []
