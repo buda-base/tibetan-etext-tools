@@ -319,11 +319,17 @@ def dedris_to_unicode(text: str, font_name: str) -> str:
     if not text or not text.strip():
         return text
     
-    # Skip non-Dedris fonts (e.g., Times New Roman, Arial)
-    # These fonts don't have Tibetan character mappings
-    if not font_name or not font_name.lower().startswith(('dedris', 'ededris')):
+    # Fonts that might contain Dedris-encoded characters due to font attribution errors
+    # SimSun is a Chinese font, but in these RTFs it sometimes contains Dedris text
+    SUSPICIOUS_FONTS = ('simsun', '@simsun', 'simsun western')
+    
+    # Check if this is a Dedris font
+    is_dedris = font_name and font_name.lower().startswith(('dedris', 'ededris'))
+    is_suspicious = font_name and font_name.lower() in SUSPICIOUS_FONTS
+    
+    if not is_dedris and not is_suspicious:
+        # Skip truly non-Dedris fonts (e.g., Times New Roman, Arial)
         # Log non-Dedris text that contains potential Dedris characters
-        # (ASCII chars that might be legacy encoding in wrong font context)
         has_suspicious = any(c in text for c in '{}0123456789.,;:!?@#$%^&*()[]<>')
         if has_suspicious and len(text.strip()) > 0:
             preview = text[:50].replace('\n', '\\n')
@@ -337,6 +343,10 @@ def dedris_to_unicode(text: str, font_name: str) -> str:
                 })
         return text
     
+    # For suspicious fonts (like SimSun), try converting as Dedris-a
+    # This handles font attribution errors in the original RTF
+    effective_font = font_name if is_dedris else 'Dedris-a'
+    
     try:
         # DEBUG: Check if text contains brace characters BEFORE conversion
         if '}' in text or '{' in text:
@@ -345,23 +355,34 @@ def dedris_to_unicode(text: str, font_name: str) -> str:
         else:
             has_brace_before = False
         
-        # Pass exact font name extracted from RTF - no fallback
-        result = convert_string(text, font_name, STATS)
+        # Pass effective font (handles font attribution errors)
+        result = convert_string(text, effective_font, STATS)
         if result is None:
             # Font not in conversion tables
             preview = text[:50].replace('\n', '\\n')
-            logger.warning(f"UNHANDLED FONT: '{font_name}' | text: '{preview}'")
+            logger.warning(f"UNHANDLED FONT: '{effective_font}' (original: '{font_name}') | text: '{preview}'")
             return text
+        
+        # Log when we converted suspicious font text
+        if is_suspicious:
+            if "converted_suspicious" not in STATS:
+                STATS["converted_suspicious"] = []
+            if len(STATS["converted_suspicious"]) < 50:
+                STATS["converted_suspicious"].append({
+                    "font": font_name,
+                    "text": text[:30],
+                    "result": result[:30]
+                })
         
         # DEBUG: Check if braces remain AFTER conversion (should be converted to Tibetan)
         if has_brace_before and ('}' in result or '{' in result):
             preview_in = text[:30].replace('\n', '\\n')
             preview_out = result[:30].replace('\n', '\\n')
-            logger.warning(f"BRACE NOT CONVERTED: font='{font_name}' | in='{preview_in}' | out='{preview_out}'")
+            logger.warning(f"BRACE NOT CONVERTED: font='{effective_font}' | in='{preview_in}' | out='{preview_out}'")
         
         return result
     except Exception as e:
-        logger.warning(f"Error converting with font {font_name}: {e}")
+        logger.warning(f"Error converting with font {effective_font}: {e}")
         return text
 
 
@@ -482,8 +503,40 @@ def convert_rtf_to_tei(rtf_path: Path, doc_path: Path, ve_id: str) -> str:
     # Convert all Dedris to Unicode
     converted_streams = []
     for stream in streams:
-        # Skip special types (headers, footers, etc.)
+        # Skip special types (headers, footers, images, etc.)
         if stream.get("type") in ("header", "footer", "pict"):
+            continue
+        
+        # Handle paragraph breaks - convert to newline
+        if stream.get("type") == "par_break":
+            converted_streams.append({
+                "text": "\n",
+                "font_size": 12,  # Default size for breaks
+                "is_break": True
+            })
+            continue
+        
+        # Handle line breaks (forced line break inside paragraph)
+        if stream.get("type") == "line_break":
+            converted_streams.append({
+                "text": "\n",
+                "font_size": 12,
+                "is_break": True
+            })
+            continue
+        
+        # Handle table cell breaks
+        if stream.get("type") == "cell_break":
+            converted_streams.append({
+                "text": "\n",  # Just newline for cell breaks
+                "font_size": 12,
+                "is_break": True
+            })
+            continue
+        
+        # Handle table row breaks (end of row)
+        if stream.get("type") == "row_break":
+            # Row breaks don't add extra newline (cell breaks already did)
             continue
         
         text = stream.get("text", "")
@@ -499,8 +552,7 @@ def convert_rtf_to_tei(rtf_path: Path, doc_path: Path, ve_id: str) -> str:
         
         converted_streams.append({
             "text": unicode_text,
-            "font_size": font_size,
-            "type": stream.get("type")
+            "font_size": font_size
         })
     
     logger.info(f"  Stage 1: Converted {len(converted_streams)} streams to Unicode")
@@ -523,10 +575,6 @@ def convert_rtf_to_tei(rtf_path: Path, doc_path: Path, ve_id: str) -> str:
     current_markup = None  # 'small', 'large', or None
     
     for item in converted_streams:
-        type = item.get("type")
-        if type and type.endswith("break"):
-            tei_lines.append("<lb/>")
-
         text = item["text"]
         font_size = item["font_size"]
         
@@ -576,7 +624,7 @@ def convert_rtf_to_tei(rtf_path: Path, doc_path: Path, ve_id: str) -> str:
         logger.info(f"  Stage 3: Applying normalization...")
         
         # Fix flying vowels and improper line breaks
-        body_content = fix_flying_vowels_and_linebreaks(body_content)
+        #body_content = fix_flying_vowels_and_linebreaks(body_content)
         
         # Apply full Unicode normalization (includes Tibetan-specific reordering)
         body_content = normalize_unicode(body_content)

@@ -10,15 +10,21 @@ import sys
 # Pre-compiled regex patterns for performance
 _RE_UNICODE = re.compile(r'\\u(-?\d+)\??')
 _RE_HEX_CHAR = re.compile(r"\\'([0-9a-fA-F]{2})")
-_RE_FONT_ID = re.compile(r'\\f(\d+)')
+_RE_FONT_ID = re.compile(r'\\f(\d+)\s?')
 
-_RE_AFONT = re.compile(r'\\af(\d+)')
-_RE_CHARSET = re.compile(r'\\(loch|hich|dbch)(?![a-zA-Z])')
-_RE_DIRCTX = re.compile(r'\\(ltrch|rtlch)(?![a-zA-Z])')
-_RE_FONT_SIZE = re.compile(r'\\fs(\d+)')
-_RE_PAR = re.compile(r'\\par(?![a-zA-Z])')  # Match \par but not \pard, \paragraph etc.
-_RE_LINE = re.compile(r'\\line(?![a-zA-Z])')  # Forced line break inside a paragraph
-_RE_CONTROL_WORD = re.compile(r'\\[a-zA-Z0-9]+\s?')
+# Note: In RTF, a space after a control word terminates it and is NOT content.
+# We use \s? to consume that terminating space.
+_RE_AFONT = re.compile(r'\\af(\d+)\s?')
+_RE_CHARSET = re.compile(r'\\(loch|hich|dbch)(?![a-zA-Z])\s?')
+_RE_DIRCTX = re.compile(r'\\(ltrch|rtlch)(?![a-zA-Z])\s?')
+_RE_FONT_SIZE = re.compile(r'\\fs(\d+)\s?')
+_RE_PAR = re.compile(r'\\par(?![a-zA-Z])\s?')  # Match \par but not \pard, \paragraph etc.
+_RE_LINE = re.compile(r'\\line(?![a-zA-Z])\s?')  # Forced line break inside a paragraph
+_RE_CELL = re.compile(r'\\cell(?![a-zA-Z])\s?')  # Table cell end
+_RE_ROW = re.compile(r'\\row(?![a-zA-Z])\s?')  # Table row end
+# Control word pattern: \letters followed by optional negative number parameter
+# Examples: \par, \f0, \fs36, \trleft-210, \tblind-102
+_RE_CONTROL_WORD = re.compile(r'\\[a-zA-Z]+-?\d*\s?')
 _RE_FONTTBL_ENTRY = re.compile(r'{\\f(\d+)[^{}]*(?:{[^{}]*}[^{}]*)*;}')
 _RE_COLOR_RED = re.compile(r'\\red(\d+)')
 _RE_COLOR_GREEN = re.compile(r'\\green(\d+)')
@@ -194,10 +200,14 @@ class BasicRTF:
 
     def _clean_text(self, text):
         """Clean text for storage, stripping RTF artifacts."""
-        # For complex RTF format, strip leading single space (RTF artifact)
-        # This fixes broken Tibetan like "མའ ི" -> "མའི"
-        if self._format == 'complex' and text.startswith(' ') and not text.startswith('  '):
-            text = text[1:]
+        # Strip RTF source newlines - these are just line wrapping in the RTF file,
+        # not actual text content. Only \par creates paragraph breaks.
+        text = text.replace('\r', '').replace('\n', '')
+        
+        # NOTE: We no longer strip leading spaces here because:
+        # 1. The regex patterns already consume terminating spaces after control words
+        # 2. Leading spaces in the remaining text are intentional content
+        # The old logic was breaking content like " ," (space before comma)
         return text
 
     def _report_progress(self, current, total, message=""):
@@ -264,7 +274,7 @@ class BasicRTF:
                 char_start = end_pos
                 return
             text = self._clean_text(''.join(text_parts))
-            if text.strip():
+            if text:
                 self._streams.append({
                     "text": text,
                     "font": {
@@ -391,7 +401,7 @@ class BasicRTF:
             elif c == '}':
                 if text_parts:
                     text = self._clean_text(''.join(text_parts))
-                    if text.strip():
+                    if text:
                         char_end = i
                         self._streams.append({
                             "text": text,
@@ -439,6 +449,7 @@ class BasicRTF:
                 # like \hich\afN can appear *right after* the control symbol. LibreOffice applies that
                 # formatting to the emitted symbol; so we mimic that by looking ahead and consuming
                 # any immediate font/charset switches before emitting the symbol.
+                handled_escaped = False
                 for sym, out_ch in ((r'\{', '{'), (r'\}', '}'), (r'\\', '\\')):
                     if data.startswith(sym, i):
                         j = i + 2
@@ -451,7 +462,7 @@ class BasicRTF:
                             if m:
                                 if not saw_format and text_parts:
                                     text = self._clean_text(''.join(text_parts))
-                                    if text.strip():
+                                    if text:
                                         char_end = i
                                         self._streams.append({
                                             "text": text,
@@ -473,7 +484,7 @@ class BasicRTF:
                             if m:
                                 if not saw_format and text_parts:
                                     text = self._clean_text(''.join(text_parts))
-                                    if text.strip():
+                                    if text:
                                         char_end = i
                                         self._streams.append({
                                             "text": text,
@@ -495,7 +506,7 @@ class BasicRTF:
                             if m:
                                 if not saw_format and text_parts:
                                     text = self._clean_text(''.join(text_parts))
-                                    if text.strip():
+                                    if text:
                                         char_end = i
                                         self._streams.append({
                                             "text": text,
@@ -517,7 +528,7 @@ class BasicRTF:
                             if m:
                                 if not saw_format and text_parts:
                                     text = self._clean_text(''.join(text_parts))
-                                    if text.strip():
+                                    if text:
                                         char_end = i
                                         self._streams.append({
                                             "text": text,
@@ -539,7 +550,7 @@ class BasicRTF:
                             if m:
                                 if not saw_format and text_parts:
                                     text = self._clean_text(''.join(text_parts))
-                                    if text.strip():
+                                    if text:
                                         char_end = i
                                         self._streams.append({
                                             "text": text,
@@ -559,12 +570,20 @@ class BasicRTF:
 
                             break
 
+
                         if saw_format:
                             char_start = i  # new run starts at the escaped symbol
 
                         text_parts.append(out_ch)
                         i = j
-                        continue
+                        handled_escaped = True
+                        break  # Break out of the for loop; we'll continue the while loop below
+                
+                # If we handled an escaped symbol, continue the main while loop
+                # (don't fall through to other handlers or the i += 1 at the end)
+                if handled_escaped:
+                    continue
+                    
                 # Handle \'hh (hex character)
                 m = _RE_HEX_CHAR.match(data, i)
                 if m:
@@ -576,7 +595,7 @@ class BasicRTF:
                 if m:
                     if text_parts:
                         text = self._clean_text(''.join(text_parts))
-                        if text.strip():
+                        if text:
                             char_end = i
                             self._streams.append({
                                 "text": text,
@@ -599,7 +618,7 @@ class BasicRTF:
                 if m:
                     if text_parts:
                         text = self._clean_text(''.join(text_parts))
-                        if text.strip():
+                        if text:
                             char_end = i
                             self._streams.append({
                                 "text": text,
@@ -622,7 +641,7 @@ class BasicRTF:
                 if m:
                     if text_parts:
                         text = self._clean_text(''.join(text_parts))
-                        if text.strip():
+                        if text:
                             char_end = i
                             self._streams.append({
                                 "text": text,
@@ -645,7 +664,7 @@ class BasicRTF:
                 if m:
                     if text_parts:
                         text = self._clean_text(''.join(text_parts))
-                        if text.strip():
+                        if text:
                             char_end = i
                             self._streams.append({
                                 "text": text,
@@ -667,7 +686,7 @@ class BasicRTF:
                 if m:
                     if text_parts:
                         text = self._clean_text(''.join(text_parts))
-                        if text.strip():
+                        if text:
                             char_end = i
                             self._streams.append({
                                 "text": text,
@@ -712,6 +731,33 @@ class BasicRTF:
                     i = m.end()
                     char_start = i
                     continue
+                
+                # Table cell end - treat like a newline (Word shows as \x07)
+                m = _RE_CELL.match(data, i)
+                if m:
+                    flush_text(i)
+                    self._streams.append({
+                        "type": "cell_break",
+                        "char_start": i,
+                        "char_end": m.end()
+                    })
+                    i = m.end()
+                    char_start = i
+                    continue
+                
+                # Table row end - treat like a paragraph break
+                m = _RE_ROW.match(data, i)
+                if m:
+                    flush_text(i)
+                    self._streams.append({
+                        "type": "row_break",
+                        "char_start": i,
+                        "char_end": m.end()
+                    })
+                    i = m.end()
+                    char_start = i
+                    continue
+                
                 # Other control words - skip
                 m = _RE_CONTROL_WORD.match(data, i)
                 if m:
@@ -725,7 +771,7 @@ class BasicRTF:
         # Final text
         if text_parts:
             text = self._clean_text(''.join(text_parts))
-            if text.strip():
+            if text:
                 char_end = i
                 self._streams.append({
                     "text": text,
