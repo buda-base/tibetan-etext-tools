@@ -623,6 +623,30 @@ def convert_rtf_to_tei(rtf_path: Path, doc_path: Path, ve_id: str) -> str:
     body_content = body_content.strip()
     
     # =========================================================================
+    # FIX <hi> TAG PLACEMENT
+    # =========================================================================
+    # Don't wrap whitespace/newlines only in <hi> tags
+    # Remove <hi> tags that contain only whitespace/newlines/lb tags
+    body_content = re.sub(r'<hi rend="[^"]+">[\s]*(?:<lb/>[\s]*)*</hi>', '', body_content)
+    
+    # Move <hi> from end of line to after <lb/> on next line
+    # Pattern: <hi...> followed by optional whitespace, newline, <lb/>
+    body_content = re.sub(r'(<hi rend="[^"]+">)\s*\n<lb/>', r'\n<lb/>\1', body_content)
+    
+    # Move </hi> from after <lb/> to before the newline (end of previous line)
+    # Pattern: newline, <lb/>, </hi>
+    body_content = re.sub(r'\n<lb/></hi>', r'</hi>\n<lb/>', body_content)
+    
+    # Remove double newlines
+    body_content = re.sub(r'\n\n+', '\n', body_content)
+    
+    # Clean up any remaining empty <hi> tags after the moves
+    body_content = re.sub(r'<hi rend="[^"]+">[\s]*</hi>', '', body_content)
+    
+    # Final strip
+    body_content = body_content.strip()
+    
+    # =========================================================================
     # GENERATE TEI XML
     # =========================================================================
     ut_id = get_ut_id_from_ve(ve_id)
