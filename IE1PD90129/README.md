@@ -4,27 +4,29 @@ Python script to convert Tibetan RTF documents into TEI XML format.
 
 ## Directory Structure
 ### Input Path: 
-```   
-    {IE_ID}/sources/{VE_ID}/{collection_name}/rtfs/{VOL_ID}/*.rtf
+```
+{IE_ID}/sources/{VE_ID}/{collection_name}/rtfs/{VOL_ID}/*.rtf
 ```
 ### Output Path:
 For nested: 
 ```
-{IE_ID}_output/archive/{VE_ID}/{collection_name}/xml/volume_{VOL_ID}/UT{suffix}_{index}.xml
+{IE_ID}_output/archive/{VE_ID}/{collection_name}/xml/volume_{VOL_ID}/{filename}.xml
 ```
 For direct: 
 ```
-{IE_ID}_output/archive/{VE_ID}/UT{suffix}_{index}.xml
+{IE_ID}_output/archive/{VE_ID}/{filename}.xml
 ```
+
+**Note:** Output XML files now preserve the original RTF filename (e.g., `document.rtf` → `document.xml`)
 
 ### Supported Input Structures
 
 #### Nested Structure (New):
 
 ```
-IE1PD105896/
+IE1PD90129/
 └── sources/
-    └── VE1PD105896/
+    └── VE1PD90129/
         └── collection_name/
             └── rtfs/
                 └── volume_001/
@@ -34,54 +36,81 @@ IE1PD105896/
 
 #### Direct Structure:
 ```
-IE1PD105896/
+IE1PD90129/
 └── sources/
-    └── VE1PD105896/
+    └── VE1PD90129/
         ├── 01.rtf
         └── 02.rtf
 ```
 #### Legacy Structure:
 ```
-IE1PD105896/
+IE1PD90129/
 └── toprocess/
-    └── IE1PD105896-VE1PD105896/
+    └── IE1PD90129-VE1PD90129/
         ├── 01.rtf
         └── ...
 ```
 
-
 ### Output Structure
 ```
-IE1PD105896_output/
+IE1PD90129_output/
 ├── archive/
-│   └── VE1PD105896/
+│   └── VE1PD90129/
 │       └── [collection_name]/
 │           └── xml/
 │               └── volume_001/
-│                   ├── UT1PD105896_0001.xml
-│                   └── UT1PD105896_0002.xml
+│                   ├── 01.xml
+│                   └── 02.xml
 └── sources/
-    └── VE1PD105896/
+    └── VE1PD90129/
         └── [collection_name]/
             └── rtfs/
                 └── volume_001/
                     ├── 01.rtf
-                    └── ...
+                    └── 02.rtf
 ```
+
+## Features
+
+### Text Cleaning (`text_cleaning.py`)
+
+The converter includes comprehensive text cleaning functionality that removes:
+
+1. **PAGE MERGEFORMAT strings** - RTF metadata noise
+2. **PAGE number patterns** - Patterns like `-PAGE 522-`, `PAGE 521`, etc.
+4. **Non-Tibetan characters**:
+   - Guillemets: `«` `»`
+   - Angle brackets: `<` `>`
+   - Periods: `.`
+   - Inverted exclamation: `¡`
+   - Middle dot: `·`
+   - Pilcrow: `¶`
+   - Currency sign: `¤`
+   - Diaeresis: `¨`
+   - Dash: `-`
+   
+
+### Font Size Classification
+
+The converter automatically classifies font sizes based on Tibetan character frequency:
+- **Regular**: Most common font size (no markup)
+- **Large**: Larger than regular (wrapped in `<hi rend="head">`)
+- **Small**: Smaller than regular (wrapped in `<hi rend="small">`)
+
+### Unicode Normalization
+
+All Tibetan text is normalized using the `normalization.py` module to ensure consistent Unicode representation.
 
 ## Usage
-```
+
+### Process All Collections:
+```bash
 python convert.py
 ```
-#### Process a Specific Collection :
-```
-python convert.py --ie-id IE1PD45495
-```
-#### Adjust Performance :
 
-Change the number of parallel worker processes (default is CPU count - 1):
-```
-python convert.py --workers 4
+### Process a Specific Collection:
+```bash
+python convert.py --ie-id IE1PD90129
 ```
 
 ## Technical Details
@@ -90,15 +119,18 @@ python convert.py --workers 4
 
 - VE ID: Extracted from the source folder name.
 
-- UT ID: Generated sequentially based on the file index within the volume.
+### Output File Naming
 
-  - Format: UT{VE_Suffix}_{Index:04d}
+Output XML files preserve the original RTF filename:
 
-  - Example: File 1 in VE3KG253 becomes UT3KG253_0001.
+- Input: `text_001.rtf` → Output: `text_001.xml`
 
+## Modules
 
-
-  
+- `convert.py` - Main conversion script with multiprocessing support
+- `basic_rtf.py` - RTF parser
+- `normalization.py` - Unicode normalization for Tibetan text
+- `text_cleaning.py` - Text cleaning and noise removal functions
 
    
 
