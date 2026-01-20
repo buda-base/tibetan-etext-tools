@@ -17,7 +17,7 @@ Usage:
     python convert.py
     
     # Process specific collection:
-    python convert.py --ie-id IE1PD45495
+    python convert.py --ie-id IE1PD105899 
     
     # Adjust worker count:
     python convert.py --workers 4
@@ -57,6 +57,7 @@ except ImportError:
 
 from basic_rtf import BasicRTF
 from normalization import normalize_unicode
+from text_cleaning import remove_non_tibetan
 
 
 # =============================================================================
@@ -238,19 +239,6 @@ def classify_font_sizes(streams: list) -> dict:
     return classifications
 
 # =============================================================================
-# Noise Filtering 
-# =============================================================================
-
-def remove_non_tibetan(text: str) -> str:
-    # Remove the PAGE MERGEFORMAT strings if they exist
-    non_tibetan = r"PAGE\s*\*?\s*MERGEFORMAT\s*\d*"
-    tibetan_only = re.sub(non_tibetan, "", text, flags=re.IGNORECASE)
-    # Remove all characters outside the Tibetan Unicode range and whitespace
-    tibetan_range = re.sub(r'[^\u0F00-\u0FFF\s]', '', tibetan_only)
-    
-    return tibetan_range
-
-# =============================================================================
 # RTF to TEI Conversion
 # =============================================================================
 
@@ -424,8 +412,8 @@ def process_volume(args: tuple) -> dict:
                 # Convert to TEI XML
                 tei_xml = convert_rtf_to_tei(rtf_path, ie_id, ve_id, ut_id, src_path)
                 
-                # Write XML
-                xml_path = archive_dir / f"{ut_id}.xml"
+                # Write XML 
+                xml_path = archive_dir / f"{rtf_path.stem}.xml"
                 with open(xml_path, 'w', encoding='utf-8') as f:
                     f.write(tei_xml)
                 
