@@ -24,9 +24,9 @@ For direct:
 #### Nested Structure (New):
 
 ```
-IE1PD90129/
+IE2DB25060/
 └── sources/
-    └── VE1PD90129/
+    └── VE2DB25060/
         └── collection_name/
             └── rtfs/
                 └── volume_001/
@@ -36,33 +36,33 @@ IE1PD90129/
 
 #### Direct Structure:
 ```
-IE1PD90129/
+IE2DB25060/
 └── sources/
-    └── VE1PD90129/
+    └── VE2DB25060/
         ├── 01.rtf
         └── 02.rtf
 ```
 #### Legacy Structure:
 ```
-IE1PD90129/
+IE2DB25060/
 └── toprocess/
-    └── IE1PD90129-VE1PD90129/
+    └── IE2DB25060-VE2DB25060/
         ├── 01.rtf
         └── ...
 ```
 
 ### Output Structure
 ```
-IE1PD90129_output/
+IE2DB25060_output/
 ├── archive/
-│   └── VE1PD90129/
+│   └── VE2DB25060/
 │       └── [collection_name]/
 │           └── xml/
 │               └── volume_001/
 │                   ├── 01.xml
 │                   └── 02.xml
 └── sources/
-    └── VE1PD90129/
+    └── VE2DB25060/
         └── [collection_name]/
             └── rtfs/
                 └── volume_001/
@@ -86,9 +86,6 @@ The converter includes comprehensive text cleaning functionality that removes:
    - Middle dot: `·`
    - Pilcrow: `¶`
    - Currency sign: `¤`
-   - Diaeresis: `¨`
-   - Dash: `-`
-   
 
 ### Font Size Classification
 
@@ -110,7 +107,7 @@ python convert.py
 
 ### Process a Specific Collection:
 ```bash
-python convert.py --ie-id IE1PD90129
+python convert.py --ie-id IE2DB25060
 ```
 
 ## Technical Details
@@ -122,8 +119,6 @@ python convert.py --ie-id IE1PD90129
 ### Output File Naming
 
 Output XML files preserve the original RTF filename:
-
-- Input: `text_001.rtf` → Output: `text_001.xml`
 
 ## Modules
 
