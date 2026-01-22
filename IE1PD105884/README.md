@@ -11,16 +11,16 @@ The simplest ways to run `convert.py`:
 python convert.py
 
 # Process a specific collection (most common use case)
-python convert.py --ie-id IE1PD104832
+python convert.py --ie-id IE1PD105884
 
 # Adjust number of parallel workers (for faster processing)
-python convert.py --ie-id IE1PD104832 --workers 4
+python convert.py --ie-id IE1PD105884 --workers 4
 
 # Use a custom input directory
 python convert.py --input-dir /path/to/rtf
 
 # Combine options: custom directory + specific collection + workers
-python convert.py --input-dir /path/to/rtf --ie-id IE1PD104832 --workers 8
+python convert.py --input-dir /path/to/rtf --ie-id IE1PD105884 --workers 8
 ```
 
 ### Input Directory Setup
@@ -52,7 +52,7 @@ rtf/
 python convert.py
 
 # Process specific collection
-python convert.py --ie-id IE1PD104832
+python convert.py --ie-id IE1PD105884
 
 # Custom input directory
 python convert.py --input-dir /path/to/rtf
@@ -64,7 +64,7 @@ python convert.py --workers 4
 python convert.py --yes
 
 # Combine multiple options
-python convert.py --ie-id IE1PD104832 --workers 4 --input-dir /path/to/rtf --yes
+python convert.py --ie-id IE1PD105884 --workers 4 --input-dir /path/to/rtf --yes
 ```
 
 ### Output
@@ -97,13 +97,13 @@ default=Path(__file__).parent.parent / "rtf"
 python rtf_check_fix.py
 
 # Check specific collection
-python rtf_check_fix.py --ie-id IE1PD104832
+python rtf_check_fix.py --ie-id IE1PD105884
 
 # Check only (no fixing)
-python rtf_check_fix.py --ie-id IE1PD104832 --no-fix
+python rtf_check_fix.py --ie-id IE1PD105884 --no-fix
 
 # Save report
-python rtf_check_fix.py --ie-id IE1PD104832 --output report.txt
+python rtf_check_fix.py --ie-id IE1PD105884 --output report.txt
 ```
 
 ### Output
@@ -161,7 +161,7 @@ Export all output folders, removing the `_output` suffix from folder names:
 python export_outputs.py
 
 # Export specific collection
-python export_outputs.py --ie-id IE1PD104832
+python export_outputs.py --ie-id IE1PD105884
 
 # Export to custom directory
 python export_outputs.py --output-dir /path/to/export
@@ -170,7 +170,7 @@ python export_outputs.py --output-dir /path/to/export
 python export_outputs.py --dry-run
 
 # Combine options
-python export_outputs.py --ie-id IE1PD104832 --output-dir /path/to/export
+python export_outputs.py --ie-id IE1PD105884 --output-dir /path/to/export
 ```
 
 ### Input Directory Setup
@@ -212,7 +212,7 @@ export/{IE_ID}/sources/{VE_ID}/*.rtf
 python export_outputs.py
 
 # Export specific collection
-python export_outputs.py --ie-id IE1PD104832
+python export_outputs.py --ie-id IE1PD105884
 
 # Custom input directory
 python export_outputs.py --input-dir /path/to/rtf
@@ -224,7 +224,7 @@ python export_outputs.py --output-dir /path/to/export
 python export_outputs.py --dry-run
 
 # Combine options
-python3 export_outputs.py --ie-id IE1PD104832 --output-dir /path/to/export
+python3 export_outputs.py --ie-id IE1PD105884 --output-dir /path/to/export
 ```
 
 ---
@@ -235,20 +235,20 @@ python3 export_outputs.py --ie-id IE1PD104832 --output-dir /path/to/export
 1. **Convert RTF to XML:**
    ```bash
    cd batch_process_rtf
-   python convert.py --ie-id IE1KG1804
+   python convert.py --ie-id IE1PD105884
    ```
 
 2. **Check and fix issues:**
    ```bash
-   python rtf_check_fix.py --ie-id IE1KG1804
+   python rtf_check_fix.py --ie-id IE1PD105884
    ```
 
 3. **Verify:**
    ```bash
-   python rtf_check_fix.py --ie-id IE1KG1804 --no-fix
+   python rtf_check_fix.py --ie-id IE1PD105884 --no-fix
    ```
 
 4. **Export outputs:**
    ```bash
-   python export_outputs.py --ie-id IE1KG1804
+   python export_outputs.py --ie-id IE1PD105884
    ```
