@@ -110,7 +110,15 @@ SPURIOUS_PATTERNS = [
     # Also catch the RTF encoded version if it appears in XML
     (r'\\u161[\\\'a1]*\\u164[\\\'a4]*', 'RTF encoded inverted exclamation-currency pattern'),
     (r'««', 'Double French quotation marks (guillemets)'),
-(r'«»', 'Mixed French quotation marks'),
+    (r'«»', 'Mixed French quotation marks'),
+    (r'</hi>\s*<hi rend="([^"]+)">', 'Consecutive <hi> tags with same rend attribute (should be merged)'),
+    # Issues with hi rend="small" tags
+    (r'<hi rend="small">\s*</hi>', 'Empty <hi rend="small"> tag (no content)'),
+    (r'<hi rend="small">\s+</hi>', '<hi rend="small"> tag with only whitespace'),
+    (r'<hi rend="small">\s*(<lb\s*/?>\s*)*</hi>', '<hi rend="small"> tag with only whitespace and/or <lb/> tags (no text content)'),
+    (r'<hi rend="head">[^<]*<hi rend="small">', 'Nested <hi rend="small"> inside <hi rend="head"> (may be missing closing tag)'),
+    (r'<hi rend="small">[^<]*$', 'Unclosed <hi rend="small"> tag at end of line'),
+    (r'<hi rend="small">[^<]*<hi rend="small">', 'Consecutive <hi rend="small"> tags without closing (nested incorrectly)'),
     # Add more spurious patterns here as needed
     # Example:
     # (r'pattern_to_match', 'Description of what this pattern matches'),

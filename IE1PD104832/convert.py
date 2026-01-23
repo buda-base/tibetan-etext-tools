@@ -463,6 +463,9 @@ def calculate_sha256(file_path: Path) -> str:
         return "FILE_NOT_FOUND"
 
 
+
+
+
 def convert_rtf_to_tei(rtf_path: Path, ie_id: str, ve_id: str, ut_id: str, src_path: str) -> str:
     """
     Convert RTF file to TEI XML.
@@ -519,6 +522,7 @@ def convert_rtf_to_tei(rtf_path: Path, ie_id: str, ve_id: str, ut_id: str, src_p
     
     body_content = ''.join(tei_lines)
     body_content = re.sub(r'<hi rend="[^"]+"></hi>', '', body_content)
+    body_content = merge_consecutive_hi_tags(body_content)
     body_content = re.sub(r'\n\n+', '\n', body_content)
     body_content = body_content.replace('\n', '\n<lb/>')
     body_content = re.sub(r' *<lb/> *', '\n<lb/>', body_content)
