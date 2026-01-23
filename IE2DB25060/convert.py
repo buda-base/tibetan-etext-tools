@@ -8,8 +8,8 @@ Input structure:
     {IE_ID}/sources/{VE_ID}/{collection_name}/rtfs/{VOL_ID}/*.rtf
 
 Output structure:
-    For nested: {IE_ID}_output/archive/{VE_ID}/{collection_name}/xml/volume_{VOL_ID}/UT{suffix}_{index}.xml
-    For direct: {IE_ID}_output/archive/{VE_ID}/UT{suffix}_{index}.xml
+    Archive (flat): {IE_ID}_output/archive/{VE_ID}/UT{suffix}_{index}.xml
+    Sources (nested): {IE_ID}_output/sources/{VE_ID}/{collection_name}/rtfs/{VOL_ID}/*.rtf
   
 
 Usage:
@@ -17,7 +17,7 @@ Usage:
     python convert.py
     
     # Process specific collection:
-    python convert.py --ie-id IE2DB25060
+    python convert.py --ie-id IE1PD105893
     
     # Adjust worker count:
     python convert.py --workers 4
@@ -65,7 +65,7 @@ from text_cleaning import remove_non_tibetan
 # =============================================================================
 
 # Default input directory containing all IE collections
-INPUT_DIR = Path(r"/Users/tenzinmonlam/Documents/dharmaduta/file_convert")
+INPUT_DIR = Path(r"/Users/tenzinmonlam/Documents/dharmaduta/file_convert_1")
 
 # Number of parallel workers (default: CPU count - 1, min 1)
 DEFAULT_WORKERS = max(1, multiprocessing.cpu_count() - 1)
@@ -362,12 +362,12 @@ def process_volume(args: tuple) -> dict:
     Process a single volume (worker function for multiprocessing).
     
     Args:
-        args: Tuple of (ie_id, ve_id, volume_num, volume_folder, output_dir, collection_name)
+        args: Tuple of (ie_id, ve_id, volume_num, volume_folder, output_dir, collection_name, start_index)
         
     Returns:
         dict with results: {ie_id, ve_id, volume_num, success, failed, errors}
     """
-    ie_id, ve_id, volume_num, volume_folder, output_dir, collection_name = args
+    ie_id, ve_id, volume_num, volume_folder, output_dir, collection_name, start_index = args
     
     volume_label = f"{ve_id}_vol{volume_num}" if volume_num else ve_id
     
@@ -388,23 +388,26 @@ def process_volume(args: tuple) -> dict:
             return result
         
         # Create output directories
-        # Use volume-specific subdirectory if volume_num exists
+        # Archive is always flat: archive/{VE_ID}/UT{suffix}_{index}.xml
+        archive_dir = output_dir / "archive" / ve_id
+        
+        # Sources preserves the nested structure
         if volume_num and collection_name:
-            archive_dir = output_dir / "archive" / ve_id / collection_name / "xml" / f"volume_{volume_num}"
             sources_output_dir = output_dir / "sources" / ve_id / collection_name / "rtfs" / f"volume_{volume_num}"
         else:
-            archive_dir = output_dir / "archive" / ve_id
             sources_output_dir = output_dir / "sources" / ve_id
         
         archive_dir.mkdir(parents=True, exist_ok=True)
         sources_output_dir.mkdir(parents=True, exist_ok=True)
         
         for idx, rtf_path in enumerate(rtf_files):
-            ut_id = get_ut_id(ve_id, idx)
+            # Use global index across all volumes for this VE_ID
+            global_idx = start_index + idx
+            ut_id = get_ut_id(ve_id, global_idx)
             
             # Build source path relative to output
             if volume_num and collection_name:
-                src_path = f"sources/{ve_id}/{collection_name}/xml/volume_{volume_num}/{rtf_path.name}"
+                src_path = f"sources/{ve_id}/{collection_name}/rtfs/volume_{volume_num}/{rtf_path.name}"
             else:
                 src_path = f"sources/{ve_id}/{rtf_path.name}"
             
@@ -412,8 +415,8 @@ def process_volume(args: tuple) -> dict:
                 # Convert to TEI XML
                 tei_xml = convert_rtf_to_tei(rtf_path, ie_id, ve_id, ut_id, src_path)
                 
-                # Write XML 
-                xml_path = archive_dir / f"{rtf_path.stem}.xml"
+                # Write XML to flat archive structure using UT ID
+                xml_path = archive_dir / f"{ut_id}.xml"
                 with open(xml_path, 'w', encoding='utf-8') as f:
                     f.write(tei_xml)
                 
@@ -452,9 +455,22 @@ def process_collection(ie_id: str, sources_dir: Path, output_dir: Path, workers:
     
     logger.info(f"  Found {len(volumes)} volumes, processing with {workers} workers...")
     
-    # Prepare arguments for workers
+    # Calculate starting index for each volume to maintain sequential numbering across volumes
+    # Group volumes by VE_ID to maintain proper indexing
+    ve_index_map = {}  # Maps (ve_id, volume_num) -> starting_index
+    current_indices = {}  # Tracks current index for each ve_id
+    
+    for ve_id, volume_num, volume_folder, collection_name in volumes:
+        if ve_id not in current_indices:
+            current_indices[ve_id] = 0
+        
+        rtf_count = len(list(volume_folder.glob("*.rtf")))
+        ve_index_map[(ve_id, volume_num)] = current_indices[ve_id]
+        current_indices[ve_id] += rtf_count
+    
+    # Prepare arguments for workers with starting indices
     work_items = [
-        (ie_id, ve_id, volume_num, volume_folder, output_dir, collection_name)
+        (ie_id, ve_id, volume_num, volume_folder, output_dir, collection_name, ve_index_map[(ve_id, volume_num)])
         for ve_id, volume_num, volume_folder, collection_name in volumes
     ]
     
