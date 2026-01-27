@@ -284,15 +284,19 @@ def convert_rtf_to_tei(rtf_path: Path, ie_id: str, ve_id: str, ut_id: str, src_p
         # Skip standard RTF non-text elements
         if stream.get("type") in ("header", "footer", "pict"):
             continue
+        
+        # Clean and normalize text
         cleaned_text = remove_non_tibetan(text)
         normalized_text = normalize_unicode(cleaned_text)
         
+        # Skip if text becomes empty after cleaning
         if not normalized_text.strip():
             continue
         
         escaped_text = escape_xml(normalized_text)
         classification = classifications.get(font_size, 'regular')
         
+        # Handle markup transitions
         if classification != current_markup:
             if current_markup in ('small', 'large'):
                 tei_lines.append('</hi>')
