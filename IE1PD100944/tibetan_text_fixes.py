@@ -178,10 +178,10 @@ def fix_flying_vowels_and_linebreaks(text: str) -> str:
     if not text:
         return text
     
-    # Apply fixes in order
+    # Apply fixes in order - ONLY for combining characters that MUST attach
     result = fix_flying_vowels(text)
     result = fix_flying_subscripts(result)
-    result = fix_mid_word_breaks(result)
+    # REMOVED: fix_mid_word_breaks - was removing legitimate paragraph breaks from original RTF
     result = fix_flying_tseg(result)
     
     return result

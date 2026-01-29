@@ -319,11 +319,17 @@ def dedris_to_unicode(text: str, font_name: str) -> str:
     if not text or not text.strip():
         return text
     
-    # Skip non-Dedris fonts (e.g., Times New Roman, Arial)
-    # These fonts don't have Tibetan character mappings
-    if not font_name or not font_name.lower().startswith(('dedris', 'ededris')):
+    # Fonts that might contain Dedris-encoded characters due to font attribution errors
+    # SimSun is a Chinese font, but in these RTFs it sometimes contains Dedris text
+    SUSPICIOUS_FONTS = ('simsun', '@simsun', 'simsun western')
+    
+    # Check if this is a Dedris font
+    is_dedris = font_name and font_name.lower().startswith(('dedris', 'ededris'))
+    is_suspicious = font_name and font_name.lower() in SUSPICIOUS_FONTS
+    
+    if not is_dedris and not is_suspicious:
+        # Skip truly non-Dedris fonts (e.g., Times New Roman, Arial)
         # Log non-Dedris text that contains potential Dedris characters
-        # (ASCII chars that might be legacy encoding in wrong font context)
         has_suspicious = any(c in text for c in '{}0123456789.,;:!?@#$%^&*()[]<>')
         if has_suspicious and len(text.strip()) > 0:
             preview = text[:50].replace('\n', '\\n')
@@ -337,31 +343,33 @@ def dedris_to_unicode(text: str, font_name: str) -> str:
                 })
         return text
     
+    # For suspicious fonts (like SimSun), try converting as Dedris-a
+    # This handles font attribution errors in the original RTF
+    effective_font = font_name if is_dedris else 'Dedris-a'
+    
     try:
-        # DEBUG: Check if text contains brace characters BEFORE conversion
-        if '}' in text or '{' in text:
-            has_brace_before = True
-            brace_chars_before = [(c, ord(c)) for c in text if c in '{}']
-        else:
-            has_brace_before = False
-        
-        # Pass exact font name extracted from RTF - no fallback
-        result = convert_string(text, font_name, STATS)
+        # Pass effective font (handles font attribution errors)
+        result = convert_string(text, effective_font, STATS)
         if result is None:
             # Font not in conversion tables
             preview = text[:50].replace('\n', '\\n')
-            logger.warning(f"UNHANDLED FONT: '{font_name}' | text: '{preview}'")
+            logger.warning(f"UNHANDLED FONT: '{effective_font}' (original: '{font_name}') | text: '{preview}'")
             return text
         
-        # DEBUG: Check if braces remain AFTER conversion (should be converted to Tibetan)
-        if has_brace_before and ('}' in result or '{' in result):
-            preview_in = text[:30].replace('\n', '\\n')
-            preview_out = result[:30].replace('\n', '\\n')
-            logger.warning(f"BRACE NOT CONVERTED: font='{font_name}' | in='{preview_in}' | out='{preview_out}'")
+        # Log when we converted suspicious font text
+        if is_suspicious:
+            if "converted_suspicious" not in STATS:
+                STATS["converted_suspicious"] = []
+            if len(STATS["converted_suspicious"]) < 50:
+                STATS["converted_suspicious"].append({
+                    "font": font_name,
+                    "text": text[:30],
+                    "result": result[:30]
+                })
         
         return result
     except Exception as e:
-        logger.warning(f"Error converting with font {font_name}: {e}")
+        logger.warning(f"Error converting with font {effective_font}: {e}")
         return text
 
 
@@ -373,15 +381,8 @@ def classify_font_sizes(converted_streams: list) -> dict:
     """
     Classify font sizes into large, regular, and small categories.
     
-    Simple classification based on top 2 most occurring font sizes:
-    1. Top 2 font sizes by character count = "regular" (body text)
-    2. Anything LARGER than both = "large" (headings)
-    3. Anything SMALLER than both = "small" (annotations)
-    
-    Example: If top 2 are 18pt and 36pt:
-        - Regular: 18pt, 36pt
-        - Large: anything > 36pt
-        - Small: anything < 18pt
+    Uses frequency analysis: most common size is regular,
+    smaller sizes are 'small', larger sizes are 'large'.
     
     Args:
         converted_streams: List of dicts with 'text' (Unicode), 'font_size'
@@ -396,63 +397,26 @@ def classify_font_sizes(converted_streams: list) -> dict:
         text = item.get("text", "")
         font_size = item.get("font_size", 12)
         
-        # Count Tibetan characters using helper function
-        tibetan_chars = count_tibetan_chars(text)
+        # Count Tibetan characters (U+0F00-U+0FFF)
+        tibetan_chars = len([c for c in text if 0x0F00 <= ord(c) <= 0x0FFF])
         if tibetan_chars > 0:
             size_counts[font_size] += tibetan_chars
     
     if not size_counts:
         return {}
     
-    sizes = sorted(size_counts.keys())
-    total_chars = sum(size_counts.values())
+    # Find most frequently occurring font size - this is regular (body text)
+    most_common = max(size_counts.items(), key=lambda x: x[1])[0]
     
-    # Only one font size - everything is regular (no tags needed)
-    if len(sizes) == 1:
-        logger.info(f"  Font size distribution: only one size ({sizes[0]}pt) - all regular")
-        return {sizes[0]: 'regular'}
-    
-    # Log the distribution for debugging
-    logger.info(f"  Font size distribution (Tibetan chars): {dict(size_counts)}")
-    
-    # Sort sizes by character count (descending) to find top 2 most common
-    sizes_by_count = sorted(size_counts.items(), key=lambda x: x[1], reverse=True)
-    
-    # Get top 2 most occurring font sizes - these are "regular"
-    top_2_sizes = [sizes_by_count[i][0] for i in range(min(2, len(sizes_by_count)))]
-    
-    # Boundaries: anything smaller than min or larger than max of top 2 gets tagged
-    regular_min = min(top_2_sizes)
-    regular_max = max(top_2_sizes)
-    
-    logger.info(f"  Top 2 sizes (regular): {sorted(top_2_sizes)}")
-    
-    # Classify all sizes
+    # Classify all sizes relative to most common
     classifications = {}
-    for fs in sizes:
-        if fs in top_2_sizes:
-            # One of the top 2 = regular
+    for fs in size_counts.keys():
+        if fs == most_common:
             classifications[fs] = 'regular'
-        elif fs > regular_max:
-            # Larger than both top 2 = large (headings)
+        elif fs > most_common:
             classifications[fs] = 'large'
-        elif fs < regular_min:
-            # Smaller than both top 2 = small (annotations)
-            classifications[fs] = 'small'
         else:
-            # Between the two top sizes = regular
-            classifications[fs] = 'regular'
-    
-    # Log classification summary
-    small_sizes = [s for s, c in classifications.items() if c == 'small']
-    large_sizes = [s for s, c in classifications.items() if c == 'large']
-    regular_sizes = [s for s, c in classifications.items() if c == 'regular']
-    
-    if small_sizes:
-        logger.info(f"  Small sizes: {sorted(small_sizes)}")
-    if large_sizes:
-        logger.info(f"  Large sizes: {sorted(large_sizes)}")
-    logger.info(f"  Regular sizes: {sorted(regular_sizes)}")
+            classifications[fs] = 'small'
     
     return classifications
 
@@ -508,26 +472,43 @@ def convert_rtf_to_tei(rtf_path: Path, doc_path: Path, ve_id: str) -> str:
     
     logger.info(f"Parsed {len(streams)} text streams")
     
-    # DEBUG: Log streams containing brace characters (} or {)
-    # These are important for Dedris fonts where } = སྔ (char 125)
-    brace_count = 0
-    for stream in streams:
-        text = stream.get("text", "")
-        font_name = stream.get("font", {}).get("name", "")
-        if '}' in text or '{' in text:
-            brace_count += 1
-            # Only log first 10 to avoid spam
-            if brace_count <= 10:
-                preview = text[:80].replace('\n', '\\n')
-                logger.info(f"DEBUG BRACE: font='{font_name}', text='{preview}...'")
-    if brace_count > 0:
-        logger.info(f"DEBUG: Found {brace_count} streams with brace characters")
-    
     # Convert all Dedris to Unicode
     converted_streams = []
     for stream in streams:
-        # Skip special types (headers, footers, etc.)
+        # Skip special types (headers, footers, images, etc.)
         if stream.get("type") in ("header", "footer", "pict"):
+            continue
+        
+        # Handle paragraph breaks - convert to newline
+        if stream.get("type") == "par_break":
+            converted_streams.append({
+                "text": "\n",
+                "font_size": 12,  # Default size for breaks
+                "is_break": True
+            })
+            continue
+        
+        # Handle line breaks (forced line break inside paragraph)
+        if stream.get("type") == "line_break":
+            converted_streams.append({
+                "text": "\n",
+                "font_size": 12,
+                "is_break": True
+            })
+            continue
+        
+        # Handle table cell breaks
+        if stream.get("type") == "cell_break":
+            converted_streams.append({
+                "text": "\n",  # Just newline for cell breaks
+                "font_size": 12,
+                "is_break": True
+            })
+            continue
+        
+        # Handle table row breaks (end of row)
+        if stream.get("type") == "row_break":
+            # Row breaks don't add extra newline (cell breaks already did)
             continue
         
         text = stream.get("text", "")
@@ -615,19 +596,19 @@ def convert_rtf_to_tei(rtf_path: Path, doc_path: Path, ve_id: str) -> str:
         logger.info(f"  Stage 3: Applying normalization...")
         
         # Fix flying vowels and improper line breaks
-        body_content = fix_flying_vowels_and_linebreaks(body_content)
+        #body_content = fix_flying_vowels_and_linebreaks(body_content)
         
         # Apply full Unicode normalization (includes Tibetan-specific reordering)
         body_content = normalize_unicode(body_content)
         
-        # Final space normalization 
-        body_content = normalize_spaces(body_content, tibetan_specific=True)
+        # Final space normalization (commented out for now)
+        # body_content = normalize_spaces(body_content, tibetan_specific=True)
         
         # Fix spacing around <hi> tags based on Tibetan punctuation rules
         body_content = fix_hi_tag_spacing(body_content)
         
-        # Clean up multiple newlines
-        body_content = re.sub(r'\n\n+', '\n', body_content)
+        # Clean up multiple newlines (commented out for now)
+        # body_content = re.sub(r'\n\n+', '\n', body_content)
     else:
         logger.info(f"  Stage 3: SKIPPED (normalization disabled)")
     
@@ -639,6 +620,30 @@ def convert_rtf_to_tei(rtf_path: Path, doc_path: Path, ve_id: str) -> str:
     # Put <lb/> at beginning of each new line and remove surrounding spaces
     body_content = body_content.replace('\n', '\n<lb/>')
     body_content = re.sub(r' *<lb/> *', '\n<lb/>', body_content)
+    body_content = body_content.strip()
+    
+    # =========================================================================
+    # FIX <hi> TAG PLACEMENT
+    # =========================================================================
+    # Don't wrap whitespace/newlines only in <hi> tags
+    # Remove <hi> tags that contain only whitespace/newlines/lb tags
+    body_content = re.sub(r'<hi rend="[^"]+">[\s]*(?:<lb/>[\s]*)*</hi>', '', body_content)
+    
+    # Move <hi> from end of line to after <lb/> on next line
+    # Pattern: <hi...> followed by optional whitespace, newline, <lb/>
+    body_content = re.sub(r'(<hi rend="[^"]+">)\s*\n<lb/>', r'\n<lb/>\1', body_content)
+    
+    # Move </hi> from after <lb/> to before the newline (end of previous line)
+    # Pattern: newline, <lb/>, </hi>
+    body_content = re.sub(r'\n<lb/></hi>', r'</hi>\n<lb/>', body_content)
+    
+    # Remove double newlines
+    body_content = re.sub(r'\n\n+', '\n', body_content)
+    
+    # Clean up any remaining empty <hi> tags after the moves
+    body_content = re.sub(r'<hi rend="[^"]+">[\s]*</hi>', '', body_content)
+    
+    # Final strip
     body_content = body_content.strip()
     
     # =========================================================================
