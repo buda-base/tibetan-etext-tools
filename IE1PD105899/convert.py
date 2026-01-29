@@ -65,7 +65,7 @@ from text_cleaning import remove_non_tibetan
 # =============================================================================
 
 # Default input directory containing all IE collections
-INPUT_DIR = Path(r"/Users/tenzinmonlam/Documents/dharmaduta/file_convert_1")
+INPUT_DIR = Path(r"/Users/tenzinmonlam/Documents/dharmaduta/file_convert_1/test")
 
 # Number of parallel workers (default: CPU count - 1, min 1)
 DEFAULT_WORKERS = max(1, multiprocessing.cpu_count() - 1)
