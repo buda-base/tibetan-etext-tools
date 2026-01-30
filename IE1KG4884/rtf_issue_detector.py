@@ -40,8 +40,8 @@ RTF_COMMAND_PATTERNS = [
     # Use negative lookahead to catch each occurrence separately even when adjacent
     (r'[-–—]+PAGE\s+\d+[-–—]+(?![–—]*PAGE)', 'PAGE with dashes before and after'),
     
-    # Multiple PAGE numbers in one line
-    (r'[^<]*PAGE\s+\d+[^<]*PAGE\s+\d+', 'Multiple PAGE numbers in one line'),
+    # Multiple PAGE numbers in one line (bounded [^<]{0,500} to avoid catastrophic backtracking)
+    (r'[^<]{0,500}PAGE\s+\d+[^<]{0,500}PAGE\s+\d+', 'Multiple PAGE numbers in one line'),
     (r'»-PAGE\s+\d+[-–—]+PAGE\s+\d+[-–—]+PAGE\s+\d+[-–—]+', 'PAGE numbers with » prefix and three PAGE markers'),
 (r'»-PAGE\s+\d+[-–—]+PAGE\s+\d+[-–—]+', 'PAGE numbers with » prefix and two PAGE markers'),
 (r'»PAGE\s+\d+[-–—]+PAGE\s+\d+[-–—]+', 'PAGE numbers with » prefix (no leading dash)'),
@@ -99,12 +99,11 @@ SPURIOUS_PATTERNS = [
     (r'\\u\d+\?', 'RTF Unicode escape sequence'),
     (r'\\u\d+\'[a-z]+', 'RTF control character'),
     
-    # Duplicate text patterns
-    (r'([\u0F00-\u0FFF]{5,})\1', 'Duplicate Tibetan text'),
-    
     # Volume/file name patterns
     (r'volume_\d+_\d+', 'Volume file name pattern'),
     (r'[¡\u00A1][¤\u00A4]([¡\u00A1][¤\u00A4])+', 'Repeating inverted exclamation and currency symbol pattern'),
+    (r'(·\u00A1\u00A4)+', 'Middle dot with inverted exclamation-currency sequence'),
+    (r'\u00B7+', 'Standalone middle dot(s)'),
     (r'[¡\u00A1][¤\u00A4]\d+', 'Inverted exclamation-currency symbol followed by number'),
     
     # Also catch the RTF encoded version if it appears in XML
@@ -116,73 +115,94 @@ SPURIOUS_PATTERNS = [
     # (r'pattern_to_match', 'Description of what this pattern matches'),
 ]
 
+# <hi rend="head"> around single vowel/shad/tsek (should be unwrapped: keep char, remove tag)
+# Same character set as rtf_cleaner.HI_WRAPPER_CHARS: ་ ། ི ུ ེ ོ
+HI_WRAPPER_CHARS = '\u0F0B\u0F0D\u0F72\u0F74\u0F7A\u0F7C'
+HI_WRAPPER_DETECT_RE = re.compile(
+    r'<hi\s+rend=["\']head["\']\s*>([' + HI_WRAPPER_CHARS + r'])</hi>'
+)
+# <hi rend="head"> around short multi-char fragment (no shad ། = not a real heading; unwrap)
+HI_HEAD_MULTI_DETECT_RE = re.compile(
+    r'<hi\s+rend=["\']head["\']\s*>([^<]{2,20})</hi>'
+)
+# Short head: single dash, single Tibetan consonant/vowel/shad (བ ི ོ ༔ etc.), or 1-2 chars without shad
+HI_HEAD_SHORT_DETECT_RE = re.compile(
+    r'<hi\s+rend=["\']head["\']\s*>([^<]{1,2})</hi>'
+)
+SHAD = '\u0F0D'  # ། — real headings typically contain this
+
+# Dedris corruption: comma/dot/curly/0 in Tibetan context (used by rtf_check_fix to mark files for cleaning)
+DEDRIS_CORRUPTION_RE = re.compile(
+    r',ོ|་\.་|[{}]'
+    r'|\.[\u0F71-\u0F84]'   # dot + Tibetan vowel (.ེ .ོ etc.)
+    r'|[\u0F00-\u0FFF]\.'   # Tibetan + dot (འ. མེ. etc.)
+    r'|0་'                   # digit 0 + tsheg
+)
+
 # Non-Tibetan text patterns (lines with no Tibetan characters)
 TIBETAN_RANGE = r'[\u0F00-\u0FFF]'
 NON_TIBETAN_PATTERN = re.compile(rf'^[^{TIBETAN_RANGE}\s<>&;]*$', re.MULTILINE)
 
+# Pre-compile patterns once for speed (avoid recompiling on every file/line)
+RTF_COMMAND_PATTERNS_COMPILED = [(re.compile(p, re.I), desc) for p, desc in RTF_COMMAND_PATTERNS]
+SPURIOUS_PATTERNS_COMPILED = [(re.compile(p, re.I), desc) for p, desc in SPURIOUS_PATTERNS]
+_TIBETAN_RE = re.compile(TIBETAN_RANGE)
+_ASCII_3PLUS_RE = re.compile(r'[A-Za-z]{3,}')
+
+
+# Cap line length for regex to avoid runaway time/memory on huge lines (like convert: one file at a time)
+MAX_LINE_LEN_FOR_REGEX = 8000
+
 
 def find_rtf_commands(text: str, file_path: Path) -> List[Tuple[int, str, str, str]]:
-    """Find RTF command patterns in text."""
+    """Find RTF command patterns in text (pre-compiled regex; long lines capped to avoid CPU/memory blowup)."""
     issues = []
     lines = text.split('\n')
     
     for line_num, line in enumerate(lines, 1):
-        # Check RTF command patterns
-        for pattern, description in RTF_COMMAND_PATTERNS:
-            matches = re.finditer(pattern, line, re.IGNORECASE)
-            for match in matches:
-                # Get context (surrounding text, max 50 chars each side)
+        # Avoid catastrophic backtracking on very long lines (same memory/speed as convert)
+        line_to_scan = line[:MAX_LINE_LEN_FOR_REGEX] if len(line) > MAX_LINE_LEN_FOR_REGEX else line
+        for pattern_re, description in RTF_COMMAND_PATTERNS_COMPILED:
+            for match in pattern_re.finditer(line_to_scan):
                 start = max(0, match.start() - 20)
-                end = min(len(line), match.end() + 20)
-                context = line[start:end].strip()
-                
-                issues.append((
-                    line_num,
-                    description,
-                    match.group(0),
-                    context  # Add context
-                ))
-        
-        # Check spurious patterns
-        for pattern, description in SPURIOUS_PATTERNS:
-            matches = re.finditer(pattern, line, re.IGNORECASE)
-            for match in matches:
-                # Get context
+                end = min(len(line_to_scan), match.end() + 20)
+                context = line_to_scan[start:end].strip()
+                issues.append((line_num, description, match.group(0), context))
+        for pattern_re, description in SPURIOUS_PATTERNS_COMPILED:
+            for match in pattern_re.finditer(line_to_scan):
                 start = max(0, match.start() - 20)
-                end = min(len(line), match.end() + 20)
-                context = line[start:end].strip()
-                
-                issues.append((
-                    line_num,
-                    description,
-                    match.group(0),
-                    context  # Add context
-                ))
+                end = min(len(line_to_scan), match.end() + 20)
+                context = line_to_scan[start:end].strip()
+                issues.append((line_num, description, match.group(0), context))
+        for match in HI_WRAPPER_DETECT_RE.finditer(line_to_scan):
+            start = max(0, match.start() - 20)
+            end = min(len(line_to_scan), match.end() + 20)
+            context = line_to_scan[start:end].strip()
+            issues.append((line_num, 'HI wrapper (unwrap)', match.group(0), context))
+        for match in HI_HEAD_SHORT_DETECT_RE.finditer(line_to_scan):
+            content = match.group(1)
+            if SHAD not in content:  # no shad = short head to unwrap
+                start = max(0, match.start() - 20)
+                end = min(len(line_to_scan), match.end() + 20)
+                context = line_to_scan[start:end].strip()
+                issues.append((line_num, 'Short head (unwrap)', match.group(0), context))
     
     return issues
 
 
 def find_non_tibetan_lines(text: str, file_path: Path) -> List[Tuple[int, str]]:
-    """Find lines that contain no Tibetan characters (potential RTF artifacts)."""
+    """Find lines that contain no Tibetan characters (uses pre-compiled regex)."""
     issues = []
     lines = text.split('\n')
     
     for line_num, line in enumerate(lines, 1):
-        # Skip XML tags and empty lines
         if not line.strip() or line.strip().startswith('<'):
             continue
-        
-        # Check if line has any Tibetan characters
-        if not re.search(TIBETAN_RANGE, line):
-            # Check if it's not just whitespace or XML
-            stripped = line.strip()
-            if stripped and not stripped.startswith('<') and not stripped.endswith('>'):
-                # Check if it contains ASCII text (potential RTF command)
-                if re.search(r'[A-Za-z]{3,}', stripped):
-                    issues.append((
-                        line_num,
-                        stripped[:50]  # First 50 chars
-                    ))
+        if _TIBETAN_RE.search(line):
+            continue
+        stripped = line.strip()
+        if stripped and not stripped.startswith('<') and not stripped.endswith('>') and _ASCII_3PLUS_RE.search(stripped):
+            issues.append((line_num, stripped[:50]))
     
     return issues
 

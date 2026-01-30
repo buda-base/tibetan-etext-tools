@@ -30,114 +30,133 @@ try:
 except ImportError:
     print("Error: Could not import from rtf_issue_detector.py")
     raise
+try:
+    from tibetan_text_fixes import fix_dedris_corruption_with_count
+except ImportError:
+    fix_dedris_corruption_with_count = None
+
+
+# Cap body length for regex so fixing never gets stuck on huge files (same idea as detector line cap)
+MAX_BODY_LEN_FOR_REGEX = 400_000
+# Cap lines processed for non-Tibetan removal so huge files don't slow fixing
+MAX_LINES_FOR_NON_TIBETAN = 50_000
+
+# Unwrap <hi rend="head"> (or rend='head') around single vowel/shad/tsek: keep the character, remove the tag.
+# Vowels ིེོུ (U+0F72, 0F74, 0F7A, 0F7C), shad ། (U+0F0D), tsek ་ (U+0F0B) - belong on previous element.
+HI_WRAPPER_CHARS = '\u0F0B\u0F0D\u0F72\u0F74\u0F7A\u0F7C'  # ་ ། ི ུ ེ ོ
+HI_WRAPPER_PATTERNS = [
+    # rend="head" or rend='head', single allowed character, replace with that character
+    (re.compile(r'<hi\s+rend=["\']head["\']\s*>([' + HI_WRAPPER_CHARS + r'])</hi>'), r'\1'),
+]
+# Short head: single dash, or 1-2 chars without shad (unwrap; keep content, remove tag)
+SHAD_CHAR = '\u0F0D'  # །
+HI_SHORT_HEAD_PATTERNS = [
+    # Single ASCII dash
+    (re.compile(r'<hi\s+rend=["\']head["\']\s*>-</hi>'), r'-'),
+    # Single Tibetan consonant བ or shad variant ༔ (U+0F14)
+    (re.compile(r'<hi\s+rend=["\']head["\']\s*>(བ)</hi>'), r'\1'),
+    (re.compile(r'<hi\s+rend=["\']head["\']\s*>(༔)</hi>'), r'\1'),
+]
+# 1-2 char fragment: unwrap only when content has no shad (use callback in cleaner)
+HI_SHORT_HEAD_1_2_RE = re.compile(r'<hi\s+rend=["\']head["\']\s*>([^<]{1,2})</hi>')
 
 
 class RTFCleaner:
     """
     Centralized RTF cleaning class.
-    All cleaning operations are performed through this class.
+    Pre-compiles regex; caps body length so fixing never hangs on huge files.
     """
     
     def __init__(self):
-        """Initialize the cleaner with patterns from the detector module."""
+        """Initialize the cleaner with pre-compiled patterns from the detector module."""
         self.rtf_patterns = RTF_COMMAND_PATTERNS
         self.spurious_patterns = SPURIOUS_PATTERNS
         self.tibetan_range = TIBETAN_RANGE
-        
-        # Additional cleaning patterns that are only used for cleaning (not detection)
-        # These can be added here without affecting detection
-        self.additional_cleaning_patterns = [
-            # Add any patterns here that should be cleaned but not necessarily detected
-            # Format: (pattern, description)
-        ]
+        self._rtf_compiled = [(re.compile(p, re.I), desc) for p, desc in self.rtf_patterns]
+        self._spurious_compiled = [(re.compile(p, re.I), desc) for p, desc in self.spurious_patterns]
+        self._tibetan_re = re.compile(self.tibetan_range)
+        self._ascii_3plus_re = re.compile(r'[A-Za-z]{3,}')
+        self.additional_cleaning_patterns = []
+        self._additional_compiled = []
+    
+    def _cap_body(self, text: str) -> Tuple[str, str]:
+        """Return (prefix to process, suffix to keep) so we never hang on huge bodies."""
+        if len(text) > MAX_BODY_LEN_FOR_REGEX:
+            return text[:MAX_BODY_LEN_FOR_REGEX], text[MAX_BODY_LEN_FOR_REGEX:]
+        return text, ''
     
     def clean_rtf_commands(self, text: str) -> Tuple[str, int]:
-        """
-        Remove RTF command patterns from text.
-        
-        Args:
-            text: Text to clean
-            
-        Returns:
-            Tuple of (cleaned_text, removal_count)
-        """
-        cleaned = text
+        """Remove RTF command patterns from text (one subn per pattern, capped length)."""
+        prefix, suffix = self._cap_body(text)
         removal_count = 0
-        
-        # Process patterns in reverse order to maintain string indices
-        for pattern, description in self.rtf_patterns:
-            matches = list(re.finditer(pattern, cleaned, re.IGNORECASE))
-            if matches:
-                # Process matches in reverse to maintain correct indices
-                for match in reversed(matches):
-                    cleaned = cleaned[:match.start()] + cleaned[match.end():]
-                    removal_count += 1
-        
-        return cleaned, removal_count
+        for pattern_re, _ in self._rtf_compiled:
+            prefix, n = pattern_re.subn('', prefix)
+            removal_count += n
+        return prefix + suffix, removal_count
     
     def clean_spurious_text(self, text: str) -> Tuple[str, int]:
-        """
-        Remove spurious text patterns from text.
-        
-        Args:
-            text: Text to clean
-            
-        Returns:
-            Tuple of (cleaned_text, removal_count)
-        """
-        cleaned = text
+        """Remove spurious text patterns (one subn per pattern, capped length)."""
+        prefix, suffix = self._cap_body(text)
         removal_count = 0
-        
-        # Clean spurious patterns
-        for pattern, description in self.spurious_patterns:
-            matches = list(re.finditer(pattern, cleaned, re.IGNORECASE))
-            if matches:
-                for match in reversed(matches):
-                    cleaned = cleaned[:match.start()] + cleaned[match.end():]
-                    removal_count += 1
-        
-        # Clean additional patterns (if any)
-        for pattern, description in self.additional_cleaning_patterns:
-            matches = list(re.finditer(pattern, cleaned, re.IGNORECASE))
-            if matches:
-                for match in reversed(matches):
-                    cleaned = cleaned[:match.start()] + cleaned[match.end():]
-                    removal_count += 1
-        
-        return cleaned, removal_count
+        for pattern_re, _ in self._spurious_compiled:
+            prefix, n = pattern_re.subn('', prefix)
+            removal_count += n
+        for pattern_re, _ in self._additional_compiled:
+            prefix, n = pattern_re.subn('', prefix)
+            removal_count += n
+        return prefix + suffix, removal_count
+    
+    def clean_hi_wrappers(self, text: str) -> Tuple[str, int]:
+        """Unwrap <hi rend="head"> around single vowel/shad/tsek (ི ུ ེ ོ ། ་); keep the character, remove the tag.
+        Also unwraps short heads: single dash, བ, ༔, and 1-2 char fragments without shad."""
+        prefix, suffix = self._cap_body(text)
+        removal_count = 0
+        for pattern_re, repl in HI_WRAPPER_PATTERNS:
+            prefix, n = pattern_re.subn(repl, prefix)
+            removal_count += n
+        for pattern_re, repl in HI_SHORT_HEAD_PATTERNS:
+            prefix, n = pattern_re.subn(repl, prefix)
+            removal_count += n
+        # 1-2 char head: unwrap only if content has no shad
+        def replace_short_head(m):
+            content = m.group(1)
+            return content if SHAD_CHAR not in content else m.group(0)
+        for m in HI_SHORT_HEAD_1_2_RE.finditer(prefix):
+            if SHAD_CHAR not in m.group(1):
+                removal_count += 1
+        prefix = HI_SHORT_HEAD_1_2_RE.sub(replace_short_head, prefix)
+        return prefix + suffix, removal_count
+    
+    def clean_dedris_corruption(self, text: str) -> Tuple[str, int]:
+        """Apply table-based Dedris corruption substitutions (e.g. ,ོ→དོ, ་.་→་ན་)."""
+        if fix_dedris_corruption_with_count is None:
+            return text, 0
+        prefix, suffix = self._cap_body(text)
+        prefix, count = fix_dedris_corruption_with_count(prefix)
+        return prefix + suffix, count
     
     def clean_non_tibetan_lines(self, text: str) -> Tuple[str, int]:
-        """
-        Remove lines that contain no Tibetan characters.
-        
-        Args:
-            text: Text to clean
-            
-        Returns:
-            Tuple of (cleaned_text, removal_count)
-        """
+        """Remove lines that contain no Tibetan characters (capped line count for huge files)."""
         lines = text.split('\n')
+        if len(lines) > MAX_LINES_FOR_NON_TIBETAN:
+            to_process = lines[:MAX_LINES_FOR_NON_TIBETAN]
+            rest = lines[MAX_LINES_FOR_NON_TIBETAN:]
+        else:
+            to_process = lines
+            rest = []
         cleaned_lines = []
         removal_count = 0
-        
-        for line in lines:
-            # Keep empty lines and XML tags
+        for line in to_process:
             if not line.strip() or line.strip().startswith('<'):
                 cleaned_lines.append(line)
                 continue
-            
-            # Check if line has Tibetan characters
-            if not re.search(self.tibetan_range, line):
+            if not self._tibetan_re.search(line):
                 stripped = line.strip()
-                # Remove lines that are not XML and contain ASCII text
-                if stripped and not stripped.startswith('<') and not stripped.endswith('>'):
-                    if re.search(r'[A-Za-z]{3,}', stripped):
-                        removal_count += 1
-                        continue
-            
+                if stripped and not stripped.startswith('<') and not stripped.endswith('>') and self._ascii_3plus_re.search(stripped):
+                    removal_count += 1
+                    continue
             cleaned_lines.append(line)
-        
-        return '\n'.join(cleaned_lines), removal_count
+        return '\n'.join(cleaned_lines + rest), removal_count
     
     def clean_all(self, text: str) -> Dict[str, int]:
         """
@@ -160,6 +179,8 @@ class RTFCleaner:
         stats = {
             'rtf_commands_removed': 0,
             'spurious_text_removed': 0,
+            'hi_wrappers_removed': 0,
+            'dedris_corruption_fixes': 0,
             'non_tibetan_lines_removed': 0,
             'total_fixes': 0
         }
@@ -172,30 +193,35 @@ class RTFCleaner:
         cleaned, spurious_count = self.clean_spurious_text(cleaned)
         stats['spurious_text_removed'] = spurious_count
         
+        # Unwrap <hi rend="head"> around single vowel/shad and short heads
+        cleaned, hi_wrappers_count = self.clean_hi_wrappers(cleaned)
+        stats['hi_wrappers_removed'] = hi_wrappers_count
+        
+        # Dedris corruption substitution (e.g. ,ོ→དོ, ་.་→་ན་)
+        cleaned, corruption_count = self.clean_dedris_corruption(cleaned)
+        stats['dedris_corruption_fixes'] = corruption_count
+        
         # Clean non-Tibetan lines
         cleaned, non_tibetan_count = self.clean_non_tibetan_lines(cleaned)
         stats['non_tibetan_lines_removed'] = non_tibetan_count
         
-        stats['total_fixes'] = rtf_count + spurious_count + non_tibetan_count
+        stats['total_fixes'] = rtf_count + spurious_count + hi_wrappers_count + corruption_count + non_tibetan_count
         stats['cleaned_text'] = cleaned
         
         return stats
     
     def add_cleaning_pattern(self, pattern: str, description: str, pattern_type: str = 'spurious'):
-        """
-        Add a new cleaning pattern at runtime.
-        
-        Args:
-            pattern: Regex pattern to match
-            description: Human-readable description
-            pattern_type: 'rtf' or 'spurious' (default: 'spurious')
-        """
+        """Add a new cleaning pattern at runtime (compiles and caches)."""
+        compiled = re.compile(pattern, re.I)
         if pattern_type == 'rtf':
             self.rtf_patterns.append((pattern, description))
+            self._rtf_compiled.append((compiled, description))
         elif pattern_type == 'spurious':
             self.spurious_patterns.append((pattern, description))
+            self._spurious_compiled.append((compiled, description))
         else:
             self.additional_cleaning_patterns.append((pattern, description))
+            self._additional_compiled.append((compiled, description))
 
 
 # Global cleaner instance for convenience
@@ -219,6 +245,16 @@ def clean_rtf_commands(text: str) -> Tuple[str, int]:
 def clean_spurious_text(text: str) -> Tuple[str, int]:
     """Remove spurious text patterns from text."""
     return get_cleaner().clean_spurious_text(text)
+
+
+def clean_hi_wrappers(text: str) -> Tuple[str, int]:
+    """Unwrap <hi rend="head"> around single vowel (ི) or shad (།); keep the character, remove the tag."""
+    return get_cleaner().clean_hi_wrappers(text)
+
+
+def clean_dedris_corruption(text: str) -> Tuple[str, int]:
+    """Apply table-based Dedris corruption substitutions (e.g. ,ོ→དོ, ་.་→་ན་)."""
+    return get_cleaner().clean_dedris_corruption(text)
 
 
 def clean_non_tibetan_lines(text: str) -> Tuple[str, int]:

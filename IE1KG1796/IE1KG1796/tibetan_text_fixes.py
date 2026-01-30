@@ -178,10 +178,10 @@ def fix_flying_vowels_and_linebreaks(text: str) -> str:
     if not text:
         return text
     
-    # Apply fixes in order - ONLY for combining characters that MUST attach
+    # Apply fixes in order
     result = fix_flying_vowels(text)
     result = fix_flying_subscripts(result)
-    # REMOVED: fix_mid_word_breaks - was removing legitimate paragraph breaks from original RTF
+    result = fix_mid_word_breaks(result)
     result = fix_flying_tseg(result)
     
     return result
@@ -280,119 +280,3 @@ def normalize_tibetan_text(text: str, fix_linebreaks: bool = True,
     
     return result
 
-
-# =============================================================================
-# Dedris corruption substitution (table-based)
-# =============================================================================
-# Unambiguous replacements for common Dedris→Unicode corruption patterns.
-# Apply in body text only (not inside XML tags).
-# Order: longest strings first so specific phrases are fixed before generic ones.
-CORRUPTION_SUBSTITUTIONS = [
-    # Comma (U+002C) where ད (U+0F51) should be
-    (',ོ', 'དོ'),
-    (',གས', 'དགས'),
-    (',ི', 'དི'),
-    (',ན', 'དན'),
-    (',ོད', 'དོད'),
-    (',ོན', 'དོན'),
-    (',ིག', 'དིག'),
-    (',ག་', 'དག་'),
-    (',ར་', 'དར་'),
-    # Tsheg + full stop + tsheg → tsheg + ན + tsheg
-    ('་.་', '་ན་'),
-    ('མ.ད་', 'མཚད་'),
-    # Digit 0 as ཏ (ta): 0་ → ཏུ་ in context
-    ('གཅིག་0་ཡིན་པར་', 'གཅིག་ཏུ་ཡིན་པར་'),
-    ('གྲོལ་བ་གཅིག་0་', 'གྲོལ་བ་གཅིག་ཏུ་'),
-    ('རང་གཅིག་0-', 'རང་གཅིག་ཏུ་-'),
-    ('གཅིག་0་', 'གཅིག་ཏུ་'),
-    # .0 (dot-zero) as དེ
-    ('.0ེ་དངོས་', 'དེ་དངོས་'),
-    ('.0ེ་ཡང་', 'དེ་ཡང་'),
-    ('.0ེར་', 'དེར་'),
-    ('.0ེ་', 'དེ་'),
-    # འ. (འ + dot) → འད for common syllables
-    ('འ.ག་པའི་', 'འདག་པའི་'),
-    ('འ.ག་སྟེ', 'འདག་སྟེ'),
-    ('འ.ག་པ', 'འདག་པ'),
-    ('འ.ས་པ', 'འདས་པ'),
-    ('འ.ས་', 'འདས་'),
-    ('འ.ག་', 'འདག་'),
-    # .ེ compound phrases (dot as དེ)
-    ('.ེའི་ཕྱིར་', 'དེའི་ཕྱིར་'),
-    ('.ེ་བཞིན་ཉིད་', 'དེ་བཞིན་ཉིད་'),
-    ('.ེ་ཕྱིར་', 'དེ་ཕྱིར་'),
-    ('.ེ་ཡང་', 'དེ་ཡང་'),
-    ('.ེ་ལྟར་', 'དེ་ལྟར་'),
-    ('.ེ་ཉིད་', 'དེ་ཉིད་'),
-    ('.ེ་དངོས་', 'དེ་དངོས་'),
-    ('.ེ་ནི་', 'དེ་ནི་'),
-    ('.ེ་བཞིན་', 'དེ་བཞིན་'),
-    ('.ེ་དོན་', 'དེ་དོན་'),
-    ('.ེ་ཚེ་', 'དེ་ཚེ་'),
-    ('.ེ་དང་', 'དེ་དང་'),
-    ('.ེའི་', 'དེའི་'),
-    ('.ེ་', 'དེ་'),
-    ('.ེ', 'དེ'),
-    # .ོན (dot as དོན)
-    ('.ོན་གྱི་', 'དོན་གྱི་'),
-    ('.ོན་རང་', 'དོན་རང་'),
-    ('.ོན་', 'དོན་'),
-    # Known syllables: Tibetan + dot → Tibetan + ད
-    ('མེ.', 'མེད'),
-    ('ཆོ.', 'ཆོད'),
-    # Misc dot-as-dedris
-    ('.བུགས་', 'དབུགས་'),
-    ('.མུ', 'དམུ'),
-    ('.ེ་ཞལ་', 'དེ་ཞལ་'),
-    ('.བུལ་', 'དབུལ་'),
-    ('.ར་ཁྲོད་', 'དར་ཁྲོད་'),
-    ('.ས་', 'དས་'),
-]
-# Curly braces in Tibetan context: { often = ཀྱི་ or གི་; } often = འི་ or similar
-# Apply only when surrounded by Tibetan (conservative)
-CORRUPTION_CURLY_OPEN = re.compile(r'(\s|[\u0F00-\u0FFF]){(\s|[\u0F00-\u0FFF])')
-CORRUPTION_CURLY_CLOSE = re.compile(r'(\s|[\u0F00-\u0FFF])}(\s|[\u0F00-\u0FFF])')
-
-# Dot as ད fallback: . + Tibetan vowel → ད + vowel (apply after literal substitutions)
-CORRUPTION_DOT_VOWEL = re.compile(r'\.([\u0F71-\u0F84])')  # U+0F71-U+0F84: vowels ེ ོ ི ུ etc.
-
-
-def fix_dedris_corruption(text: str) -> str:
-    """
-    Apply table-based corruption substitutions to body text.
-    Replaces only in text; does not alter XML tag content.
-    """
-    if not text:
-        return text
-    result = text
-    for old, new in CORRUPTION_SUBSTITUTIONS:
-        result = result.replace(old, new)
-    # Curly braces: { → ཀྱི་ (common), } → འི་ (common) when between Tibetan/space
-    result = CORRUPTION_CURLY_OPEN.sub(r'\1ཀྱི་\2', result)
-    result = CORRUPTION_CURLY_CLOSE.sub(r"\1འི་\2", result)
-    # Fallback: . + Tibetan vowel → ད + vowel (catches any remaining .ེ .ོ etc.)
-    result = CORRUPTION_DOT_VOWEL.sub(r'ད\1', result)
-    return result
-
-
-def fix_dedris_corruption_with_count(text: str) -> tuple:
-    """
-    Apply table-based corruption substitutions; return (fixed_text, replacement_count).
-    """
-    if not text:
-        return text, 0
-    count = 0
-    result = text
-    for old, new in CORRUPTION_SUBSTITUTIONS:
-        n = result.count(old)
-        if n:
-            result = result.replace(old, new)
-            count += n
-    result, n_open = CORRUPTION_CURLY_OPEN.subn(r'\1ཀྱི་\2', result)
-    count += n_open
-    result, n_close = CORRUPTION_CURLY_CLOSE.subn(r"\1འི་\2", result)
-    count += n_close
-    result, n_dot_vowel = CORRUPTION_DOT_VOWEL.subn(r'ད\1', result)
-    count += n_dot_vowel
-    return result, count

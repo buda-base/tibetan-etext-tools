@@ -1,0 +1,17 @@
+# Core dependencies for RTF to XML conversion
+natsort>=8.0.0
+
+# Word document text extraction for validation
+python-docx>=1.1.0
+
+# Dedris to Unicode conversion (REQUIRED for Tibetan text conversion)
+# Install with: pip install -U git+https://github.com/buda-base/py-tiblegenc.git
+# Note: This is a git dependency, not available on PyPI
+# pytiblegenc>=0.1.0  # Uncomment when available on PyPI
+
+# Google Drive API dependencies for DOC to RTF conversion
+google-auth>=2.23.0
+google-auth-oauthlib>=1.1.0
+google-auth-httplib2>=0.1.1
+google-api-python-client>=2.100.0
+requests>=2.31.0

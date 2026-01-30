@@ -402,6 +402,28 @@ def copy_sources_to_volume_folder(volume_base: str, ve_id: str, output_dir: Path
 # Dedris to Unicode Conversion
 # =============================================================================
 
+# Known corruption patterns (wrong font can produce these)
+_CORRUPTION_PATTERNS = [
+    re.compile(r',ོ'),
+    re.compile(r'་\.་'),
+    re.compile(r'[{}]'),
+]
+_ALTERNATE_DEDRIS_FONTS = ['Dedris-vowa', 'Dedris-a', 'Dedris-b', 'Dedris-c']
+
+
+def _has_corruption(unicode_text: str) -> bool:
+    """Return True if text contains known Dedris corruption patterns."""
+    return any(p.search(unicode_text) for p in _CORRUPTION_PATTERNS)
+
+
+def _tibetan_ratio(text: str) -> float:
+    """Fraction of characters in Tibetan block U+0F00-U+0FFF."""
+    if not text:
+        return 0.0
+    tibetan_count = sum(1 for c in text if 0x0F00 <= ord(c) <= 0x0FFF)
+    return tibetan_count / len(text)
+
+
 def dedris_to_unicode(text: str, font_name: str) -> str:
     """
     Convert Dedris encoded string to Unicode using pytiblegenc.
@@ -615,6 +637,24 @@ def convert_rtf_to_tei(rtf_path: Path, doc_path: Path, ve_id: str, ut_id: str = 
         
         # Convert Dedris to Unicode
         unicode_text = dedris_to_unicode(text, font_name)
+        
+        # If output contains known corruption, try alternate Dedris fonts for this run
+        if unicode_text and _has_corruption(unicode_text):
+            best_text = unicode_text
+            best_ratio = _tibetan_ratio(unicode_text)
+            for alt_font in _ALTERNATE_DEDRIS_FONTS:
+                if (alt_font or "").lower() == (font_name or "").lower():
+                    continue
+                candidate = dedris_to_unicode(text, alt_font)
+                if not candidate:
+                    continue
+                if not _has_corruption(candidate):
+                    r = _tibetan_ratio(candidate)
+                    # Prefer clean result; among clean, prefer higher Tibetan ratio
+                    if _has_corruption(best_text) or r > best_ratio:
+                        best_text = candidate
+                        best_ratio = r
+            unicode_text = best_text
         
         # Keep streams even if they only have whitespace/newlines (for structure)
         if not unicode_text:
@@ -1056,7 +1096,8 @@ def convert_all_files(output_dir: Path = None):
             for idx, rtf_path in enumerate(files):
                 file_num += 1
                 ut_id = get_ut_id_with_index(ve_id, idx)
-                logger.info(f"[{file_num}/{total_files}] {rtf_path.name} -> {ve_id} ({ut_id})")
+                pct = round(100 * file_num / total_files)
+                logger.info(f"[{file_num}/{total_files}] ({pct}%) {rtf_path.name} -> {ve_id} ({ut_id})")
                 result = convert_single_file(rtf_path, ve_id, output_dir, ut_id=ut_id)
                 if result:
                     success += 1
@@ -1100,8 +1141,8 @@ def convert_all_files(output_dir: Path = None):
     for idx in range(num_pairs):
         ve_id = ve_ids[idx]
         rtf_path = volume_files[idx]
-        
-        logger.info(f"[{idx + 1}/{num_pairs}] {rtf_path.name} -> {ve_id}")
+        pct = round(100 * (idx + 1) / num_pairs)
+        logger.info(f"[{idx + 1}/{num_pairs}] ({pct}%) {rtf_path.name} -> {ve_id}")
         
         result = convert_single_file(rtf_path, ve_id, output_dir)
         if result:

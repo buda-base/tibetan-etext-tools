@@ -131,6 +131,12 @@ ENV/
 env.bak/
 venv.bak/
 
+# Google API credentials (sensitive - never commit!)
+credentials.json
+token.json
+service_account.json
+*.json.enc
+
 # Spyder project settings
 .spyderproject
 .spyproject
