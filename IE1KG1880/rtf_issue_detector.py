@@ -1,0 +1,199 @@
+#!/usr/bin/env python3
+"""
+RTF Issue Detection Module
+
+This module contains all the patterns and functions for detecting RTF commands
+and spurious text in XML files.
+"""
+
+import re
+from pathlib import Path
+from typing import List, Tuple
+
+# RTF command patterns to detect
+# To add new RTF command patterns, simply add them to this list.
+# Format: (regex_pattern, description)
+RTF_COMMAND_PATTERNS = [
+    # Page number commands
+    (r'PAGE\s+\*\s+MERGEFORMAT\s+\d+', 'PAGE * MERGEFORMAT'),
+    (r'NUMPAGES\s+\*\s+MERGEFORMAT', 'NUMPAGES * MERGEFORMAT'),
+    (r'PAGE\s+OF\s+NUMPAGES', 'PAGE OF NUMPAGES'),
+    
+    # Date/time commands
+    (r'DATE\s+\*\s+MERGEFORMAT', 'DATE * MERGEFORMAT'),
+    (r'TIME\s+\*\s+MERGEFORMAT', 'TIME * MERGEFORMAT'),
+    
+    # Reference commands
+    (r'REF\s+\w+\s+\*\s+MERGEFORMAT', 'REF * MERGEFORMAT'),
+    
+    # Other common RTF field codes
+    (r'SEQ\s+\w+', 'SEQ field'),
+    (r'STYLEREF\s+\d+', 'STYLEREF'),
+    (r'TOC\s+\\', 'TOC field'),
+    
+    # General MERGEFORMAT pattern
+    (r'\w+\s+\*\s+MERGEFORMAT', 'MERGEFORMAT field'),
+    
+    # New patterns for PAGE numbers
+    (r'PAGE\s+\d+', 'PAGE followed by number'),
+    # PAGE with dashes before and after (e.g., -PAGE 228-, --PAGE 229-)
+    # Use negative lookahead to catch each occurrence separately even when adjacent
+    (r'[-–—]+PAGE\s+\d+[-–—]+(?![–—]*PAGE)', 'PAGE with dashes before and after'),
+    
+    # Multiple PAGE numbers in one line
+    (r'[^<]*PAGE\s+\d+[^<]*PAGE\s+\d+', 'Multiple PAGE numbers in one line'),
+    (r'»-PAGE\s+\d+[-–—]+PAGE\s+\d+[-–—]+PAGE\s+\d+[-–—]+', 'PAGE numbers with » prefix and three PAGE markers'),
+(r'»-PAGE\s+\d+[-–—]+PAGE\s+\d+[-–—]+', 'PAGE numbers with » prefix and two PAGE markers'),
+(r'»PAGE\s+\d+[-–—]+PAGE\s+\d+[-–—]+', 'PAGE numbers with » prefix (no leading dash)'),
+(r'PAGE\s+\d+[-–—]+PAGE\s+\d+[-–—]+', 'PAGE numbers without leading dash or »'),
+    # French quotation marks (guillemets)
+(r'[«»]', 'French quotation marks (guillemets)'),
+
+# Multiple PAGE numbers with dashes in sequence
+(r'[-–—]+PAGE\s+\d+[-–—]+PAGE\s+\d+[-–—]+PAGE\s+\d+[-–—]+', 'Multiple PAGE numbers with dashes in sequence'),
+(r'[-–—]+PAGE\s+\d+[-–—]+PAGE\s+\d+[-–—]+', 'Two PAGE numbers with dashes in sequence'),
+
+# PAGE PAGE pattern
+(r'PAGE\s+PAGE\s+[-–—]+PAGE\s+\d+[-–—]+', 'PAGE PAGE followed by PAGE number pattern'),
+# French quotation marks (guillemets)
+(r'[«»]', 'French quotation marks (guillemets)'),
+
+# Multiple PAGE numbers with dashes in sequence
+(r'[-–—]+PAGE\s+\d+[-–—]+PAGE\s+\d+[-–—]+PAGE\s+\d+[-–—]+', 'Multiple PAGE numbers with dashes in sequence'),
+(r'[-–—]+PAGE\s+\d+[-–—]+PAGE\s+\d+[-–—]+', 'Two PAGE numbers with dashes in sequence'),
+
+# PAGE PAGE patterns (various forms)
+(r'PAGE\s+PAGE\s+[-–—]+PAGE\s+\d+[-–—]+', 'PAGE PAGE followed by PAGE number pattern'),
+(r'\d+PAGE\s+PAGE\s+[-–—]+', 'Number followed by PAGE PAGE and dashes'),
+(r'PAGE\s+PAGE\s+[-–—]+', 'PAGE PAGE followed by dashes'),
+# Standalone dashes (multiple dashes that are spurious)
+(r'[-–—]{3,}', 'Standalone multiple dashes'),
+]
+
+# Spurious text patterns
+# To add new spurious elements, simply add them to this list.
+# Format: (regex_pattern, description)
+SPURIOUS_PATTERNS = [
+    (r'Got these', 'Spurious "Got these" text'),
+    # Semicolon patterns - one, two, or three
+    (r'<lb/>\s*;', '<lb/> followed by single semicolon'),
+    (r'<lb/>\s*;;', '<lb/> followed by two semicolons'),
+    (r'<lb/>\s*;;;', '<lb/> followed by three semicolons'),
+    (r'<lb/>\s*;{4,}', '<lb/> followed by four or more semicolons'),
+    # Standalone semicolons (not part of Tibetan text)
+    (r'(?<![\u0F00-\u0FFF])\s*;\s*(?![\u0F00-\u0FFF])', 'Standalone semicolon'),
+    # <lb/> followed by single letter (like 'p', 'r', etc.)
+    (r'<lb/>\s*([a-zA-Z])(?:\s|$)', '<lb/> followed by single letter'),
+    # Multiple line breaks with semicolons
+    (r'<lb/>\s*<lb/>\s*;+', 'Multiple line breaks with semicolons'),
+    # <lb/> followed by non-Tibetan text
+    (r'<lb/>\s*([A-Za-z]{2,})(?:\s|$)', '<lb/> followed by ASCII text'),
+    # PAGE numbers with various dash patterns
+    (r'[-–—]+\s*PAGE\s+\d+\s*[-–—]+', 'PAGE number with dashes'),
+    (r'PAGE\s+\d+\s*[-–—]+\s*PAGE\s+\d+', 'Multiple PAGE numbers with dashes'),
+    
+    # Standalone numbers (4 digits, likely years or page numbers)
+    (r'(?<![\u0F00-\u0FFF])\b\d{4}\b(?![\u0F00-\u0FFF])', 'Standalone 4-digit number'),
+    
+    # RTF control characters appearing as text
+    (r'\\u\d+\?', 'RTF Unicode escape sequence'),
+    (r'\\u\d+\'[a-z]+', 'RTF control character'),
+    
+    # Duplicate text patterns
+    (r'([\u0F00-\u0FFF]{5,})\1', 'Duplicate Tibetan text'),
+    
+    # Volume/file name patterns
+    (r'volume_\d+_\d+', 'Volume file name pattern'),
+    (r'[¡\u00A1][¤\u00A4]([¡\u00A1][¤\u00A4])+', 'Repeating inverted exclamation and currency symbol pattern'),
+    (r'[¡\u00A1][¤\u00A4]\d+', 'Inverted exclamation-currency symbol followed by number'),
+    
+    # Also catch the RTF encoded version if it appears in XML
+    (r'\\u161[\\\'a1]*\\u164[\\\'a4]*', 'RTF encoded inverted exclamation-currency pattern'),
+    (r'««', 'Double French quotation marks (guillemets)'),
+    (r'«»', 'Mixed French quotation marks'),
+    (r'</hi>\s*<hi rend="([^"]+)">', 'Consecutive <hi> tags with same rend attribute (should be merged)'),
+    # Issues with hi rend="small" tags
+    (r'<hi rend="small">\s*</hi>', 'Empty <hi rend="small"> tag (no content)'),
+    (r'<hi rend="small">\s+</hi>', '<hi rend="small"> tag with only whitespace'),
+    (r'<hi rend="small">\s*(<lb\s*/?>\s*)*</hi>', '<hi rend="small"> tag with only whitespace and/or <lb/> tags (no text content)'),
+    (r'<hi rend="head">[^<]*<hi rend="small">', 'Nested <hi rend="small"> inside <hi rend="head"> (may be missing closing tag)'),
+    (r'<hi rend="small">[^<]*$', 'Unclosed <hi rend="small"> tag at end of line'),
+    (r'<hi rend="small">[^<]*<hi rend="small">', 'Consecutive <hi rend="small"> tags without closing (nested incorrectly)'),
+    # Add more spurious patterns here as needed
+    # Example:
+    # (r'pattern_to_match', 'Description of what this pattern matches'),
+]
+
+# Non-Tibetan text patterns (lines with no Tibetan characters)
+TIBETAN_RANGE = r'[\u0F00-\u0FFF]'
+NON_TIBETAN_PATTERN = re.compile(rf'^[^{TIBETAN_RANGE}\s<>&;]*$', re.MULTILINE)
+
+# Precompiled regexes (compile once at import; used in hot loops)
+TIBETAN_RE = re.compile(TIBETAN_RANGE)
+ASCII_WORD_RE = re.compile(r'[A-Za-z]{3,}')
+RTF_COMMAND_COMPILED = [(re.compile(p, re.IGNORECASE), d) for p, d in RTF_COMMAND_PATTERNS]
+SPURIOUS_COMPILED = [(re.compile(p, re.IGNORECASE), d) for p, d in SPURIOUS_PATTERNS]
+# Patterns that can cause catastrophic backtracking on long lines; run only on short lines
+_MAX_LINE_LEN_FOR_BACKREF = 500
+_MAX_LINE_LEN_FOR_OPEN_ENDED = 2000  # for patterns with [^<]* etc.
+# RTF: "Multiple PAGE numbers in one line" uses [^<]* and is slow on long lines
+RTF_SAFE = [(r, d) for r, d in RTF_COMMAND_COMPILED if 'Multiple PAGE numbers in one line' not in d]
+RTF_LONG_LINE_UNSAFE = [(r, d) for r, d in RTF_COMMAND_COMPILED if 'Multiple PAGE numbers in one line' in d]
+SPURIOUS_SAFE = [(r, d) for r, d in SPURIOUS_COMPILED if 'Duplicate Tibetan' not in d]
+SPURIOUS_LONG_LINE_UNSAFE = [(r, d) for r, d in SPURIOUS_COMPILED if 'Duplicate Tibetan' in d]
+
+
+def find_rtf_commands(text: str, file_path: Path) -> List[Tuple[int, str, str, str]]:
+    """Find RTF command patterns in text."""
+    issues = []
+    lines = text.split('\n')
+    
+    for line_num, line in enumerate(lines, 1):
+        for regex, description in RTF_SAFE:
+            for match in regex.finditer(line):
+                start = max(0, match.start() - 20)
+                end = min(len(line), match.end() + 20)
+                context = line[start:end].strip()
+                issues.append((line_num, description, match.group(0), context))
+        if len(line) <= _MAX_LINE_LEN_FOR_OPEN_ENDED:
+            for regex, description in RTF_LONG_LINE_UNSAFE:
+                for match in regex.finditer(line):
+                    start = max(0, match.start() - 20)
+                    end = min(len(line), match.end() + 20)
+                    context = line[start:end].strip()
+                    issues.append((line_num, description, match.group(0), context))
+        
+        for regex, description in SPURIOUS_SAFE:
+            for match in regex.finditer(line):
+                start = max(0, match.start() - 20)
+                end = min(len(line), match.end() + 20)
+                context = line[start:end].strip()
+                issues.append((line_num, description, match.group(0), context))
+        if len(line) <= _MAX_LINE_LEN_FOR_BACKREF:
+            for regex, description in SPURIOUS_LONG_LINE_UNSAFE:
+                for match in regex.finditer(line):
+                    start = max(0, match.start() - 20)
+                    end = min(len(line), match.end() + 20)
+                    context = line[start:end].strip()
+                    issues.append((line_num, description, match.group(0), context))
+    
+    return issues
+
+
+def find_non_tibetan_lines(text: str, file_path: Path) -> List[Tuple[int, str]]:
+    """Find lines that contain no Tibetan characters (potential RTF artifacts)."""
+    issues = []
+    lines = text.split('\n')
+    
+    for line_num, line in enumerate(lines, 1):
+        if not line.strip() or line.strip().startswith('<'):
+            continue
+        if TIBETAN_RE.search(line):
+            continue
+        stripped = line.strip()
+        if stripped and not stripped.startswith('<') and not stripped.endswith('>'):
+            if ASCII_WORD_RE.search(stripped):
+                issues.append((line_num, stripped[:50]))
+    
+    return issues
+
