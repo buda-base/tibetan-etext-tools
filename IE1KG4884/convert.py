@@ -5,11 +5,12 @@ Convert RTF files from IE1PD100944 (KAMA Collection) to TEI XML format.
 This script converts RTF files with Dedris legacy encoding to Unicode TEI XML.
 
 Pipeline:
-1. Parse RTF using basic_rtf parser (extracts text with font info)
-2. Convert Dedris encoding to Unicode using pytiblegenc
-3. Normalize Unicode (Tibetan-specific normalization)
-4. Classify font sizes (regular/small/large)
-5. Generate TEI XML with proper structure
+1. Strip embedded image groups ({\\pict ... }) from RTF so only text is converted.
+2. Parse RTF using basic_rtf parser (extracts text with font info)
+3. Convert Dedris encoding to Unicode using pytiblegenc
+4. Normalize Unicode (Tibetan-specific normalization)
+5. Classify font sizes (regular/small/large)
+6. Generate TEI XML with proper structure
 
 Usage:
     # Test on first file (give RTF folder via --ie-id or --rtf-dir):
@@ -28,6 +29,7 @@ import os
 import re
 import hashlib
 import shutil
+import tempfile
 import argparse
 import logging
 from pathlib import Path
@@ -135,6 +137,69 @@ def find_files_recursive(directory: Path, extensions: set = None) -> list:
     return files
 
 
+def _rtf_pict_keyword_end(s: str, i: int) -> int:
+    """Return end index of \\pict control word (\\pict, \\pict0, \\pict-123, etc.)."""
+    if i + 5 > len(s) or not s.startswith("\\pict", i):
+        return i
+    j = i + 5
+    while j < len(s) and (s[j] == "-" or s[j].isdigit()):
+        j += 1
+    if j < len(s) and s[j] in " \n\r\t":
+        j += 1
+    return j
+
+
+def strip_rtf_picture_groups(rtf_str: str) -> str:
+    """
+    Remove RTF picture groups {\\pict ... } from the string so the rest can be parsed as text.
+    Uses brace matching: when \\pict (full control word) is seen inside a group, the whole
+    group from the opening { to the matching } is removed.
+    """
+    out = []
+    stack = []  # indices into out where we output '{'
+    i = 0
+    n = len(rtf_str)
+    while i < n:
+        if rtf_str[i] == "{":
+            stack.append(len(out))
+            out.append("{")
+            i += 1
+        elif rtf_str[i] == "}":
+            if stack:
+                stack.pop()
+            out.append("}")
+            i += 1
+        elif rtf_str[i] == "\\" and rtf_str.startswith("\\pict", i):
+            j = _rtf_pict_keyword_end(rtf_str, i)
+            if stack:
+                open_pos = stack.pop()
+                del out[open_pos:]
+                level = 1
+                while j < n and level > 0:
+                    if rtf_str[j] == "{":
+                        level += 1
+                    elif rtf_str[j] == "}":
+                        level -= 1
+                    j += 1
+                i = j
+            else:
+                i = j
+        else:
+            if rtf_str[i] == "\\":
+                out.append("\\")
+                i += 1
+                while i < n and (rtf_str[i].isalnum() or (rtf_str[i] == "-" and i + 1 < n and rtf_str[i + 1].isdigit())):
+                    out.append(rtf_str[i])
+                    i += 1
+                if i < n and rtf_str[i] in " \n\r\t":
+                    out.append(rtf_str[i])
+                    i += 1
+            else:
+                out.append(rtf_str[i])
+                i += 1
+    return "".join(out)
+
+
 def extract_ve_id_from_path(file_path: Path, ie_id: str) -> str:
     """
     Extract VE ID from file path (from IE1PD104832).
@@ -162,7 +227,10 @@ def extract_ve_id_from_path(file_path: Path, ie_id: str) -> str:
             elif re.match(r'vol(ume)?[_\s]?(\d+)', name, re.I):
                 match = re.search(r'(\d+)', name)
                 if match:
-                    return f'VE{match.group(1).zfill(3)}'
+                    # Use same naming as toprocess: VE{IE suffix}_{volume}, e.g. VE1KG4884_001
+                    vol_num = match.group(1).zfill(3)
+                    ie_suffix = ie_id[2:] if len(ie_id) > 2 else ie_id
+                    return f'VE{ie_suffix}_{vol_num}'
         parent = parent.parent
         if parent == parent.parent:
             break
@@ -206,9 +274,15 @@ def get_ve_ids_from_toprocess(toprocess_path: Path = None) -> list:
     
     ve_ids = []
     for folder in toprocess_path.iterdir():
-        if folder.is_dir() and folder.name.startswith(f'{IE_ID}-'):
-            ve_id = folder.name.replace(f'{IE_ID}-', '')  # "VE3KG466"
-            ve_ids.append(ve_id)
+        if not folder.is_dir():
+            continue
+        if folder.name.startswith(f'{IE_ID}-'):
+            ve_id = folder.name.replace(f'{IE_ID}-', '')  # "VE3KG466" or "VE1KG4884_001"
+            if ve_id:
+                ve_ids.append(ve_id)
+        elif folder.name.startswith('VE') and len(folder.name) > 2 and any(c.isalnum() or c == '_' for c in folder.name[2:]):
+            # e.g. toprocess/VE1KG4884_001/ -> use folder name as ve_id
+            ve_ids.append(folder.name)
     
     result = natsorted(ve_ids)
     logger.info(f"Found {len(result)} VE IDs")
@@ -330,18 +404,20 @@ def find_all_related_source_files(volume_base: str, rtf_dir: Path = None, doc_di
     # e.g., KAMA-001 matches KAMA-001.rtf, KAMA-001-a.rtf, KAMA-001-a-1.rtf
     # but NOT KAMA-0010.rtf (that would be volume 10, not 001)
     
-    # Find RTF files
+    # Find RTF files (search recursively so sources in subdirs like sources/volume_001/ are found)
     if rtf_dir.exists():
-        for rtf_file in rtf_dir.glob(f"{volume_base}*.rtf"):
-            # Make sure it's an exact base match (not a different volume number)
-            # e.g., KAMA-001 should match KAMA-001-a but not KAMA-0010
+        for rtf_file in rtf_dir.rglob(f"{volume_base}*.rtf"):
+            if "_output" in rtf_file.parts:
+                continue
             name_without_ext = rtf_file.stem
             if name_without_ext == volume_base or name_without_ext.startswith(f"{volume_base}-"):
                 related_files.append(rtf_file)
     
-    # Find DOC files
+    # Find DOC files (search recursively)
     if doc_dir.exists():
-        for doc_file in doc_dir.glob(f"{volume_base}*.doc"):
+        for doc_file in doc_dir.rglob(f"{volume_base}*.doc"):
+            if "_output" in doc_file.parts:
+                continue
             name_without_ext = doc_file.stem
             if name_without_ext == volume_base or name_without_ext.startswith(f"{volume_base}-"):
                 related_files.append(doc_file)
@@ -350,7 +426,8 @@ def find_all_related_source_files(volume_base: str, rtf_dir: Path = None, doc_di
 
 
 def copy_sources_to_volume_folder(volume_base: str, ve_id: str, output_dir: Path = None,
-                                   rtf_dir: Path = None, doc_dir: Path = None) -> int:
+                                   rtf_dir: Path = None, doc_dir: Path = None,
+                                   rtf_path: Path = None, doc_path: Path = None) -> int:
     """
     Copy all source files (DOC and RTF, including splits) to the volume's sources folder.
     
@@ -367,6 +444,8 @@ def copy_sources_to_volume_folder(volume_base: str, ve_id: str, output_dir: Path
         output_dir: Output directory (default: OUTPUT_DIR)
         rtf_dir: RTF source directory (default: RTF_DIR)
         doc_dir: DOC source directory (default: SOURCE_DOC_DIR)
+        rtf_path: Optional path to the RTF file being converted (always copied if given)
+        doc_path: Optional path to the DOC file (always copied if given and exists)
         
     Returns:
         Number of files copied
@@ -382,8 +461,16 @@ def copy_sources_to_volume_folder(volume_base: str, ve_id: str, output_dir: Path
     sources_ve_dir = output_dir / "sources" / ve_id
     sources_ve_dir.mkdir(parents=True, exist_ok=True)
     
-    # Find all related files
+    # Find all related files (recursive search under rtf_dir / doc_dir)
     related_files = find_all_related_source_files(volume_base, rtf_dir, doc_dir)
+    
+    # Always include the file(s) being converted so at least they are in output sources
+    seen_names = {p.name for p in related_files}
+    if rtf_path is not None and rtf_path.exists() and rtf_path.name not in seen_names:
+        related_files.append(rtf_path)
+        seen_names.add(rtf_path.name)
+    if doc_path is not None and doc_path.exists() and doc_path.name not in seen_names:
+        related_files.append(doc_path)
     
     copied_count = 0
     for src_file in related_files:
@@ -586,9 +673,21 @@ def convert_rtf_to_tei(rtf_path: Path, doc_path: Path, ve_id: str, ut_id: str = 
     # STAGE 1: Parse RTF and Convert to Unicode
     # =========================================================================
     logger.info(f"Parsing RTF file: {rtf_path.name}")
-    parser = BasicRTF()
-    parser.parse_file(str(rtf_path))
-    streams = parser.get_streams()
+    with open(rtf_path, encoding="utf-8", errors="ignore") as f:
+        rtf_content = f.read()
+    rtf_content = strip_rtf_picture_groups(rtf_content)
+    tmp_fd, tmp_path = tempfile.mkstemp(suffix=".rtf", prefix="ie1kg4884_")
+    try:
+        with os.fdopen(tmp_fd, "w", encoding="utf-8") as tf:
+            tf.write(rtf_content)
+        parser = BasicRTF()
+        parser.parse_file(tmp_path)
+        streams = parser.get_streams()
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
     
     logger.info(f"Parsed {len(streams)} text streams")
     
@@ -789,8 +888,9 @@ def convert_rtf_to_tei(rtf_path: Path, doc_path: Path, ve_id: str, ut_id: str = 
     # =========================================================================
     if ut_id is None:
         ut_id = get_ut_id_from_ve(ve_id)
-    sha256 = calculate_sha256(doc_path)
-    src_path = f"sources/{ve_id}/{doc_path.name}"
+    source_file = doc_path if doc_path.exists() else rtf_path
+    sha256_ref = calculate_sha256(source_file)
+    src_path = f"{ve_id}/{source_file.name}"
     
     tei_xml = f'''<?xml version="1.0" encoding="UTF-8"?>
 <TEI xmlns="http://www.tei-c.org/ns/1.0">
@@ -805,7 +905,7 @@ def convert_rtf_to_tei(rtf_path: Path, doc_path: Path, ve_id: str, ut_id: str = 
 <sourceDesc>
 <bibl>
 <idno type="src_path">{src_path}</idno>
-<idno type="src_sha256">{sha256}</idno>
+<idno type="sha256">{sha256_ref}</idno>
 <idno type="bdrc_ie">http://purl.bdrc.io/resource/{IE_ID}</idno>
 <idno type="bdrc_ve">http://purl.bdrc.io/resource/{ve_id}</idno>
 <idno type="bdrc_ut">http://purl.bdrc.io/resource/{ut_id}</idno>
@@ -905,9 +1005,10 @@ def convert_single_file(rtf_path: Path, ve_id: str, output_dir: Path = None, rtf
     
     logger.info(f"  Output: {xml_path}")
     
-    # Copy all related source files (DOC + RTF, including splits) to sources/{VE_ID}/
+    # Copy all related source files (DOC + RTF, including splits) to output sources/{VE_ID}/
     volume_base = get_volume_base_name(rtf_path)
-    copy_sources_to_volume_folder(volume_base, ve_id, output_dir, rtf_dir=rtf_dir, doc_dir=doc_dir)
+    copy_sources_to_volume_folder(volume_base, ve_id, output_dir, rtf_dir=rtf_dir, doc_dir=doc_dir,
+                                   rtf_path=rtf_path, doc_path=doc_path if doc_path.exists() else None)
     
     return xml_path
 
