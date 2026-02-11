@@ -3,9 +3,9 @@
 Converts DOC/DOCX to RTF (Word by default, or Google Drive API).
 
 ```bash
-python convert_doc_to_rtf.py --ie-id IE8CZ264
-python convert_doc_to_rtf.py --ie-id IE8CZ264 --method drive
-python convert_doc_to_rtf.py --ie-id IE8CZ264 --remove-original
+python convert_doc_to_rtf.py --ie-id IE8CZ274
+python convert_doc_to_rtf.py --ie-id IE8CZ274 --method drive
+python convert_doc_to_rtf.py --ie-id IE8CZ274 --remove-original
 ```
 
 Options: `--ie-id` (required), `--method {word,drive}`, `--input-dir`, `--remove-original`.
@@ -19,15 +19,15 @@ Dedris fonts are converted to Unicode in the RTF→XML step (`convert.py`), not 
 **Test first file only** (no filename; recursively finds RTF and converts the first). Requires `--ie-id` or `--rtf-dir`:
 
 ```bash
-python convert.py --ie-id IE8CZ264 --test-first
-python convert.py --rtf-dir ../rtf/IE8CZ264 --test-first
+python convert.py --ie-id IE8CZ274 --test-first
+python convert.py --rtf-dir ../rtf/IE8CZ274 --test-first
 ```
 
 **Single file or all:**
 
 ```bash
-python convert.py --ie-id IE8CZ264 --single yourfile.rtf
-python convert.py --ie-id IE8CZ264 --all
+python convert.py --ie-id IE8CZ274 --single yourfile.rtf
+python convert.py --ie-id IE8CZ274 --all
 ```
 
 | Option | Description |
@@ -46,9 +46,9 @@ Output: `{output_dir}/archive/{VE_ID}/*.xml` and `.../sources/{VE_ID}/*.rtf`.
 # RTF check/fix (`rtf_check_fix.py`)
 
 ```bash
-python rtf_check_fix.py --ie-id IE8CZ264
-python rtf_check_fix.py --ie-id IE8CZ264 --no-fix
-python rtf_check_fix.py --ie-id IE8CZ264 --output report.txt
+python rtf_check_fix.py --ie-id IE8CZ274
+python rtf_check_fix.py --ie-id IE8CZ274 --no-fix
+python rtf_check_fix.py --ie-id IE8CZ274 --output report.txt
 ```
 
 Default input: `../rtf`. Fixes write to `archive/` (no backup). Add patterns in `rtf_issue_detector.py` (RTF_COMMAND_PATTERNS, SPURIOUS_PATTERNS).
@@ -58,8 +58,8 @@ Default input: `../rtf`. Fixes write to `archive/` (no backup). Add patterns in 
 # Export (`export_outputs.py`)
 
 ```bash
-python export_outputs.py --ie-id IE8CZ264
-python export_outputs.py --ie-id IE8CZ264 --output-dir /path/to/export
+python export_outputs.py --ie-id IE8CZ274
+python export_outputs.py --ie-id IE8CZ274 --output-dir /path/to/export
 python export_outputs.py --dry-run
 ```
 
@@ -69,7 +69,7 @@ Reads from `rtf/{IE_ID}/{IE_ID}_output/`, writes to `export/{IE_ID}/` (no `_outp
 
 # Quick start
 
-1. DOC→RTF: `python convert_doc_to_rtf.py --ie-id IE8CZ264`
-2. RTF→XML: `python convert.py --ie-id IE8CZ264 --test-first` or `--all`
-3. Check RTF: `python rtf_check_fix.py --ie-id IE8CZ264`
-4. Export: `python export_outputs.py --ie-id IE8CZ264`
+1. DOC→RTF: `python convert_doc_to_rtf.py --ie-id IE8CZ274`
+2. RTF→XML: `python convert.py --ie-id IE8CZ274 --test-first` or `--all`
+3. Check RTF: `python rtf_check_fix.py --ie-id IE8CZ274`
+4. Export: `python export_outputs.py --ie-id IE8CZ274`

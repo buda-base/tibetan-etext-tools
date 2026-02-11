@@ -57,6 +57,7 @@ script_dir = Path(__file__).parent
 sys.path.insert(0, str(script_dir))
 
 from basic_rtf import BasicRTF
+from basic_text import BasicText
 from normalization import normalize_unicode, normalize_spaces
 from tibetan_text_fixes import (
     fix_flying_vowels_and_linebreaks,
@@ -89,7 +90,7 @@ IE_ID = "IE1PD100944"
 # Paths - adjust these as needed (Windows KAMA layout)
 BASE_DIR = Path(r"C:\Users\GANGA GYATSO\OneDrive\Documents\IE1PD100944")
 SOURCE_DOC_DIR = BASE_DIR / "IE1PD100944" / "sources"
-RTF_DIR = BASE_DIR / "IE1PD100944_rtf"
+SRC_DIR = BASE_DIR / "IE1PD100944_rtf"
 TOPROCESS_DIR = BASE_DIR / "IE1PD100944" / "toprocess"
 OUTPUT_DIR = BASE_DIR / "IE1PD100944_output"
 
@@ -98,11 +99,11 @@ OUTPUT_DIR = BASE_DIR / "IE1PD100944_output"
 if not BASE_DIR.exists():
     BASE_DIR = script_dir.parent
     IE_ID = "IE1KG4884"
-    RTF_DIR = BASE_DIR / "rtf" / "IE1KG4884"
-    SOURCE_DOC_DIR = RTF_DIR  # same folder as RTF for single-file test
-    TOPROCESS_DIR = RTF_DIR / "toprocess"
-    OUTPUT_DIR = RTF_DIR / f"{IE_ID}_output"
-    logger.info(f"Using repo-relative paths for {IE_ID}: RTF_DIR={RTF_DIR}")
+    SRC_DIR = BASE_DIR / "rtf" / "IE1KG4884"
+    SOURCE_DOC_DIR = SRC_DIR  # same folder as RTF for single-file test
+    TOPROCESS_DIR = SRC_DIR / "toprocess"
+    OUTPUT_DIR = SRC_DIR / f"{IE_ID}_output"
+    logger.info(f"Using repo-relative paths for {IE_ID}: SRC_DIR={SRC_DIR}")
 
 # Global stats for pytiblegenc
 STATS = {
@@ -114,7 +115,7 @@ STATS = {
 }
 
 # Supported file extensions for recursive discovery (same as IE1PD104832)
-SUPPORTED_EXTENSIONS = {'.rtf', '.doc'}
+SUPPORTED_EXTENSIONS = {'.rtf', '.doc','.txt'}
 
 
 # =============================================================================
@@ -127,7 +128,7 @@ def find_files_recursive(directory: Path, extensions: set = None) -> list:
     
     Args:
         directory: Directory to search
-        extensions: Set of file extensions (e.g., {'.rtf', '.doc'})
+        extensions: Set of file extensions (e.g., {'.rtf', '.doc','.txt'})
         
     Returns:
         List of Path objects
@@ -260,14 +261,25 @@ def group_files_by_volume(files: list, ie_id: str) -> dict:
 # VE/UT ID Functions (from toprocess folder)
 # =============================================================================
 
+def _short_ve_id(ve_id: str) -> str:
+    """
+    Return the short VE part for BDRC URIs and UT IDs.
+    IE8CZ266-VE8CZ88 -> VE8CZ88; VE8CZ88 -> VE8CZ88.
+    """
+    if ve_id.startswith(f"{IE_ID}-"):
+        return ve_id[len(IE_ID) + 1:]
+    return ve_id
+
+
 def get_ve_ids_from_toprocess(toprocess_path: Path = None) -> list:
     """
     Get sorted VE IDs from toprocess folder.
     
-    Reads folder names like 'IE1PD100944-VE3KG466' and extracts 'VE3KG466'.
+    Preserves full folder names (e.g. 'IE8CZ266-VE8CZ88') so output paths
+    use them. Legacy folders like 'VE1KG4884_001' are returned as-is.
     
     Returns:
-        List of VE IDs sorted naturally (e.g., ['VE3KG466', 'VE3KG467', ...])
+        List of volume IDs sorted naturally (full or short form)
     """
     if toprocess_path is None:
         toprocess_path = TOPROCESS_DIR
@@ -283,9 +295,8 @@ def get_ve_ids_from_toprocess(toprocess_path: Path = None) -> list:
         if not folder.is_dir():
             continue
         if folder.name.startswith(f'{IE_ID}-'):
-            ve_id = folder.name.replace(f'{IE_ID}-', '')  # "VE3KG466" or "VE1KG4884_001"
-            if ve_id:
-                ve_ids.append(ve_id)
+            # Keep full name e.g. IE8CZ266-VE8CZ88 for output paths
+            ve_ids.append(folder.name)
         elif folder.name.startswith('VE') and len(folder.name) > 2 and any(c.isalnum() or c == '_' for c in folder.name[2:]):
             # e.g. toprocess/VE1KG4884_001/ -> use folder name as ve_id
             ve_ids.append(folder.name)
@@ -338,13 +349,13 @@ def is_volume_file(filename: str) -> bool:
 
 def get_volume_rtf_files(rtf_dir: Path = None) -> list:
     """
-    Get sorted list of volume RTF files (excluding split files).
+    Get sorted list of volume (RTF/TEXT) files (excluding split files).
     
     Returns:
         List of Path objects for volume RTF files, naturally sorted
     """
     if rtf_dir is None:
-        rtf_dir = RTF_DIR
+        rtf_dir = SRC_DIR
     
     logger.info(f"Looking for RTF files in: {rtf_dir}")
     
@@ -361,12 +372,14 @@ def get_volume_rtf_files(rtf_dir: Path = None) -> list:
     return natsorted(volume_files, key=lambda p: p.name)
 
 
-def get_volume_rtf_files_from_toprocess(ve_ids: list, toprocess_path: Path = None):
+def get_volume_files_from_toprocess(ve_ids: list, toprocess_path: Path = None,srctype:str = 'rtf'):
     """
-    Get RTF files from toprocess subfolders (one folder per VE ID).
+    Get (RTF/TEXT) files from toprocess subfolders (one folder per VE ID).
     
-    When layout is toprocess/IE1KG4285-VE3KG159/*.rtf, we collect all .rtf
-    from each VE folder. No is_volume_file() filter so any naming is accepted.
+    Collects all .rtf/.txt from each VE folder, including subdirectories (e.g.
+    toprocess/IE1KG4285-VE3KG159/volume-001/*(.rtf/.txt)). Flat layout
+    (toprocess/IE1KG4285-VE3KG159/*.rtf) is also supported. No is_volume_file()
+    filter so any naming is accepted.
     
     Args:
         ve_ids: List of VE IDs (e.g. from get_ve_ids_from_toprocess())
@@ -382,18 +395,22 @@ def get_volume_rtf_files_from_toprocess(ve_ids: list, toprocess_path: Path = Non
         return []
     result = []
     for ve_id in ve_ids:
-        folder = toprocess_path / f"{IE_ID}-{ve_id}"
-        if not folder.exists():
-            folder = toprocess_path / ve_id
+        # ve_id may be full (IE8CZ266-VE8CZ88) or short (VE8CZ80)
+        folder = toprocess_path / ve_id
+        if not folder.exists() and not ve_id.startswith(f"{IE_ID}-"):
+            folder = toprocess_path / f"{IE_ID}-{ve_id}"
         if not folder.is_dir():
             logger.warning(f"Volume folder not found: {folder}")
             result.append((ve_id, []))
             continue
-        rtf_in_folder = list(folder.glob("*.rtf")) + list(folder.glob("*.RTF"))
-        files = natsorted(rtf_in_folder, key=lambda x: x.name)
+        if srctype == 'txt':
+            files_in_folder = list(folder.rglob("*.txt")) + list(folder.rglob("*.TXT"))
+        else:
+            files_in_folder = list(folder.rglob("*.rtf")) + list(folder.rglob("*.RTF"))
+        files = natsorted(files_in_folder, key=lambda x: (x.parent.name, x.name))
         result.append((ve_id, files))
     total = sum(len(files) for _, files in result)
-    logger.info(f"Found {total} total RTF files in toprocess ({len(ve_ids)} volume(s))")
+    logger.info(f"Found {total} total {srctype.upper()} files in toprocess ({len(ve_ids)} volume(s))")
     return result
 
 
@@ -417,7 +434,7 @@ def get_volume_base_name(rtf_path: Path) -> str:
     return rtf_path.stem  # e.g., "KAMA-001"
 
 
-def find_all_related_source_files(volume_base: str, rtf_dir: Path = None, doc_dir: Path = None) -> list:
+def find_all_related_source_files(volume_base: str, rtf_dir: Path = None, doc_dir: Path = None, include_txt: bool = False) -> list:
     """
     Find all source files related to a volume (main file + all splits).
     
@@ -426,19 +443,23 @@ def find_all_related_source_files(volume_base: str, rtf_dir: Path = None, doc_di
         - KAMA-001-a.rtf, KAMA-001-a.doc (split a)
         - KAMA-001-b.rtf, KAMA-001-b.doc (split b)
         - etc.
+    When include_txt is True, also finds volume_base*.txt in rtf_dir.
     
     Args:
         volume_base: Base name of volume (e.g., "KAMA-001", "KAMA-040-1")
-        rtf_dir: Directory containing RTF files
+        rtf_dir: Directory containing RTF (and optionally TXT) files
         doc_dir: Directory containing DOC files
+        include_txt: If True, also search for .txt files in rtf_dir (for text-source volumes)
         
     Returns:
-        List of Path objects for all related source files (both DOC and RTF)
+        List of Path objects for all related source files (both DOC and RTF, and TXT if include_txt)
     """
     if rtf_dir is None:
-        rtf_dir = RTF_DIR
+        rtf_dir = SRC_DIR
     if doc_dir is None:
         doc_dir = SOURCE_DOC_DIR
+
+    dcp_dir = SRC_DIR
     
     related_files = []
     
@@ -454,6 +475,13 @@ def find_all_related_source_files(volume_base: str, rtf_dir: Path = None, doc_di
             name_without_ext = rtf_file.stem
             if name_without_ext == volume_base or name_without_ext.startswith(f"{volume_base}-"):
                 related_files.append(rtf_file)
+        if include_txt:
+            for txt_file in list(rtf_dir.rglob(f"{volume_base}*.txt")) + list(rtf_dir.rglob(f"{volume_base}*.TXT")):
+                if "_output" in txt_file.parts:
+                    continue
+                name_without_ext = txt_file.stem
+                if name_without_ext == volume_base or name_without_ext.startswith(f"{volume_base}-"):
+                    related_files.append(txt_file)
     
     # Find DOC files (search recursively)
     if doc_dir.exists():
@@ -464,12 +492,21 @@ def find_all_related_source_files(volume_base: str, rtf_dir: Path = None, doc_di
             if name_without_ext == volume_base or name_without_ext.startswith(f"{volume_base}-"):
                 related_files.append(doc_file)
     
+    if dcp_dir.exists():
+        for dcp_file in dcp_dir.rglob(f"{volume_base}*.dcp"):
+            if "_output" in dcp_file.parts:
+                continue
+            name_without_ext = dcp_file.stem
+            if name_without_ext == volume_base or name_without_ext.startswith(f"{volume_base}-"):
+                related_files.append(dcp_file)
+    
     return natsorted(related_files, key=lambda p: p.name)
 
 
 def copy_sources_to_volume_folder(volume_base: str, ve_id: str, output_dir: Path = None,
                                    rtf_dir: Path = None, doc_dir: Path = None,
-                                   rtf_path: Path = None, doc_path: Path = None) -> int:
+                                   rtf_path: Path = None, doc_path: Path = None,
+                                   source_is_txt: bool = False) -> int:
     """
     Copy all source files (DOC and RTF, including splits) to the volume's sources folder.
     
@@ -484,10 +521,11 @@ def copy_sources_to_volume_folder(volume_base: str, ve_id: str, output_dir: Path
         volume_base: Base name of volume (e.g., "KAMA-001")
         ve_id: Volume Entity ID (e.g., "VE3KG466")
         output_dir: Output directory (default: OUTPUT_DIR)
-        rtf_dir: RTF source directory (default: RTF_DIR)
+        rtf_dir: RTF source directory (default: SRC_DIR)
         doc_dir: DOC source directory (default: SOURCE_DOC_DIR)
-        rtf_path: Optional path to the RTF file being converted (always copied if given)
+        rtf_path: Optional path to the RTF/TXT file being converted (always copied if given)
         doc_path: Optional path to the DOC file (always copied if given and exists)
+        source_is_txt: If True, also find and copy related .txt files (for text-source volumes)
         
     Returns:
         Number of files copied
@@ -495,7 +533,7 @@ def copy_sources_to_volume_folder(volume_base: str, ve_id: str, output_dir: Path
     if output_dir is None:
         output_dir = OUTPUT_DIR
     if rtf_dir is None:
-        rtf_dir = RTF_DIR
+        rtf_dir = SRC_DIR
     if doc_dir is None:
         doc_dir = SOURCE_DOC_DIR
     
@@ -504,7 +542,7 @@ def copy_sources_to_volume_folder(volume_base: str, ve_id: str, output_dir: Path
     sources_ve_dir.mkdir(parents=True, exist_ok=True)
     
     # Find all related files (recursive search under rtf_dir / doc_dir)
-    related_files = find_all_related_source_files(volume_base, rtf_dir, doc_dir)
+    related_files = find_all_related_source_files(volume_base, rtf_dir, doc_dir, include_txt=source_is_txt)
     
     # Always include the file(s) being converted so at least they are in output sources
     seen_names = {p.name for p in related_files}
@@ -946,8 +984,10 @@ def convert_rtf_to_tei(rtf_path: Path, doc_path: Path, ve_id: str, ut_id: str = 
     # =========================================================================
     # GENERATE TEI XML
     # =========================================================================
+    # ve_id may be full (IE8CZ266-VE8CZ88); use for src_path; short form for UT/bdrc_ve
+    short_ve_id = _short_ve_id(ve_id)
     if ut_id is None:
-        ut_id = get_ut_id_from_ve(ve_id)
+        ut_id = get_ut_id_from_ve(short_ve_id)
     source_file = doc_path if doc_path.exists() else rtf_path
     sha256_ref = calculate_sha256(source_file)
     src_path = f"{ve_id}/{source_file.name}"
@@ -967,7 +1007,7 @@ def convert_rtf_to_tei(rtf_path: Path, doc_path: Path, ve_id: str, ut_id: str = 
 <idno type="src_path">{src_path}</idno>
 <idno type="sha256">{sha256_ref}</idno>
 <idno type="bdrc_ie">http://purl.bdrc.io/resource/{IE_ID}</idno>
-<idno type="bdrc_ve">http://purl.bdrc.io/resource/{ve_id}</idno>
+<idno type="bdrc_ve">http://purl.bdrc.io/resource/{short_ve_id}</idno>
 <idno type="bdrc_ut">http://purl.bdrc.io/resource/{ut_id}</idno>
 </bibl>
 </sourceDesc>
@@ -987,6 +1027,235 @@ def convert_rtf_to_tei(rtf_path: Path, doc_path: Path, ve_id: str, ut_id: str = 
     return tei_xml
 
 
+def convert_txt_to_tei(txt_path: Path, doc_path: Path, ve_id: str, ut_id: str = None, encoding: str = "unicode") -> str:
+    """
+    Convert plain text file to TEI XML.
+
+    
+
+    Args:
+        txt_path: Path to the .txt file
+        doc_path: Path used for SHA256 / source reference (often same as txt_path for .txt)
+        ve_id: Volume Entity ID (e.g. "VE3KG466")
+        ut_id: Optional UT ID (default from get_ut_id_from_ve(ve_id))
+        encoding: "unicode" or "dedris" (for future use)
+
+    Returns:
+        TEI XML string
+    """
+    logger.info(f"Parsing TXT file: {txt_path.name}")
+    parser = BasicText()
+    parser.parse_file(txt_path, encoding="utf-8")
+    streams = parser.get_streams()
+
+    logger.info(f"Parsed {len(streams)} text streams")
+
+    # Plain text: no header/footer/pict/par_break/table; each stream is {"text": line, "font": {size: 12}}
+    converted_streams = []
+    for stream in streams:
+        text = stream.get("text", "")
+        font_size = stream.get("font", {}).get("size", 12)
+        if encoding == "dedris":
+            font_name = stream.get("font", {}).get("name", "")
+            unicode_text = dedris_to_unicode(text, font_name)
+            if unicode_text and _has_corruption(unicode_text):
+                best_text = unicode_text
+                best_ratio = _tibetan_ratio(unicode_text)
+                for alt_font in _ALTERNATE_DEDRIS_FONTS:
+                    if (alt_font or "").lower() == (font_name or "").lower():
+                        continue
+                    candidate = dedris_to_unicode(text, alt_font)
+                    if not candidate:
+                        continue
+                    if not _has_corruption(candidate):
+                        r = _tibetan_ratio(candidate)
+                        if _has_corruption(best_text) or r > best_ratio:
+                            best_text = candidate
+                            best_ratio = r
+                unicode_text = best_text
+        else:
+            unicode_text = text
+        if not unicode_text:
+            continue
+        converted_streams.append({"text": unicode_text, "font_size": font_size})
+
+    logger.info(f"  Stage 1: Converted {len(converted_streams)} streams to Unicode")
+    
+    # =========================================================================
+    # STAGE 2: Font Size Classification (optional)
+    # =========================================================================
+    if ENABLE_FONT_CLASSIFICATION:
+        classifications = classify_font_sizes(converted_streams)
+        if classifications:
+            logger.info(f"  Stage 2: Font classifications: {classifications}")
+    else:
+        classifications = {}
+        logger.info(f"  Stage 2: SKIPPED (font classification disabled)")
+    
+    # =========================================================================
+    # BUILD TEI CONTENT
+    # =========================================================================
+    tei_lines = []
+    current_markup = None  # 'small', 'large', or None
+    
+    for item in converted_streams:
+        text = item["text"]
+        font_size = item["font_size"]
+        
+        # Escape XML special characters
+        escaped_text = escape_xml(text)
+        
+        if ENABLE_FONT_CLASSIFICATION and classifications:
+            # Determine markup based on font size
+            classification = classifications.get(font_size, 'regular')
+            
+            # Handle markup transitions
+            if classification != current_markup:
+                # Close previous markup
+                if current_markup == 'small':
+                    tei_lines.append('</hi>')
+                elif current_markup == 'large':
+                    tei_lines.append('</hi>')
+                
+                # Open new markup
+                if classification == 'small':
+                    tei_lines.append('<hi rend="small">')
+                elif classification == 'large':
+                    tei_lines.append('<hi rend="head">')
+                
+                current_markup = classification if classification != 'regular' else None
+        
+        # Add text content (preserve newlines from RTF \par)
+        tei_lines.append(escaped_text)
+    
+    # Close any open markup
+    if current_markup == 'small':
+        tei_lines.append('</hi>')
+    elif current_markup == 'large':
+        tei_lines.append('</hi>')
+    
+    # Join all content (text already has newlines from RTF \par)
+    body_content = ''.join(tei_lines)
+    
+    # Clean up empty hi tags and merge consecutive same-rend hi tags
+    if ENABLE_FONT_CLASSIFICATION:
+        body_content = re.sub(r'<hi rend="[^"]+"></hi>', '', body_content)
+        body_content = merge_consecutive_hi_tags(body_content)
+    
+    # =========================================================================
+    # Strip Word field codes (PAGE \* MERGEFORMAT, etc.) from body text
+    # =========================================================================
+    # Allow optional backslash before * (Word can emit "PAGE \* MERGEFORMAT")
+    body_content = re.sub(r'\s*PAGE\s+\\?\s*\*\s*MERGEFORMAT\s*\d*\s*', ' ', body_content)
+    body_content = re.sub(r'\s*NUMPAGES\s+\\?\s*\*\s*MERGEFORMAT\s*', ' ', body_content)
+    body_content = re.sub(r'\s{2,}', ' ', body_content)  # collapse spaces left by stripping
+    
+    # =========================================================================
+    # STAGE 3: Normalization (optional)
+    # =========================================================================
+    if ENABLE_NORMALIZATION:
+        logger.info(f"  Stage 3: Applying normalization...")
+        
+        # Remove spaces only inside syllables (preserve space after ། and ་)
+        body_content = remove_spaces_between_tibetan_chars(body_content)
+        
+        # Ensure space after shad ( ། ) when missing so "ལི།བོད་" -> "ལི། བོད་"
+        body_content = ensure_space_after_shad(body_content)
+        
+        # Fix flying vowels and improper line breaks
+        body_content = fix_flying_vowels_and_linebreaks(body_content)
+        
+        # Apply full Unicode normalization (includes Tibetan-specific reordering)
+        body_content = normalize_unicode(body_content)
+        
+        # Final space normalization (commented out for now)
+        # body_content = normalize_spaces(body_content, tibetan_specific=True)
+        
+        # Fix spacing around <hi> tags based on Tibetan punctuation rules
+        body_content = fix_hi_tag_spacing(body_content)
+        
+        # Clean up multiple newlines (commented out for now)
+        # body_content = re.sub(r'\n\n+', '\n', body_content)
+    else:
+        logger.info(f"  Stage 3: SKIPPED (normalization disabled)")
+    
+    body_content = body_content.strip()
+    
+    # =========================================================================
+    # PAGE BREAKS (blank lines between content; skip first one so no pb after opening line)
+    # =========================================================================
+    def _pb_repl(m):
+        _pb_repl.n += 1
+        return r'\n<pb/>\n' if _pb_repl.n > 1 else '\n'
+    _pb_repl.n = 0
+    body_content = re.sub(r'(?<=.)\n\n+(?=.)', _pb_repl, body_content)
+    body_content = re.sub(r'\n\n+', '\n', body_content)
+    
+    # =========================================================================
+    # ADD LINE BREAK TAGS
+    # =========================================================================
+    body_content = body_content.replace('\n', '\n<lb/>')
+    body_content = re.sub(r' *<lb/> *', '\n<lb/>', body_content)
+    body_content = body_content.strip()
+    
+    # =========================================================================
+    # FIX <hi> TAG PLACEMENT
+    # =========================================================================
+    body_content = re.sub(r'<hi rend="[^"]+">[\s]*(?:<lb/>[\s]*)*</hi>', '', body_content)
+    body_content = re.sub(r'(<hi rend="[^"]+">)\s*\n<lb/>', r'\n<lb/>\1', body_content)
+    body_content = re.sub(r'\n<lb/></hi>', r'</hi>\n<lb/>', body_content)
+    
+    # Clean up any remaining empty <hi> tags after the moves
+    body_content = re.sub(r'<hi rend="[^"]+">[\s]*</hi>', '', body_content)
+    
+    # Final strip
+    body_content = body_content.strip()
+    
+    # =========================================================================
+    # GENERATE TEI XML
+    # =========================================================================
+    # ve_id may be full (IE8CZ266-VE8CZ88); use for src_path; short form for UT/bdrc_ve
+    short_ve_id = _short_ve_id(ve_id)
+    if ut_id is None:
+        ut_id = get_ut_id_from_ve(short_ve_id)
+    source_file = doc_path if doc_path.exists() else txt_path
+    sha256_ref = calculate_sha256(source_file)
+    src_path = f"{ve_id}/{source_file.name}"
+
+    tei_xml = f'''<?xml version="1.0" encoding="UTF-8"?>
+<TEI xmlns="http://www.tei-c.org/ns/1.0">
+<teiHeader>
+<fileDesc>
+<titleStmt>
+<title>{escape_xml(txt_path.stem)}</title>
+</titleStmt>
+<publicationStmt>
+<p>File from the archive of the Buddhist Digital Resource Center (BDRC), converted into TEI from a file not created by BDRC.</p>
+</publicationStmt>
+<sourceDesc>
+<bibl>
+<idno type="src_path">{src_path}</idno>
+<idno type="sha256">{sha256_ref}</idno>
+<idno type="bdrc_ie">http://purl.bdrc.io/resource/{IE_ID}</idno>
+<idno type="bdrc_ve">http://purl.bdrc.io/resource/{short_ve_id}</idno>
+<idno type="bdrc_ut">http://purl.bdrc.io/resource/{ut_id}</idno>
+</bibl>
+</sourceDesc>
+</fileDesc>
+<encodingDesc>
+<p>The TEI header does not contain any bibliographical data. It is instead accessible through the <ref target="http://purl.bdrc.io/resource/{IE_ID}">record in the BDRC database</ref>.</p>
+</encodingDesc>
+</teiHeader>
+<text>
+<body xml:lang="bo">
+<p>{body_content}</p>
+</body>
+</text>
+</TEI>
+'''
+    return tei_xml
+
+
 def calculate_sha256(file_path: Path) -> str:
     """Calculate SHA256 hash of a file."""
     sha256_hash = hashlib.sha256()
@@ -1003,15 +1272,15 @@ def calculate_sha256(file_path: Path) -> str:
 # Single File Conversion
 # =============================================================================
 
-def convert_single_file(rtf_path: Path, ve_id: str, output_dir: Path = None, rtf_dir: Path = None, doc_dir: Path = None, ut_id: str = None,encoding = "unicode"):
+def convert_single_file(rtf_path: Path, ve_id: str, output_dir: Path = None, rtf_dir: Path = None, doc_dir: Path = None, ut_id: str = None, encoding = "unicode", srctype = "rtf"):
     """
-    Convert a single RTF file to TEI XML.
+    Convert a single RTF or TXT file to TEI XML.
     
     Args:
-        rtf_path: Path to the RTF file
+        rtf_path: Path to the source file (.rtf or .txt; branch by extension)
         ve_id: Volume Entity ID (e.g., "VE3KG466")
         output_dir: Output directory (default: OUTPUT_DIR)
-        rtf_dir: Optional RTF/source directory (for doc and copy lookups; default: RTF_DIR)
+        rtf_dir: Optional RTF/source directory (for doc and copy lookups; default: SRC_DIR)
         doc_dir: Optional DOC directory (default: SOURCE_DOC_DIR or rtf_dir)
         ut_id: Optional UT ID (default: from get_ut_id_from_ve(ve_id); use for multi-file-per-volume)
         
@@ -1021,40 +1290,48 @@ def convert_single_file(rtf_path: Path, ve_id: str, output_dir: Path = None, rtf
     if output_dir is None:
         output_dir = OUTPUT_DIR
     if rtf_dir is None:
-        rtf_dir = RTF_DIR
+        rtf_dir = SRC_DIR
     if doc_dir is None:
         doc_dir = SOURCE_DOC_DIR
     
     if not rtf_path.exists():
-        logger.error(f"RTF file not found: {rtf_path}")
+        logger.error(f"Source file not found: {rtf_path}")
         return None
-    
-    # Get corresponding DOC file
-    doc_filename = rtf_path.stem + ".doc"
-    doc_path = doc_dir / doc_filename
-    
-    if not doc_path.exists():
-        logger.warning(f"Original DOC file not found: {doc_path}")
-        # Continue anyway, SHA256 will show FILE_NOT_FOUND
-    
-    # Generate UT ID
+
+    source_is_txt = rtf_path.suffix.lower() == '.txt'
+
+    # Get corresponding DOC file (for RTF only; for .txt use source file for SHA256)
+    if source_is_txt:
+        doc_path = rtf_path  # use .txt for SHA256 / source reference
+    else:
+        doc_filename = rtf_path.stem + ".doc"
+        doc_path = doc_dir / doc_filename
+        if not doc_path.exists():
+            logger.warning(f"Original DOC file not found: {doc_path}")
+            # Continue anyway, SHA256 will show FILE_NOT_FOUND
+
+    # Full ve_id used for output paths (archive/sources); short form for UT and BDRC idno
+    short_ve_id = _short_ve_id(ve_id)
     if ut_id is None:
-        ut_id = get_ut_id_from_ve(ve_id)
+        ut_id = get_ut_id_from_ve(short_ve_id)
     
     logger.info(f"Converting: {rtf_path.name}")
     logger.info(f"  VE ID: {ve_id}")
     logger.info(f"  UT ID: {ut_id}")
     
-    # Convert
+    # Convert (full ve_id for TEI src_path; short for bdrc_ve idno inside)
     try:
-        tei_xml = convert_rtf_to_tei(rtf_path, doc_path, ve_id, ut_id=ut_id,encoding = encoding)
+        if source_is_txt:
+            tei_xml = convert_txt_to_tei(rtf_path, doc_path, ve_id, ut_id=ut_id, encoding=encoding)
+        else:
+            tei_xml = convert_rtf_to_tei(rtf_path, doc_path, ve_id, ut_id=ut_id, encoding=encoding)
     except Exception as e:
         logger.error(f"Error converting {rtf_path.name}: {e}")
         import traceback
         traceback.print_exc()
         return None
     
-    # Create output directory
+    # Create output directory (full ve_id e.g. IE8CZ266-VE8CZ88 for paths)
     archive_dir = output_dir / "archive" / ve_id
     archive_dir.mkdir(parents=True, exist_ok=True)
     
@@ -1065,11 +1342,12 @@ def convert_single_file(rtf_path: Path, ve_id: str, output_dir: Path = None, rtf
     
     logger.info(f"  Output: {xml_path}")
     
-    # Copy all related source files (DOC + RTF, including splits) to output sources/{VE_ID}/
+    # Copy all related source files (DOC + RTF, or TXT when source is .txt) to output sources/{VE_ID}/
     volume_base = get_volume_base_name(rtf_path)
     copy_sources_to_volume_folder(volume_base, ve_id, output_dir, rtf_dir=rtf_dir, doc_dir=doc_dir,
-                                   rtf_path=rtf_path, doc_path=doc_path if doc_path.exists() else None)
-    
+                                   rtf_path=rtf_path, doc_path=doc_path if doc_path.exists() else None,
+                                   source_is_txt=source_is_txt)
+
     return xml_path
 
 
@@ -1210,7 +1488,7 @@ def _print_conversion_stats(output_dir: Path):
 # Batch Conversion
 # =============================================================================
 
-def convert_all_files(output_dir: Path = None, encoding = "unicode"):
+def convert_all_files(output_dir: Path = None, encoding = "unicode",srctype = "rtf"):
     """
     Convert all volume RTF files to TEI XML using sequential VE ID mapping.
     
@@ -1224,7 +1502,7 @@ def convert_all_files(output_dir: Path = None, encoding = "unicode"):
     
     logger.info("=" * 60)
     logger.info(f"Converting all files for {IE_ID}")
-    logger.info(f"RTF Source: {RTF_DIR}")
+    logger.info(f"RTF Source: {SRC_DIR}")
     logger.info(f"Output: {output_dir}")
     logger.info("=" * 60)
     
@@ -1234,17 +1512,17 @@ def convert_all_files(output_dir: Path = None, encoding = "unicode"):
     if not ve_ids:
         # Fallback: recursively find RTF files and group by inferred volume (same as IE1PD104832)
         logger.info("No toprocess folder; discovering RTF files recursively")
-        if not RTF_DIR.exists():
-            logger.error(f"RTF directory not found: {RTF_DIR}")
+        if not SRC_DIR.exists():
+            logger.error(f"{srctype} directory not found: {SRC_DIR}")
             return
-        all_rtf = find_files_recursive(RTF_DIR, {'.rtf'})
-        all_rtf = [f for f in all_rtf if '_output' not in f.parts]
-        if not all_rtf:
-            logger.error(f"No RTF files found under {RTF_DIR}")
+        all_files = find_files_recursive(SRC_DIR, {f'.{srctype}'})
+        all_files = [f for f in all_files if '_output' not in f.parts]
+        if not all_files:
+            logger.error(f"No {srctype} files found under {SRC_DIR}")
             return
-        volumes = group_files_by_volume(all_rtf, IE_ID)
+        volumes = group_files_by_volume(all_files, IE_ID)
         total_files = sum(len(files) for files in volumes.values())
-        logger.info(f"Found {total_files} RTF file(s) in {len(volumes)} volume(s) (recursive discovery)")
+        logger.info(f"Found {total_files} {srctype} file(s) in {len(volumes)} volume(s) (recursive discovery)")
         
         archive_dir = output_dir / "archive"
         archive_dir.mkdir(parents=True, exist_ok=True)
@@ -1259,7 +1537,7 @@ def convert_all_files(output_dir: Path = None, encoding = "unicode"):
                 ut_id = get_ut_id_with_index(ve_id, idx)
                 pct = round(100 * file_num / total_files)
                 logger.info(f"[{file_num}/{total_files}] ({pct}%) {rtf_path.name} -> {ve_id} ({ut_id})")
-                result = convert_single_file(rtf_path, ve_id, output_dir, ut_id=ut_id, encoding=encoding)
+                result = convert_single_file(rtf_path, ve_id, output_dir, ut_id=ut_id, encoding=encoding, srctype=srctype)
                 if result:
                     success += 1
                 else:
@@ -1276,10 +1554,10 @@ def convert_all_files(output_dir: Path = None, encoding = "unicode"):
     # Standard path: toprocess folder present
     logger.info(f"VE IDs from: {TOPROCESS_DIR}")
     # Collect RTF files from toprocess subfolders (IE_ID-VExxx/ or VExxx/)
-    ve_id_to_files = get_volume_rtf_files_from_toprocess(ve_ids)
+    ve_id_to_files = get_volume_files_from_toprocess(ve_ids,srctype = srctype)
     total_files = sum(len(files) for _, files in ve_id_to_files)
     if total_files == 0:
-        # Fallback: flat list from RTF_DIR (KAMA-style top-level *.rtf)
+        # Fallback: flat list from SRC_DIR (KAMA-style top-level *.rtf)
         volume_files = get_volume_rtf_files()
         if not volume_files:
             logger.error("No volume RTF files found")
@@ -1309,16 +1587,16 @@ def convert_all_files(output_dir: Path = None, encoding = "unicode"):
     for ve_id, files in ve_id_to_files:
         for file_index, rtf_path in enumerate(files):
             file_num += 1
-            ut_id = get_ut_id_with_index(ve_id, file_index)
+            ut_id = get_ut_id_with_index(_short_ve_id(ve_id), file_index)
             pct = round(100 * file_num / total_files)
             logger.info(f"[{file_num}/{total_files}] ({pct}%) {rtf_path.name} -> {ve_id} ({ut_id})")
-            result = convert_single_file(rtf_path, ve_id, output_dir, ut_id=ut_id,encoding = encoding)
+            result = convert_single_file(rtf_path, ve_id, output_dir, ut_id=ut_id,encoding = encoding,srctype = srctype)
             if result:
                 success += 1
             else:
                 failed += 1
     
-    # Only create "other" for unmatched files when using fallback (flat RTF_DIR).
+    # Only create "other" for unmatched files when using fallback (flat SRC_DIR).
     # When from toprocess, all sources stay in sources/ per volume; no "other".
     if not from_toprocess and len(volume_files_for_other) > len(ve_ids):
         other_dir.mkdir(parents=True, exist_ok=True)
@@ -1355,7 +1633,7 @@ def convert_all_files(output_dir: Path = None, encoding = "unicode"):
 # =============================================================================
 
 def main():
-    global IE_ID, RTF_DIR, TOPROCESS_DIR, OUTPUT_DIR, SOURCE_DOC_DIR
+    global IE_ID, SRC_DIR, TOPROCESS_DIR, OUTPUT_DIR, SOURCE_DOC_DIR
     parser = argparse.ArgumentParser(
         description="Convert IE1PD100944 RTF files to TEI XML"
     )
@@ -1399,6 +1677,12 @@ def main():
         default="unicode",
         help="RTF encoding: unicode (default, skip Dedris conversion) or dedris (convert with pytiblegenc)"
     )
+    parser.add_argument(
+        "--srctype",
+        choices=["rtf", "txt"],
+        default="rtf",
+        help="Source type: the source files are RTF files or TXT files"
+    )
     
     args = parser.parse_args()
     
@@ -1406,33 +1690,34 @@ def main():
     if args.ie_id:
         base = script_dir.parent
         IE_ID = args.ie_id
-        RTF_DIR = base / "rtf" / args.ie_id
-        TOPROCESS_DIR = RTF_DIR / "toprocess"
-        OUTPUT_DIR = RTF_DIR / f"{args.ie_id}_output"
-        SOURCE_DOC_DIR = RTF_DIR
-        logger.info(f"Using --ie-id {args.ie_id}: RTF_DIR={RTF_DIR}")
+        SRC_DIR = base / "rtf" / args.ie_id
+        TOPROCESS_DIR = SRC_DIR / "toprocess"
+        OUTPUT_DIR = SRC_DIR / f"{args.ie_id}_output"
+        SOURCE_DOC_DIR = SRC_DIR
+        logger.info(f"Using --ie-id {args.ie_id}: SRC_DIR={SRC_DIR}")
     
     output_dir = Path(args.output) if args.output else OUTPUT_DIR
-    rtf_dir = Path(args.rtf_dir) if args.rtf_dir else RTF_DIR
+    rtf_dir = Path(args.rtf_dir) if args.rtf_dir else SRC_DIR
     
     if args.test_first:
         # --test-first requires the RTF folder via --ie-id or --rtf-dir
         if not args.rtf_dir and not args.ie_id:
             logger.error("--test-first requires --ie-id (e.g. IE1KG4884) or --rtf-dir (e.g. ../rtf/IE1KG4884)")
             return
-        # Recursively find RTF files, convert only the first one (no filename needed)
+        # Recursively find source files (RTF or TXT per --srctype), convert only the first one
         if not rtf_dir.exists():
-            logger.error(f"RTF directory not found: {rtf_dir}")
+            logger.error(f"Source directory not found: {rtf_dir}")
             return
-        all_rtf = find_files_recursive(rtf_dir, {'.rtf'})
+        ext = f'.{args.srctype}'
+        all_files = find_files_recursive(rtf_dir, {ext})
         # Exclude files inside output directories
-        all_rtf = [f for f in all_rtf if '_output' not in f.parts]
-        if not all_rtf:
-            logger.error(f"No RTF files found under {rtf_dir}")
+        all_files = [f for f in all_files if '_output' not in f.parts]
+        if not all_files:
+            logger.error(f"No {args.srctype.upper()} files found under {rtf_dir}")
             return
-        all_rtf = natsorted(all_rtf, key=lambda p: (p.parent.name, p.name))
-        rtf_path = all_rtf[0]
-        logger.info(f"Found {len(all_rtf)} RTF file(s) recursively; converting first: {rtf_path.relative_to(rtf_dir)}")
+        all_files = natsorted(all_files, key=lambda p: (p.parent.name, p.name))
+        rtf_path = all_files[0]
+        logger.info(f"Found {len(all_files)} {args.srctype.upper()} file(s) recursively; converting first: {rtf_path.relative_to(rtf_dir)}")
         
         ve_ids = get_ve_ids_from_toprocess()
         if ve_ids:
@@ -1442,7 +1727,7 @@ def main():
             ve_id = f"VE{IE_ID[2:]}_0001"
             logger.info(f"NOTE: No toprocess folder; using default VE ID {ve_id} for single file test")
         
-        convert_single_file(rtf_path, ve_id, output_dir, rtf_dir=rtf_dir, encoding=args.encoding)
+        convert_single_file(rtf_path, ve_id, output_dir, rtf_dir=rtf_dir, encoding=args.encoding, srctype=args.srctype)
     elif args.single:
         # Resolve single file: allow path or filename under rtf_dir
         single_path = Path(args.single)
@@ -1463,9 +1748,9 @@ def main():
             logger.info(f"NOTE: No toprocess folder; using default VE ID {ve_id} for single file test")
         
         # Pass custom rtf_dir so source lookups use it when testing
-        convert_single_file(rtf_path, ve_id, output_dir, rtf_dir=rtf_dir if args.rtf_dir else None, encoding = args.encoding)
+        convert_single_file(rtf_path, ve_id, output_dir, rtf_dir=rtf_dir if args.rtf_dir else None, encoding = args.encoding,srctype = args.srctype)
     else:
-        convert_all_files(output_dir, encoding = args.encoding)
+        convert_all_files(output_dir, encoding = args.encoding,srctype = args.srctype)
 
 
 if __name__ == "__main__":

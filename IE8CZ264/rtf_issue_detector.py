@@ -109,7 +109,16 @@ SPURIOUS_PATTERNS = [
     # Also catch the RTF encoded version if it appears in XML
     (r'\\u161[\\\'a1]*\\u164[\\\'a4]*', 'RTF encoded inverted exclamation-currency pattern'),
     (r'««', 'Double French quotation marks (guillemets)'),
-(r'«»', 'Mixed French quotation marks'),
+    (r'«»', 'Mixed French quotation marks'),
+    # Mojibake/RTF artifacts (¡ = U+00A1, Ã = U+00C3, ¶ = U+00B6)
+    (r'¡¡ÃÃ', 'Inverted exclamation + A-tilde mojibake'),
+    (r'¡¡¶¶', 'Inverted exclamation + pilcrow mojibake'),
+    # Two or more ¡ immediately after Tibetan (artifact from bad encoding)
+    (r'(?<=[\u0F00-\u0FFF])¡{2,}', 'Inverted exclamation run after Tibetan'),
+    # Standalone PAGE between <lb/> and </p> (fixed-length lookbehind so we only remove PAGE)
+    (r'(?<=<lb/>)PAGE(?=</p>)', 'Lone PAGE between <lb/> and </p>'),
+    (r'(?<=<lb/> )PAGE(?=</p>)', 'Lone PAGE between <lb/> and </p> (with space)'),
+    (r'PAGE\s+PAGE(?=\s*<)', 'PAGE PAGE immediately before tag'),
     # Add more spurious patterns here as needed
     # Example:
     # (r'pattern_to_match', 'Description of what this pattern matches'),
