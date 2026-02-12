@@ -122,6 +122,12 @@ SPURIOUS_PATTERNS = [
     (r'PAGE\s+PAGE(?=\s*<)', 'PAGE PAGE immediately before tag'),
     # Repeated Dedris padding (same Tibetan char many times)
     (r'\u0F51{10,}', 'Repeated da (ད) padding from Dedris TOC/leader'),
+    # Short da padding before TOC digit or ༽ (safe: not part of a word)
+    (r'\u0F51{2,}(?=[\u0F20-\u0F29\u0F3D])', 'Short da (ད) padding before Tibetan digit or ༽'),
+    # Exactly three da before syllable-initial da (e.g. དདདདཔལ -> keep དཔལ)
+    (r'(?:\u0F51){3}(?=\u0F51)', 'Three da (ད) padding before syllable-initial da'),
+    # Three da before another consonant (e.g. དདདཔལ -> keep དཔལ; padding not followed by ད)
+    (r'(?:\u0F51){3}(?=[\u0F40-\u0F69])', 'Three da (ད) padding before Tibetan consonant'),
     # Field-like bracket wrappers (RTF/symbol bytes)
     (r'\uFF5B\u00A3\u00FB', 'Spurious opening ｛£û wrapper'),
     (r'\uFF5D\u00A3\u00FD', 'Spurious closing ｝£ý wrapper'),
