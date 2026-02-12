@@ -32,7 +32,7 @@ _RE_COLOR_BLUE = re.compile(r'\\blue(\d+)')
 
 
 def detect_rtf_format(file_path: str) -> str:
-    """
+    r"""
     Detect RTF format by checking if Dedris fonts have {\*\panose}.
     
     Args:
@@ -52,7 +52,7 @@ def detect_rtf_format(file_path: str) -> str:
 
 
 def _strip_nested_groups(text: str) -> str:
-    """
+    r"""
     Remove nested {...} groups from text (groups inside the outer braces).
     Used to strip {\*\panose ...} and {\*\falt ...} from font entries.
     
@@ -87,7 +87,7 @@ def _strip_nested_groups(text: str) -> str:
 
 
 def _parse_font_table_simple(fonttbl_data: str) -> list:
-    """
+    r"""
     Parse font table for simple RTF format.
     
     Simple Dedris fonts: {\f3\fnil\fcharset0 Dedris-a;}
@@ -138,7 +138,7 @@ def _parse_font_table_simple(fonttbl_data: str) -> list:
 
 
 def _parse_font_table_complex(fonttbl_data: str) -> list:
-    """
+    r"""
     Parse font table for complex RTF format.
     
     All fonts have panose: {\f45\fbidi \froman...\fprq2{\*\panose...}Dedris-vowa;}
@@ -300,7 +300,7 @@ class BasicRTF:
             r'{\fonttbl', r'{\colortbl', r'{\stylesheet', r'{\info',
             r'{\listtable', r'{\listoverridetable', r'{\*\generator',
             r'{\*\rsidtbl', r'{\*\pgptbl', r'{\mmathPr',
-            #r'{\footer', r'{\header'
+            r'{\footer', r'{\header'  # Skip header/footer blocks
         ]
 
         # Progress tracking

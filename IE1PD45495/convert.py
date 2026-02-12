@@ -503,24 +503,52 @@ def convert_rtf_to_tei(rtf_path: Path, ve_id: str, ut_id: str, src_path: str) ->
     # =========================================================================
     if ENABLE_NORMALIZATION:
         logger.info(f"  Stage 3: Applying normalization...")
-        
-        # Fix flying vowels and improper line breaks
-        #body_content = fix_flying_vowels_and_linebreaks(body_content)
-        
         # Apply full Unicode normalization (includes Tibetan-specific reordering)
         body_content = normalize_unicode(body_content)
-        
-        # Final space normalization (commented out for now)
-        # body_content = normalize_spaces(body_content, tibetan_specific=True)
-        
         # Fix spacing around <hi> tags based on Tibetan punctuation rules
         body_content = fix_hi_tag_spacing(body_content)
         
-        # Clean up multiple newlines (commented out for now)
-        # body_content = re.sub(r'\n\n+', '\n', body_content)
     else:
         logger.info(f"  Stage 3: SKIPPED (normalization disabled)")
     
+    body_content = body_content.strip()
+    
+    # =========================================================================
+    # REMOVE PAGE NUMBER PATTERNS
+    # =========================================================================
+    # Remove page number patterns like: - 2 -, 289 -, ་286-, - 288 -, -, -2་
+    # These patterns can appear anywhere in the text (not just on their own lines)
+    
+    # Pattern 1: dash-number-dash patterns (with optional spaces and Tibetan tsheg)
+    # Matches: "- 2 -", "- 288 -", "-2-", "- 338 -", etc.
+    body_content = re.sub(r'\n-\s*\d+\s*-\n', '\n', body_content)
+    body_content = re.sub(r'\n-\s*\d+\s*-\s', '\n', body_content)
+    
+    # Pattern 2: Tibetan tsheg-number-dash patterns
+    # Matches: "་286-", "་123-", "་ 311 -", etc.
+    body_content = re.sub(r'\n་\s*\d+\s*-\n', '\n', body_content)
+    body_content = re.sub(r'\n་\s*\d+\s*-\s', '\n', body_content)
+    
+    # Pattern 3: number-dash patterns at end of line
+    # Matches: "289 -", "123-", etc.
+    body_content = re.sub(r'\n\d+\s*-\n', '\n', body_content)
+    body_content = re.sub(r'\n\d+\s*-\s', '\n', body_content)
+    
+    # Pattern 4: dash-number with optional Tibetan tsheg at end
+    # Matches: "-2་", "-123་", "-2 ་", etc.
+    body_content = re.sub(r'\n-\s*\d+\s*་?\n', '\n', body_content)
+    body_content = re.sub(r'\n-\s*\d+\s*་?\s', '\n', body_content)
+    
+    # Pattern 5: Standalone dash on its own line
+    # Matches: "-", "- ", " -", etc.
+    body_content = re.sub(r'\n\s*-\s*\n', '\n', body_content)
+    
+    # Pattern 6: Standalone numbers on their own line (likely page numbers, 1-4 digits)
+    # Matches lines with just numbers
+    body_content = re.sub(r'\n\s*\d{1,4}\s*\n', '\n', body_content)
+    
+    # Clean up any resulting multiple newlines
+    body_content = re.sub(r'\n\n+', '\n', body_content)
     body_content = body_content.strip()
     
     # =========================================================================
