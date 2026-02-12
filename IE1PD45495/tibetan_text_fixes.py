@@ -236,6 +236,8 @@ def is_tibetan_char(char: str) -> bool:
 
 def count_tibetan_chars(text: str) -> int:
     """Count the number of Tibetan characters in a string."""
+    if text is None:
+        return 0
     return sum(1 for c in text if is_tibetan_char(c))
 
 
