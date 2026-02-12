@@ -496,7 +496,7 @@ def process_volume(ie_id: str, ve_id: str, volume_num: str, volume_folder: Path,
                    output_dir: Path, collection_name: str) -> dict:
     """
     Process a single volume.
-    
+
     Args:
         ie_id: Image Entity ID
         ve_id: Volume Entity ID
