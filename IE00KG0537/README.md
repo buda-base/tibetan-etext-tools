@@ -112,4 +112,3 @@ pip install -U git+https://github.com/buda-base/py-tiblegenc.git
 - No toprocess folder required (VE IDs discovered automatically)
 - Handles both direct RTF files and nested collection structures
 - Automatically removes lines containing only dashes and spaces (e.g., "- - - - -")
-- Page breaks (`\page`) not currently supported
