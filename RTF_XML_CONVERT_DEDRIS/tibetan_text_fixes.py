@@ -204,11 +204,16 @@ def fix_ascii_to_tibetan(text: str) -> str:
     instead of proper Tibetan characters in the source RTF files.
     
     Mappings:
-        . (period)     -> ད (Tibetan letter DA)
-        - (hyphen)     -> ་ (Tibetan tseg/syllable separator)
-        0 (zero)       -> པ (Tibetan letter PA)
-        , (comma)      -> ཐ (Tibetan letter THA)
+        . (period)      -> ད (Tibetan letter DA) - preserves ellipsis (2+ dots)
+        - (hyphen)      -> ་ (Tibetan tseg/syllable separator)
+        0 (zero)        -> པ (Tibetan letter PA)
+        , (comma)       -> ཐ (Tibetan letter THA)
         } (right brace) -> སྔ (Tibetan SA + NGA)
+        ( (left paren)  -> ༼ (Tibetan left bracket)
+        ) (right paren) -> ༽ (Tibetan right bracket)
+        \\ (backslash)  -> གླ (Tibetan GA + LA subscript)
+    
+    Note: Ellipsis (sequences of 2+ periods) are preserved as-is.
     
     Args:
         text: Input text with ASCII characters
@@ -219,12 +224,23 @@ def fix_ascii_to_tibetan(text: str) -> str:
     if not text:
         return text
     
+    # First, protect ellipsis by temporarily replacing sequences of 2+ periods
+    # Use a placeholder that won't appear in normal text
+    ELLIPSIS_PLACEHOLDER = '\uE000'  # Private Use Area character
+    text = re.sub(r'\.{2,}', lambda m: ELLIPSIS_PLACEHOLDER * len(m.group()), text)
+    
     # Apply character replacements
-    text = text.replace('.', 'ད')  # period -> DA
+    text = text.replace('.', 'ད')  # period -> DA (only single periods now)
     text = text.replace('-', '་')  # hyphen -> tseg
     text = text.replace('0', 'པ')  # zero -> PA
     text = text.replace(',', 'ཐ')  # comma -> THA
     text = text.replace('}', 'སྔ')  # right brace -> SA + NGA
+    text = text.replace('(', '༼')  # left paren -> Tibetan left bracket
+    text = text.replace(')', '༽')  # right paren -> Tibetan right bracket
+    text = text.replace('\\', 'གླ')  # backslash -> GA + LA subscript
+    
+    # Restore ellipsis
+    text = text.replace(ELLIPSIS_PLACEHOLDER, '.')
     
     return text
 

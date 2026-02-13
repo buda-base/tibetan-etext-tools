@@ -81,13 +81,18 @@ The `{BASE_DIR}` folder name should contain the IE_ID (e.g., `IE1GS58442`).
 
 The following ASCII characters are automatically converted to their Tibetan equivalents:
 
-| ASCII | Unicode | Tibetan |
-|-------|---------|---------|
-| `.`   | U+002E  | ད       | 
-| `-`   | U+002D  | ་       | 
-| `0`   | U+0030  | པ       | 
-| `,`   | U+002C  | ཐ       | 
-| `}`   | U+007D  | སྔ      | 
+| ASCII | Unicode | Tibetan | Description |
+|-------|---------|---------|-------------|
+| `.`   | U+002E  | ད       | Letter DA (single periods only) |
+| `-`   | U+002D  | ་       | Tseg (syllable separator) |
+| `0`   | U+0030  | པ       | Letter PA |
+| `,`   | U+002C  | ཐ       | Letter THA |
+| `}`   | U+007D  | སྔ      | SA + NGA |
+| `(`   | U+0028  | ༼       | Tibetan left bracket |
+| `)`   | U+0029  | ༽       | Tibetan right bracket |
+| `\`   | U+005C  | གླ      | GA + LA subscript |
+
+**Note:** Ellipsis (sequences of 2 or more periods like `...` or `....................`) are preserved as-is and not converted. Only isolated single periods are converted to ད.
 
 These mappings are applied in `tibetan_text_fixes.py` via the `fix_ascii_to_tibetan()` function.
 

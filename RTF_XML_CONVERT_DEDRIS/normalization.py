@@ -138,12 +138,17 @@ class Cats(Enum):
     TopVowel = 5
     TopMark = 6
     RightMark = 7
+    PostVowelMark = 8  # Marks that come after vowels (e.g., ༔ U+0F14)
 
 
 CATEGORIES = (
     [Cats.Other]  # 0F00
     + [Cats.Base]  # 0F01, often followed by 0f083
-    + [Cats.Other] * 22  # 0F02-0F17
+    + [Cats.Other] * 11  # 0F02-0F0C
+    + [Cats.PostVowelMark] * 5  # 0F0D-0F11 (།༎༏༐༑ - shad marks, come after vowels)
+    + [Cats.Other] * 2  # 0F12-0F13
+    + [Cats.PostVowelMark]  # 0F14 ༔ GTER TSHEG - comes after vowels
+    + [Cats.Other] * 3  # 0F15-0F17
     + [Cats.BottomVowel] * 2  # 0F18-0F19
     + [Cats.Other] * 6  # 0F1A-0F1F
     + [Cats.Base]

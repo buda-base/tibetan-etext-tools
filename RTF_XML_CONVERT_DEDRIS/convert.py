@@ -423,6 +423,11 @@ def convert_rtf_to_tei(rtf_path: Path, ie_id: str, ve_id: str, ut_id: str, src_p
     # Join and clean up
     body_content = ''.join(tei_lines)
     
+    # Apply final Unicode normalization to handle cross-stream character ordering
+    # This fixes cases where ༔ and vowels are in separate RTF streams
+    if ENABLE_NORMALIZATION:
+        body_content = normalize_unicode(body_content)
+    
     # Fix hi tag spacing and remove empty hi tags (only if font classification is enabled)
     if ENABLE_FONT_CLASSIFICATION:
         body_content = fix_hi_tag_spacing(body_content)
