@@ -718,6 +718,23 @@ class BasicRTF:
                     i = m.end()
                     char_start = i
                     continue
+                
+                # Backslash-newline: In RTF, \ followed by \n or \r\n is a line break
+                # This is commonly used in Mac RTF files instead of \line or \par
+                if i + 1 < len(data) and data[i + 1] in ('\n', '\r'):
+                    flush_text(i)
+                    # Skip the backslash and the newline(s)
+                    end_pos = i + 2
+                    if i + 2 < len(data) and data[i + 1] == '\r' and data[i + 2] == '\n':
+                        end_pos = i + 3  # Skip \r\n
+                    self._streams.append({
+                        "type": "line_break",
+                        "char_start": i,
+                        "char_end": end_pos
+                    })
+                    i = end_pos
+                    char_start = i
+                    continue
 
                 # Forced line break inside a paragraph
                 m = _RE_LINE.match(data, i)

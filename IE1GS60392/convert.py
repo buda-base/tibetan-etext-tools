@@ -432,20 +432,20 @@ def convert_rtf_to_tei(rtf_path: Path, ie_id: str, ve_id: str, ut_id: str, src_p
     
     # Put <lb/> at beginning of each new line and remove surrounding spaces
     body_content = body_content.replace('\n', '\n<lb/>')
-    body_content = re.sub(r' *<lb/> *', '\n<lb/>', body_content)
+    body_content = re.sub(r' *<lb/> *', '<lb/>', body_content)
     body_content = body_content.strip()
     
     # Remove <hi> tags that contain only whitespace/newlines/lb tags
     body_content = re.sub(r'<hi rend="[^"]+">[\s]*(?:<lb/>[\s]*)*</hi>', '', body_content)
     
     # Move <hi> from end of line to after <lb/> on next line
-    body_content = re.sub(r'(<hi rend="[^"]+">)\s*\n<lb/>', r'\n<lb/>\1', body_content)
+    body_content = re.sub(r'(<hi rend="[^"]+">)\s*<lb/>', r'<lb/>\1', body_content)
     
-    # Move </hi> from after <lb/> to before the newline (end of previous line)
-    body_content = re.sub(r'\n<lb/></hi>', r'</hi>\n<lb/>', body_content)
+    # Move </hi> from after <lb/> to its own line, then <lb/> on next line
+    body_content = re.sub(r'<lb/></hi>', r'</hi>\n<lb/>', body_content)
     
     # Remove multiple consecutive <lb/> tags around </hi>, keeping only one after </hi>
-    body_content = re.sub(r'(<lb/>\s*)+</hi>\s*(<lb/>\s*)+', r'</hi>\n<lb/>\n', body_content)
+    body_content = re.sub(r'(<lb/>\s*)+</hi>\s*(<lb/>\s*)+', r'</hi>\n<lb/>', body_content)
     
     # Remove double newlines
     body_content = re.sub(r'\n\n+', '\n', body_content)
@@ -454,7 +454,7 @@ def convert_rtf_to_tei(rtf_path: Path, ie_id: str, ve_id: str, ut_id: str, src_p
     body_content = re.sub(r'<hi rend="[^"]+">[\s]*</hi>', '', body_content)
     
     # Remove multiple consecutive <lb/> tags, keeping only one
-    body_content = re.sub(r'(<lb/>[\s]*)+', '<lb/>\n', body_content)
+    body_content = re.sub(r'(<lb/>)+', '<lb/>', body_content)
     
     # Final strip
     body_content = body_content.strip()
