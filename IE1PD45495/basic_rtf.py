@@ -32,7 +32,7 @@ _RE_COLOR_BLUE = re.compile(r'\\blue(\d+)')
 
 
 def detect_rtf_format(file_path: str) -> str:
-    """
+    r"""
     Detect RTF format by checking if Dedris fonts have {\*\panose}.
     
     Args:
@@ -52,7 +52,7 @@ def detect_rtf_format(file_path: str) -> str:
 
 
 def _strip_nested_groups(text: str) -> str:
-    """
+    r"""
     Remove nested {...} groups from text (groups inside the outer braces).
     Used to strip {\*\panose ...} and {\*\falt ...} from font entries.
     
@@ -87,7 +87,7 @@ def _strip_nested_groups(text: str) -> str:
 
 
 def _parse_font_table_simple(fonttbl_data: str) -> list:
-    """
+    r"""
     Parse font table for simple RTF format.
     
     Simple Dedris fonts: {\f3\fnil\fcharset0 Dedris-a;}
@@ -138,7 +138,7 @@ def _parse_font_table_simple(fonttbl_data: str) -> list:
 
 
 def _parse_font_table_complex(fonttbl_data: str) -> list:
-    """
+    r"""
     Parse font table for complex RTF format.
     
     All fonts have panose: {\f45\fbidi \froman...\fprq2{\*\panose...}Dedris-vowa;}
@@ -300,7 +300,7 @@ class BasicRTF:
             r'{\fonttbl', r'{\colortbl', r'{\stylesheet', r'{\info',
             r'{\listtable', r'{\listoverridetable', r'{\*\generator',
             r'{\*\rsidtbl', r'{\*\pgptbl', r'{\mmathPr',
-            #r'{\footer', r'{\header'
+            r'{\footer', r'{\header'  # Skip header/footer blocks
         ]
 
         # Progress tracking
@@ -716,6 +716,23 @@ class BasicRTF:
                         "char_end": m.end()
                     })
                     i = m.end()
+                    char_start = i
+                    continue
+                
+                # Backslash-newline: In RTF, \ followed by \n or \r\n is a line break
+                # This is commonly used in Mac RTF files instead of \line or \par
+                if i + 1 < len(data) and data[i + 1] in ('\n', '\r'):
+                    flush_text(i)
+                    # Skip the backslash and the newline(s)
+                    end_pos = i + 2
+                    if i + 2 < len(data) and data[i + 1] == '\r' and data[i + 2] == '\n':
+                        end_pos = i + 3  # Skip \r\n
+                    self._streams.append({
+                        "type": "line_break",
+                        "char_start": i,
+                        "char_end": end_pos
+                    })
+                    i = end_pos
                     char_start = i
                     continue
 

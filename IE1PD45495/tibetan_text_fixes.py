@@ -152,10 +152,11 @@ def fix_flying_vowels_and_linebreaks(text: str) -> str:
     Fix all flying vowel and line break issues in Tibetan text.
     
     This is the main function that applies all fixes in the correct order:
-    1. Flying vowels (vowel at line start joins previous consonant)
-    2. Flying subscripts (subscript at line start joins previous consonant)
-    3. Mid-word breaks (consonant joins previous consonant/vowel/subscript)
-    4. Flying tseg (tseg at line start joins previous text)
+    1. ASCII to Tibetan character fixes (. - 0 , -> Tibetan equivalents)
+    2. Flying vowels (vowel at line start joins previous consonant)
+    3. Flying subscripts (subscript at line start joins previous consonant)
+    4. Mid-word breaks (consonant joins previous consonant/vowel/subscript)
+    5. Flying tseg (tseg at line start joins previous text)
     
     PARAGRAPH BREAKS ARE PRESERVED when they follow:
     - Tibetan sheds (།) - sentence/section markers
@@ -178,13 +179,70 @@ def fix_flying_vowels_and_linebreaks(text: str) -> str:
     if not text:
         return text
     
-    # Apply fixes in order - ONLY for combining characters that MUST attach
-    result = fix_flying_vowels(text)
+    # Apply fixes in order
+    # First fix ASCII to Tibetan character mappings
+    result = fix_ascii_to_tibetan(text)
+    
+    # Then fix combining characters that MUST attach
+    result = fix_flying_vowels(result)
     result = fix_flying_subscripts(result)
     # REMOVED: fix_mid_word_breaks - was removing legitimate paragraph breaks from original RTF
     result = fix_flying_tseg(result)
     
     return result
+
+
+# =============================================================================
+# ASCII to Tibetan Character Fixes
+# =============================================================================
+
+def fix_ascii_to_tibetan(text: str) -> str:
+    """
+    Fix ASCII characters that should be Tibetan characters.
+    
+    These mappings handle cases where ASCII punctuation was incorrectly used
+    instead of proper Tibetan characters in the source RTF files.
+    
+    Mappings:
+        . (period)      -> ད (Tibetan letter DA) - preserves ellipsis (2+ dots)
+        - (hyphen)      -> ་ (Tibetan tseg/syllable separator)
+        0 (zero)        -> པ (Tibetan letter PA)
+        , (comma)       -> ཐ (Tibetan letter THA)
+        } (right brace) -> སྔ (Tibetan SA + NGA)
+        ( (left paren)  -> ༼ (Tibetan left bracket)
+        ) (right paren) -> ༽ (Tibetan right bracket)
+        \\ (backslash)  -> གླ (Tibetan GA + LA subscript)
+    
+    Note: Ellipsis (sequences of 2+ periods) are preserved as-is.
+    
+    Args:
+        text: Input text with ASCII characters
+        
+    Returns:
+        Text with ASCII characters replaced by Tibetan equivalents
+    """
+    if not text:
+        return text
+    
+    # First, protect ellipsis by temporarily replacing sequences of 2+ periods
+    # Use a placeholder that won't appear in normal text
+    ELLIPSIS_PLACEHOLDER = '\uE000'  # Private Use Area character
+    text = re.sub(r'\.{2,}', lambda m: ELLIPSIS_PLACEHOLDER * len(m.group()), text)
+    
+    # Apply character replacements
+    text = text.replace('.', 'ད')  # period -> DA (only single periods now)
+    text = text.replace('-', '་')  # hyphen -> tseg
+    text = text.replace('0', 'པ')  # zero -> PA
+    text = text.replace(',', 'ཐ')  # comma -> THA
+    text = text.replace('}', 'སྔ')  # right brace -> SA + NGA
+    text = text.replace('(', '༼')  # left paren -> Tibetan left bracket
+    text = text.replace(')', '༽')  # right paren -> Tibetan right bracket
+    text = text.replace('\\', 'གླ')  # backslash -> GA + LA subscript
+    
+    # Restore ellipsis
+    text = text.replace(ELLIPSIS_PLACEHOLDER, '.')
+    
+    return text
 
 
 # =============================================================================

@@ -44,8 +44,9 @@ def normalize_spaces(
 
     Tibetan-specific rules:
       - Remove space after tsheg (U+0F0B, U+0F0C, U+0FD2) if followed by
-        initial letter (U+0F40-U+0F6C) or shad (U+0F0D-U+0F11)
+        initial letter (U+0F40-U+0F6C)
       - Remove space between final letter (U+0F40-U+0FBC) and tsheg
+      - Preserve spaces between shad marks (།༎༏༐༑ U+0F0D-U+0F11) for proper sentence separation
     """
     if not text:
         return ""
@@ -65,8 +66,9 @@ def normalize_spaces(
 
     # 4) Tibetan-specific space normalization
     if tibetan_specific:
-        # Remove space after tsheg if followed by initial letter or shad
-        s = re.sub(r"([\u0f0b\u0f0c\u0fd2]) +([\u0f40-\u0f6c\u0f0d-\u0f11])", r"\1\2", s)
+        # Remove space after tsheg (་ U+0F0B, U+0F0C, U+0FD2) if followed by initial letter
+        # BUT preserve space after shad marks (།༎༏༐༑ U+0F0D-U+0F11) - these are sentence terminators
+        s = re.sub(r"([\u0f0b\u0f0c\u0fd2]) +([\u0f40-\u0f6c])", r"\1\2", s)
         # Remove space between final letter and tsheg
         s = re.sub(r"([\u0f40-\u0fbc]) +([\u0f0b\u0f0c\u0fd2])", r"\1\2", s)
 
@@ -121,8 +123,8 @@ def normalize_unicode(
     s = normalize_unicode_tib(s)
     # no graphical distinction between 0f0b and 0f0c
     s = s.replace("\u0f0c", "\u0f0b")
-    # double shad is just two shad
-    s = s.replace("\u0f0e", "\u0f0d\u0f0d")
+    # double shad is two shad with space (། །)
+    s = s.replace("\u0f0e", "\u0f0d \u0f0d")
 
     return s
 
@@ -138,12 +140,17 @@ class Cats(Enum):
     TopVowel = 5
     TopMark = 6
     RightMark = 7
+    PostVowelMark = 8  # Marks that come after vowels (e.g., ༔ U+0F14)
 
 
 CATEGORIES = (
     [Cats.Other]  # 0F00
     + [Cats.Base]  # 0F01, often followed by 0f083
-    + [Cats.Other] * 22  # 0F02-0F17
+    + [Cats.Other] * 11  # 0F02-0F0C
+    + [Cats.PostVowelMark] * 5  # 0F0D-0F11 (།༎༏༐༑ - shad marks, come after vowels)
+    + [Cats.Other] * 2  # 0F12-0F13
+    + [Cats.PostVowelMark]  # 0F14 ༔ GTER TSHEG - comes after vowels
+    + [Cats.Other] * 3  # 0F15-0F17
     + [Cats.BottomVowel] * 2  # 0F18-0F19
     + [Cats.Other] * 6  # 0F1A-0F1F
     + [Cats.Base]

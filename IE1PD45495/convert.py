@@ -1,32 +1,30 @@
 #!/usr/bin/env python3
 """
-Convert RTF files from IE1PD45495 (Taranatha Gsung Qbum Collection) to TEI XML format.
+Convert RTF files to TEI XML format.
 
-Input structure:    
-    IE1PD45495/sources/{VE_ID}/{collection_name}/{VOL_ID}/*.rtf
+Input structure:
+    {IE_ID}/sources/{VE_ID}/{collection_name}/{VOL_ID}/*.rtf
     Example: IE1PD45495/sources/VE1PD45495_001/taranatha-gsung-qbum/volume_001/*.rtf
+    
+    Or single subfolder: {IE_ID}/sources/{VE_ID}/*.rtf
+    Example: IE1PD45495/sources/VE1PD45495_001/*.rtf
 
 Output structure:
-    Archive (flat): IE1PD45495_output/archive/{VE_ID}/UT1PD45495_{VOL_NUM}_{FILE_NUM}.xml
-    Example: volume_029_266.rtf -> UT1PD45495_029_266.xml
-    Sources (nested): IE1PD45495_output/sources/{VE_ID}/{collection_name}/{VOL_ID}/*.rtf and *.doc
-
-Pipeline:
-1. Parse RTF using basic_rtf parser (extracts text with font info)
-2. Convert Dedris encoding to Unicode using pytiblegenc
-3. Normalize Unicode (Tibetan-specific normalization)
-4. Classify font sizes (regular/small/large)
-5. Generate TEI XML with proper structure
+    Archive (flat): {IE_ID}_output/archive/{VE_ID}/UT{suffix}_{FILE_NUM}.xml
+    Sources (nested): {IE_ID}_output/sources/{VE_ID}/{collection_name}/{VOL_ID}/*.rtf and *.doc
 
 Usage:
-    # Convert all volumes:
-    python convert.py --all
+    # Process all VE folders in current directory (auto-detects IE_ID):
+    python convert.py
     
-    # Convert a single volume:
-    python convert.py --single VE1PD45495_001
+    # Process specific directory (auto-detects IE_ID):
+    python convert.py /path/to/IE1GS58442
     
-    # Adjust worker count:
-    python convert.py --all --workers 4
+    # Process only a specific VE_ID:
+    python convert.py --ve-id VE1PD45495_001
+    
+    # Process with explicit IE_ID override:
+    python convert.py /path/to/folder --ie-id IE1GS58442
 """
 
 import sys
@@ -38,14 +36,7 @@ import argparse
 import logging
 from pathlib import Path
 from collections import Counter
-from concurrent.futures import ProcessPoolExecutor, as_completed
-import multiprocessing
-
-try:
-    from natsort import natsorted
-except ImportError:
-    # logger not yet defined, will use sorted as fallback
-    natsorted = sorted
+from natsort import natsorted
 
 # Configure logging with immediate output
 logging.basicConfig(
@@ -73,10 +64,6 @@ from tibetan_text_fixes import (
 )
 
 # Import char_converter directly to avoid pdfminer dependency issues in pytiblegenc.__init__
-# This imports the convert_string function without going through __init__.py
-import importlib.util
-import site
-
 try:
     from pytiblegenc import convert_string
 except ImportError as e:
@@ -89,17 +76,9 @@ except ImportError as e:
 # Configuration
 # =============================================================================
 
-IE_ID = "IE1PD45495"
-
-# Paths - adjust these as needed
-# The script expects the following structure created by organizer.py:
-# IE1PD45495/sources/VE1PD45495_001/taranatha-gsung-qbum/volume_001/*.rtf
-BASE_DIR = Path(__file__).parent  # Script directory (IE1PD45495 folder)
-SOURCE_RTF_BASE = BASE_DIR / "IE1PD45495" / "sources"  # Base path for volume sources
-OUTPUT_DIR = BASE_DIR / "IE1PD45495_output"
-
-# Number of parallel workers (default: CPU count - 1, min 1)
-DEFAULT_WORKERS = max(1, multiprocessing.cpu_count() - 1)
+# Processing stages - can be enabled/disabled
+ENABLE_FONT_CLASSIFICATION = True   
+ENABLE_NORMALIZATION = True        
 
 # Global stats for pytiblegenc
 STATS = {
@@ -110,69 +89,55 @@ STATS = {
     "error_characters": 0
 }
 
-
 # =============================================================================
-# VE/UT ID Functions
+# Discovery Functions
 # =============================================================================
 
-def get_ut_id(ve_id: str, file_index: int) -> str:
-    """
-    Generate UT ID from VE ID and file index.
-    
-    VE1PD45495_001, index 0 -> UT1PD45495_001_0001
-    VE1PD45495_001, index 1 -> UT1PD45495_001_0002
-    """
-    # Remove 'VE' prefix
-    if ve_id.startswith('VE'):
-        ve_suffix = ve_id[2:]
-    else:
-        ve_suffix = ve_id
-    
-    return f"UT{ve_suffix}_{file_index + 1:04d}"
-
-
-def get_volume_folders(source_base: Path = None) -> list:
+def get_volume_folders(ie_id: str, sources_dir: Path) -> list:
     """
     Get list of volume folders from sources directory.
     
-    Handles structure: {IE_ID}/sources/{VE_ID}/{collection_name}/volume_XXX/*.rtf
-    
-    Args:
-        source_base: Base path for sources (default: SOURCE_RTF_BASE)
+    Handles multiple structures:
+    1. Direct RTF files in VE folder: {IE_ID}/sources/{VE_ID}/*.rtf
+    2. Nested structure: {IE_ID}/sources/{VE_ID}/{collection_name}/{VOL_ID}/*.rtf
     
     Returns:
-        List of (ve_id, volume_number, rtf_folder_path, collection_name) tuples
+        List of (ve_id, volume_id, rtf_folder_path, collection_name) tuples
     """
-    if source_base is None:
-        source_base = SOURCE_RTF_BASE
-    
     volumes = []
     
-    if not source_base.exists():
-        logger.error(f"Sources folder not found at {source_base}")
-        return []
-    
-    # Iterate through VE folders
-    for ve_folder in source_base.iterdir():
-        if not ve_folder.is_dir():
+    # Iterate through VE folders in sources directory
+    for ve_folder in sources_dir.iterdir():
+        if not ve_folder.is_dir() or ve_folder.name.startswith('.'):
             continue
         
         ve_id = ve_folder.name
+        found_nested = False
         
-        # Look for collection subdirectories that contain volume_XXX folders
-        # This handles variable collection names like "taranatha-gsung-qbum"
-        for subdir in ve_folder.iterdir():
-            if not subdir.is_dir() or subdir.name.startswith('.'):
+        # Check for nested structure: {VE_ID}/{collection_name}/{VOL_ID}/*.rtf
+        for collection_folder in ve_folder.iterdir():
+            if not collection_folder.is_dir() or collection_folder.name.startswith('.'):
                 continue
             
-            collection_name = subdir.name
-            # Find all volume_XXX folders directly in the collection folder
-            for volume_folder in subdir.iterdir():
-                if volume_folder.is_dir() and volume_folder.name.startswith('volume_'):
-                    volume_num = volume_folder.name.replace('volume_', '')
-                    # Only add if there are RTF files
-                    if list(volume_folder.glob("*.rtf")):
-                        volumes.append((ve_id, volume_num, volume_folder, collection_name))
+            collection_name = collection_folder.name
+            
+            # Look for volume folders (any folder that contains RTF files)
+            for vol_folder in collection_folder.iterdir():
+                if not vol_folder.is_dir() or vol_folder.name.startswith('.'):
+                    continue
+                
+                # Check if this folder contains RTF files
+                rtf_files = list(vol_folder.glob("*.rtf"))
+                if rtf_files:
+                    volume_id = vol_folder.name
+                    volumes.append((ve_id, volume_id, vol_folder, collection_name))
+                    found_nested = True
+        
+        # Check for direct RTF files in VE folder (single subfolder structure)
+        if not found_nested:
+            rtf_files = list(ve_folder.glob("*.rtf"))
+            if rtf_files:
+                volumes.append((ve_id, None, ve_folder, None))
     
     return natsorted(volumes, key=lambda x: (x[0], x[1] or ''))
 
@@ -181,6 +146,22 @@ def get_rtf_files(volume_folder: Path) -> list:
     """Get sorted list of RTF files in a volume folder."""
     rtf_files = list(volume_folder.glob("*.rtf"))
     return natsorted(rtf_files, key=lambda p: p.name)
+
+
+def get_ut_id(ve_id: str, file_index: int) -> str:
+    """
+    Generate UT ID from VE ID and file index.
+    
+    VE3KG253, index 0 -> UT3KG253_0001
+    VE1ER664, index 0 -> UT1ER664_0001
+    """
+    # Remove 'VE' prefix
+    if ve_id.startswith('VE'):
+        ve_suffix = ve_id[2:]
+    else:
+        ve_suffix = ve_id
+    
+    return f"UT{ve_suffix}_{file_index + 1:04d}"
 
 
 # =============================================================================
@@ -202,7 +183,6 @@ def dedris_to_unicode(text: str, font_name: str) -> str:
         return text
     
     # Fonts that might contain Dedris-encoded characters due to font attribution errors
-    # SimSun is a Chinese font, but in these RTFs it sometimes contains Dedris text
     SUSPICIOUS_FONTS = ('simsun', '@simsun', 'simsun western')
     
     # Check if this is a Dedris font
@@ -210,48 +190,18 @@ def dedris_to_unicode(text: str, font_name: str) -> str:
     is_suspicious = font_name and font_name.lower() in SUSPICIOUS_FONTS
     
     if not is_dedris and not is_suspicious:
-        # Skip truly non-Dedris fonts (e.g., Times New Roman, Arial)
-        # Log non-Dedris text that contains potential Dedris characters
-        has_suspicious = any(c in text for c in '{}0123456789.,;:!?@#$%^&*()[]<>')
-        if has_suspicious and len(text.strip()) > 0:
-            preview = text[:50].replace('\n', '\\n')
-            if "skipped_non_dedris" not in STATS:
-                STATS["skipped_non_dedris"] = []
-            if len(STATS["skipped_non_dedris"]) < 100:  # Limit to 100 samples
-                STATS["skipped_non_dedris"].append({
-                    "font": font_name or "(no font)",
-                    "text": preview,
-                    "chars": [f"'{c}'({ord(c)})" for c in text[:20] if ord(c) < 128]
-                })
         return text
     
-    # For suspicious fonts (like SimSun), try converting as Dedris-a
-    # This handles font attribution errors in the original RTF
-    effective_font = font_name if is_dedris else 'Dedris-a'
-    
     try:
-        # Pass effective font (handles font attribution errors)
-        result = convert_string(text, effective_font, STATS)
-        if result is None:
-            # Font not in conversion tables
-            preview = text[:50].replace('\n', '\\n')
-            logger.warning(f"UNHANDLED FONT: '{effective_font}' (original: '{font_name}') | text: '{preview}'")
+        # Use pytiblegenc to convert
+        unicode_text = convert_string(text, font_name, STATS)
+        # If conversion returns None or empty, return original text
+        if unicode_text is None or unicode_text == '':
             return text
-        
-        # Log when we converted suspicious font text
-        if is_suspicious:
-            if "converted_suspicious" not in STATS:
-                STATS["converted_suspicious"] = []
-            if len(STATS["converted_suspicious"]) < 50:
-                STATS["converted_suspicious"].append({
-                    "font": font_name,
-                    "text": text[:30],
-                    "result": result[:30]
-                })
-        
-        return result
+        return unicode_text
     except Exception as e:
-        logger.warning(f"Error converting with font {effective_font}: {e}")
+        logger.warning(f"Failed to convert text with font {font_name}: {e}")
+        STATS["error_characters"] += len(text)
         return text
 
 
@@ -259,43 +209,55 @@ def dedris_to_unicode(text: str, font_name: str) -> str:
 # Font Size Classification
 # =============================================================================
 
-def classify_font_sizes(converted_streams: list) -> dict:
+def classify_font_sizes_from_converted(converted_streams: list) -> dict:
     """
     Classify font sizes into large, regular, and small categories.
     
-    Uses frequency analysis: most common size is regular,
-    smaller sizes are 'small', larger sizes are 'large'.
+    Uses frequency analysis: the font size with the MOST Tibetan characters 
+    is classified as "regular" (body text). Larger sizes become "large" (headers),
+    smaller sizes become "small" (footnotes).
+    
+    IMPORTANT: This function must be called AFTER Dedris to Unicode conversion,
+    otherwise Tibetan character counting will return 0.
     
     Args:
-        converted_streams: List of dicts with 'text' (Unicode), 'font_size'
+        converted_streams: List of dicts with 'text' (Unicode), 'font_size', 'is_break'
         
     Returns:
         dict: Mapping of font_size -> classification ('large', 'regular', 'small')
+        
+    Example:
+        Input streams with font sizes: 10 (200 chars), 12 (5000 chars), 16 (50 chars)
+        Returns: {10: 'small', 12: 'regular', 16: 'large'}
     """
-    # Count Tibetan characters for each font size
     size_counts = Counter()
     
     for item in converted_streams:
         text = item.get("text", "")
         font_size = item.get("font_size", 12)
+        is_break = item.get("is_break", False)
+        
+        # Skip break streams
+        if is_break:
+            continue
         
         # Count Tibetan characters (U+0F00-U+0FFF)
-        tibetan_chars = len([c for c in text if 0x0F00 <= ord(c) <= 0x0FFF])
+        tibetan_chars = count_tibetan_chars(text)
         if tibetan_chars > 0:
             size_counts[font_size] += tibetan_chars
     
     if not size_counts:
         return {}
     
-    # Find most frequently occurring font size - this is regular (body text)
-    most_common = max(size_counts.items(), key=lambda x: x[1])[0]
+    # Find the font size with the most Tibetan characters - that's "regular" (body text)
+    most_common_size = max(size_counts.items(), key=lambda x: x[1])[0]
     
     # Classify all sizes relative to most common
     classifications = {}
     for fs in size_counts.keys():
-        if fs == most_common:
+        if fs == most_common_size:
             classifications[fs] = 'regular'
-        elif fs > most_common:
+        elif fs > most_common_size:
             classifications[fs] = 'large'
         else:
             classifications[fs] = 'small'
@@ -304,8 +266,52 @@ def classify_font_sizes(converted_streams: list) -> dict:
 
 
 # =============================================================================
-# RTF to TEI Conversion
+# TEI XML Generation
 # =============================================================================
+
+def is_watermark(text: str) -> bool:
+    """
+    Detect if text is a watermark/copyright pattern.
+    
+    Watermarks typically have:
+    - Mix of Tibetan characters with ASCII digits
+    - Hex-like patterns (e.g., "3cac58c", "a1c58c")
+    - High ratio of digits/letters to Tibetan characters
+    - Long repeating patterns of 'f' characters
+    
+    Args:
+        text: Text to check
+        
+    Returns:
+        True if text appears to be a watermark
+    """
+    if not text or len(text) < 10:
+        return False
+    
+    # Count different character types
+    tibetan_count = sum(1 for c in text if '\u0f00' <= c <= '\u0fff')
+    digit_count = sum(1 for c in text if c.isdigit())
+    letter_count = sum(1 for c in text if c.isalpha() and ord(c) < 128)  # ASCII letters
+    total_chars = len(text)
+    
+    # Pattern 1: High density of ASCII digits mixed with Tibetan
+    if tibetan_count > 0 and digit_count > tibetan_count * 0.3:
+        return True
+    
+    # Pattern 2: Contains hex-like patterns with Tibetan
+    if tibetan_count > 0 and re.search(r'[a-f0-9]{6,}', text, re.IGNORECASE):
+        return True
+    
+    # Pattern 3: Very long repeating patterns of same character
+    if re.search(r'(.)\1{50,}', text):
+        return True
+    
+    # Pattern 4: Mix of Tibetan with ASCII letters (not spaces/punctuation)
+    if tibetan_count > 0 and letter_count > 0 and letter_count > tibetan_count * 0.2:
+        return True
+    
+    return False
+
 
 def escape_xml(text: str) -> str:
     """Escape XML special characters."""
@@ -315,50 +321,44 @@ def escape_xml(text: str) -> str:
     return text
 
 
-# =============================================================================
-# Staged Conversion Control
-# =============================================================================
-# Set these flags to control which stages are enabled:
-#   Stage 1: RTF parsing + Unicode conversion only (no normalization, no font tags)
-#   Stage 2: Add font size classification and <hi> tags
-#   Stage 3: Add careful normalization (flying vowels, Unicode normalization)
+def calculate_sha256(file_path: Path) -> str:
+    """Calculate SHA256 hash of a file."""
+    sha256_hash = hashlib.sha256()
+    try:
+        with open(file_path, "rb") as f:
+            for byte_block in iter(lambda: f.read(4096), b""):
+                sha256_hash.update(byte_block)
+        return sha256_hash.hexdigest()
+    except FileNotFoundError:
+        return "FILE_NOT_FOUND"
 
-ENABLE_FONT_CLASSIFICATION = True   # Stage 2: Add <hi rend="small/head"> tags
-ENABLE_NORMALIZATION = True         # Stage 3: Apply text normalization
 
-
-def convert_rtf_to_tei(rtf_path: Path, ve_id: str, ut_id: str, src_path: str) -> str:
+def convert_rtf_to_tei(rtf_path: Path, ie_id: str, ve_id: str, ut_id: str, src_path: str) -> str:
     """
     Convert RTF file to TEI XML.
     
-    Staged conversion:
-    - Stage 1: Parse RTF + convert Dedris to Unicode (always enabled)
-    - Stage 2: Font size classification (ENABLE_FONT_CLASSIFICATION)
-    - Stage 3: Text normalization (ENABLE_NORMALIZATION)
-    
     Args:
         rtf_path: Path to RTF file
-        ve_id: Volume Entity ID (e.g., "VE1PD45495_001")
-        ut_id: Unit Text ID (e.g., "UT1PD45495_001_0001")
-        src_path: Relative path to source file in output structure
+        ie_id: Image Entity ID
+        ve_id: Volume Entity ID
+        ut_id: Unit Text ID
+        src_path: Relative source path for metadata
         
     Returns:
         TEI XML string
     """
     # =========================================================================
-    # STAGE 1: Parse RTF and Convert to Unicode
+    # STAGE 1: Parse RTF and Convert Dedris to Unicode
     # =========================================================================
-    logger.info(f"Parsing RTF file: {rtf_path.name}")
     parser = BasicRTF()
     parser.parse_file(str(rtf_path))
     streams = parser.get_streams()
     
-    logger.info(f"Parsed {len(streams)} text streams")
-    
-    # Convert all Dedris to Unicode
+    # Convert all text streams to Unicode first
     converted_streams = []
+    
     for stream in streams:
-        # Skip special types (headers, footers, images, etc.)
+        # Skip standard RTF non-text elements
         if stream.get("type") in ("header", "footer", "pict"):
             continue
         
@@ -366,7 +366,7 @@ def convert_rtf_to_tei(rtf_path: Path, ve_id: str, ut_id: str, src_path: str) ->
         if stream.get("type") == "par_break":
             converted_streams.append({
                 "text": "\n",
-                "font_size": 12,  # Default size for breaks
+                "font_size": 12,
                 "is_break": True
             })
             continue
@@ -383,7 +383,7 @@ def convert_rtf_to_tei(rtf_path: Path, ve_id: str, ut_id: str, src_path: str) ->
         # Handle table cell breaks
         if stream.get("type") == "cell_break":
             converted_streams.append({
-                "text": "\n",  # Just newline for cell breaks
+                "text": "\n",
                 "font_size": 12,
                 "is_break": True
             })
@@ -401,80 +401,80 @@ def convert_rtf_to_tei(rtf_path: Path, ve_id: str, ut_id: str, src_path: str) ->
         # Convert Dedris to Unicode
         unicode_text = dedris_to_unicode(text, font_name)
         
-        # Keep streams even if they only have whitespace/newlines (for structure)
-        if not unicode_text:
-            continue
-        
+        # Store converted stream
         converted_streams.append({
             "text": unicode_text,
-            "font_size": font_size
+            "font_size": font_size,
+            "is_break": False
         })
-    
-    logger.info(f"  Stage 1: Converted {len(converted_streams)} streams to Unicode")
-    
-    # =========================================================================
-    # REMOVE WATERMARK/COPYRIGHT PATTERNS (after Unicode conversion)
-    # =========================================================================
-    # Remove watermark patterns from converted streams before any further processing
-    # These are typically long sequences of repetitive Tibetan characters
-    cleaned_streams = []
-    for item in converted_streams:
-        text = item.get("text", "")
-        
-        # Check if this is a watermark pattern
-        # Criteria: Very long text (>500 chars) with low unique character ratio
-        if len(text) > 500:
-            # Count unique vs total Tibetan characters (ignoring spaces/newlines)
-            chars = [c for c in text if c.strip() and 0x0F00 <= ord(c) <= 0x0FFF]
-            if chars:
-                unique_ratio = len(set(chars)) / len(chars)
-                # If less than 10% unique characters, it's likely a watermark
-                if unique_ratio < 0.1:
-                    logger.info(f"  Removing watermark stream ({len(text)} chars, {unique_ratio:.2%} unique)")
-                    continue  # Skip this stream entirely
-        
-        cleaned_streams.append(item)
-    
-    converted_streams = cleaned_streams
-    logger.info(f"  After watermark removal: {len(converted_streams)} streams remaining")
     
     # =========================================================================
     # STAGE 2: Font Size Classification (optional)
     # =========================================================================
     if ENABLE_FONT_CLASSIFICATION:
-        classifications = classify_font_sizes(converted_streams)
-        if classifications:
-            logger.info(f"  Stage 2: Font classifications: {classifications}")
+        classifications = classify_font_sizes_from_converted(converted_streams)
     else:
         classifications = {}
-        logger.info(f"  Stage 2: SKIPPED (font classification disabled)")
     
     # =========================================================================
-    # BUILD TEI CONTENT
+    # STAGE 3: Process Converted Streams and Build Content
     # =========================================================================
     tei_lines = []
-    current_markup = None  # 'small', 'large', or None
+    current_markup = None
     
     for item in converted_streams:
         text = item["text"]
         font_size = item["font_size"]
+        is_break = item.get("is_break", False)
         
-        # Escape XML special characters
-        escaped_text = escape_xml(text)
+        # If it's a break, just add the newline
+        if is_break:
+            tei_lines.append(text)
+            continue
         
+        # Apply normalization if enabled
+        if ENABLE_NORMALIZATION:
+            # Normalize Unicode (includes space normalization)
+            normalized_text = normalize_unicode(text)
+            
+            # Skip only if completely empty, but preserve space-only text
+            # (spaces between Tibetan punctuation marks like ། । are significant)
+            if not normalized_text:
+                continue
+            
+            # Apply Tibetan-specific fixes
+            fixed_text = fix_flying_vowels_and_linebreaks(normalized_text)
+            
+            # Remove inverted exclamation mark (¡) that appears with ellipsis in some fonts
+            fixed_text = fixed_text.replace('¡', '')
+        else:
+            fixed_text = text
+            if not fixed_text:
+                continue
+        
+        # Skip lines that contain only dashes (e.g., "- - - - -")
+        # But preserve pure spaces (significant between Tibetan punctuation)
+        # and ellipsis characters (U+2026: …)
+        if re.match(r'^[\s\-]+$', fixed_text) and '-' in fixed_text and '…' not in fixed_text:
+            continue
+        
+        # Skip watermark/copyright patterns
+        if is_watermark(fixed_text):
+            logger.debug(f"Skipping watermark: {fixed_text[:50]}...")
+            continue
+        
+        # Escape XML
+        escaped_text = escape_xml(fixed_text)
+        
+        # Apply font size classification if enabled
         if ENABLE_FONT_CLASSIFICATION and classifications:
-            # Determine markup based on font size
             classification = classifications.get(font_size, 'regular')
             
-            # Handle markup transitions
+            # Handle markup changes
             if classification != current_markup:
-                # Close previous markup
-                if current_markup == 'small':
-                    tei_lines.append('</hi>')
-                elif current_markup == 'large':
+                if current_markup in ('small', 'large'):
                     tei_lines.append('</hi>')
                 
-                # Open new markup
                 if classification == 'small':
                     tei_lines.append('<hi rend="small">')
                 elif classification == 'large':
@@ -482,124 +482,60 @@ def convert_rtf_to_tei(rtf_path: Path, ve_id: str, ut_id: str, src_path: str) ->
                 
                 current_markup = classification if classification != 'regular' else None
         
-        # Add text content (preserve newlines from RTF \par)
         tei_lines.append(escaped_text)
     
     # Close any open markup
-    if current_markup == 'small':
-        tei_lines.append('</hi>')
-    elif current_markup == 'large':
+    if current_markup in ('small', 'large'):
         tei_lines.append('</hi>')
     
-    # Join all content (text already has newlines from RTF \par)
+    # Join and clean up
     body_content = ''.join(tei_lines)
     
-    # Clean up empty hi tags
+    # Apply final Unicode normalization to handle cross-stream character ordering
+    # This fixes cases where ༔ and vowels are in separate RTF streams
+    if ENABLE_NORMALIZATION:
+        body_content = normalize_unicode(body_content)
+    
+    # Fix hi tag spacing and remove empty hi tags (only if font classification is enabled)
     if ENABLE_FONT_CLASSIFICATION:
+        body_content = fix_hi_tag_spacing(body_content)
         body_content = re.sub(r'<hi rend="[^"]+"></hi>', '', body_content)
     
-    # =========================================================================
-    # STAGE 3: Normalization (optional)
-    # =========================================================================
-    if ENABLE_NORMALIZATION:
-        logger.info(f"  Stage 3: Applying normalization...")
-        # Apply full Unicode normalization (includes Tibetan-specific reordering)
-        body_content = normalize_unicode(body_content)
-        # Fix spacing around <hi> tags based on Tibetan punctuation rules
-        body_content = fix_hi_tag_spacing(body_content)
-        
-    else:
-        logger.info(f"  Stage 3: SKIPPED (normalization disabled)")
-    
     body_content = body_content.strip()
     
-    # =========================================================================
-    # REMOVE PAGE NUMBER PATTERNS
-    # =========================================================================
-    # Remove page number patterns like: - 2 -, 289 -, ་286-, - 288 -, -, -2་
-    # These patterns can appear anywhere in the text (not just on their own lines)
-    
-    # Pattern 1: dash-number-dash patterns (with optional spaces and Tibetan tsheg)
-    # Matches: "- 2 -", "- 288 -", "-2-", "- 338 -", etc.
-    body_content = re.sub(r'\n-\s*\d+\s*-\n', '\n', body_content)
-    body_content = re.sub(r'\n-\s*\d+\s*-\s', '\n', body_content)
-    
-    # Pattern 2: Tibetan tsheg-number-dash patterns
-    # Matches: "་286-", "་123-", "་ 311 -", etc.
-    body_content = re.sub(r'\n་\s*\d+\s*-\n', '\n', body_content)
-    body_content = re.sub(r'\n་\s*\d+\s*-\s', '\n', body_content)
-    
-    # Pattern 3: number-dash patterns at end of line
-    # Matches: "289 -", "123-", etc.
-    body_content = re.sub(r'\n\d+\s*-\n', '\n', body_content)
-    body_content = re.sub(r'\n\d+\s*-\s', '\n', body_content)
-    
-    # Pattern 4: dash-number with optional Tibetan tsheg at end
-    # Matches: "-2་", "-123་", "-2 ་", etc.
-    body_content = re.sub(r'\n-\s*\d+\s*་?\n', '\n', body_content)
-    body_content = re.sub(r'\n-\s*\d+\s*་?\s', '\n', body_content)
-    
-    # Pattern 5: Standalone dash on its own line
-    # Matches: "-", "- ", " -", etc.
-    body_content = re.sub(r'\n\s*-\s*\n', '\n', body_content)
-    
-    # Pattern 6: Standalone numbers on their own line (likely page numbers, 1-4 digits)
-    # Matches lines with just numbers
-    body_content = re.sub(r'\n\s*\d{1,4}\s*\n', '\n', body_content)
-    
-    # Clean up any resulting multiple newlines
-    body_content = re.sub(r'\n\n+', '\n', body_content)
-    body_content = body_content.strip()
-    
-    # =========================================================================
-    # ADD LINE BREAK TAGS
-    # =========================================================================
-    # Replace newlines with <lb/> tags inline
-    body_content = body_content.replace('\n', '<lb/>')
+    # Put <lb/> at beginning of each new line and remove surrounding spaces
+    body_content = body_content.replace('\n', '\n<lb/>')
     body_content = re.sub(r' *<lb/> *', '<lb/>', body_content)
     body_content = body_content.strip()
     
-    # =========================================================================
-    # FIX <hi> TAG PLACEMENT
-    # =========================================================================
-    # Don't wrap whitespace/lb tags only in <hi> tags
-    # Remove <hi> tags that contain only whitespace/lb tags
+    # Remove <hi> tags that contain only whitespace/newlines/lb tags
     body_content = re.sub(r'<hi rend="[^"]+">[\s]*(?:<lb/>[\s]*)*</hi>', '', body_content)
     
-    # Move <hi> from before <lb/> to after it
-    # Pattern: <hi...> followed by <lb/>
-    body_content = re.sub(r'(<hi rend="[^"]+">)<lb/>', r'<lb/>\1', body_content)
+    # Move <hi> from end of line to after <lb/> on next line
+    body_content = re.sub(r'(<hi rend="[^"]+">)\s*<lb/>', r'<lb/>\1', body_content)
     
-    # Move </hi> from after <lb/> to before the newline (end of previous line)
-    # Pattern: newline, <lb/>, </hi>
-    body_content = re.sub(r'\n<lb/></hi>', r'</hi>\n<lb/>', body_content)
+    # Move </hi> from after <lb/> to its own line, then <lb/> on next line
+    body_content = re.sub(r'<lb/></hi>', r'</hi>\n<lb/>', body_content)
+    
+    # Remove multiple consecutive <lb/> tags around </hi>, keeping only one after </hi>
+    body_content = re.sub(r'(<lb/>\s*)+</hi>\s*(<lb/>\s*)+', r'</hi>\n<lb/>', body_content)
     
     # Remove double newlines
     body_content = re.sub(r'\n\n+', '\n', body_content)
+    
     # Clean up any remaining empty <hi> tags after the moves
     body_content = re.sub(r'<hi rend="[^"]+">[\s]*</hi>', '', body_content)
     
-    # Merge consecutive identical <hi> tags while preserving line breaks
-    # Pattern: </hi> followed by <lb/>, then same <hi> tag
-    body_content = re.sub(r'</hi><lb/><hi rend="small">', '<lb/>', body_content)
-    body_content = re.sub(r'</hi><lb/><hi rend="head">', '<lb/>', body_content)
-    
-    # Also handle cases without <lb/> tags (with or without whitespace between tags)
-    body_content = re.sub(r'</hi>\s*<hi rend="small">', ' ', body_content)
-    body_content = re.sub(r'</hi>\s*<hi rend="head">', ' ', body_content)
-    
-    # Remove duplicate consecutive <lb/> tags (keep only one)
-    while re.search(r'<lb/><lb/>', body_content):
-        body_content = re.sub(r'<lb/><lb/>', '<lb/>', body_content)
+    # Remove multiple consecutive <lb/> tags, keeping only one
+    body_content = re.sub(r'(<lb/>)+', '<lb/>', body_content)
     
     # Final strip
     body_content = body_content.strip()
     
-    # =========================================================================
-    # GENERATE TEI XML
-    # =========================================================================
+    # Calculate SHA256
     sha256 = calculate_sha256(rtf_path)
     
+    # Generate TEI XML
     tei_xml = f'''<?xml version="1.0" encoding="UTF-8"?>
 <TEI xmlns="http://www.tei-c.org/ns/1.0">
 <teiHeader>
@@ -614,14 +550,14 @@ def convert_rtf_to_tei(rtf_path: Path, ve_id: str, ut_id: str, src_path: str) ->
 <bibl>
 <idno type="src_path">{src_path}</idno>
 <idno type="src_sha256">{sha256}</idno>
-<idno type="bdrc_ie">http://purl.bdrc.io/resource/{IE_ID}</idno>
+<idno type="bdrc_ie">http://purl.bdrc.io/resource/{ie_id}</idno>
 <idno type="bdrc_ve">http://purl.bdrc.io/resource/{ve_id}</idno>
 <idno type="bdrc_ut">http://purl.bdrc.io/resource/{ut_id}</idno>
 </bibl>
 </sourceDesc>
 </fileDesc>
 <encodingDesc>
-<p>The TEI header does not contain any bibliographical data. It is instead accessible through the <ref target="http://purl.bdrc.io/resource/{IE_ID}">record in the BDRC database</ref>.</p>
+<p>The TEI header does not contain any bibliographical data. It is instead accessible through the <ref target="http://purl.bdrc.io/resource/{ie_id}">record in the BDRC database</ref>.</p>
 </encodingDesc>
 </teiHeader>
 <text>
@@ -634,40 +570,31 @@ def convert_rtf_to_tei(rtf_path: Path, ve_id: str, ut_id: str, src_path: str) ->
     
     return tei_xml
 
-
-def calculate_sha256(file_path: Path) -> str:
-    """Calculate SHA256 hash of a file."""
-    sha256_hash = hashlib.sha256()
-    try:
-        with open(file_path, "rb") as f:
-            for byte_block in iter(lambda: f.read(4096), b""):
-                sha256_hash.update(byte_block)
-        return sha256_hash.hexdigest()
-    except FileNotFoundError:
-        return "FILE_NOT_FOUND"
-
-
 # =============================================================================
-# Volume Processing (Worker Function)
+# Volume Processing
 # =============================================================================
 
-def process_volume(args: tuple) -> dict:
+def process_volume(ie_id: str, ve_id: str, volume_id: str, volume_folder: Path, 
+                   output_dir: Path, collection_name: str) -> dict:
     """
-    Process a single volume (worker function for multiprocessing).
-    
+    Process a single volume.
+
     Args:
-        args: Tuple of (ve_id, volume_num, volume_folder, output_dir, collection_name, start_index)
+        ie_id: Image Entity ID
+        ve_id: Volume Entity ID
+        volume_id: Volume ID folder name (e.g., "volume_001") or None for direct files
+        volume_folder: Path to folder containing RTF files
+        output_dir: Output directory
+        collection_name: Collection name (or None for direct files)
         
     Returns:
-        dict with results: {ve_id, volume_num, success, failed, errors}
+        dict with results: {ve_id, volume_id, success, failed, errors}
     """
-    ve_id, volume_num, volume_folder, output_dir, collection_name, start_index = args
-    
-    volume_label = f"{ve_id}_vol{volume_num}" if volume_num else ve_id
+    volume_label = f"{ve_id}_{volume_id}" if volume_id else ve_id
     
     result = {
         "ve_id": ve_id,
-        "volume_num": volume_num,
+        "volume_id": volume_id,
         "volume_label": volume_label,
         "success": 0,
         "failed": 0,
@@ -680,313 +607,151 @@ def process_volume(args: tuple) -> dict:
         if not rtf_files:
             return result
         
+        logger.info(f"  Processing {volume_label}: {len(rtf_files)} RTF files")
+        
         # Create output directories
-        # Archive is always flat: archive/{VE_ID}/UT{suffix}_{index}.xml
+        # Archive is always flat: archive/{VE_ID}/UT{suffix}_{FILE_NUM}.xml
         archive_dir = output_dir / "archive" / ve_id
         
         # Sources preserves the nested structure
-        if volume_num and collection_name:
-            sources_output_dir = output_dir / "sources" / ve_id / collection_name / f"volume_{volume_num}"
+        if volume_id and collection_name:
+            sources_output_dir = output_dir / "sources" / ve_id / collection_name / volume_id
         else:
             sources_output_dir = output_dir / "sources" / ve_id
         
         archive_dir.mkdir(parents=True, exist_ok=True)
         sources_output_dir.mkdir(parents=True, exist_ok=True)
         
-        # Get DOC files for copying to sources
-        doc_files = list(volume_folder.glob("*.doc"))
-        
-        for idx, rtf_path in enumerate(rtf_files):
-            # Use global index across all volumes for this VE_ID
-            global_idx = start_index + idx
-            ut_id = get_ut_id(ve_id, global_idx)
-            
-            # Build source path relative to output
-            if volume_num and collection_name:
-                src_path = f"sources/{ve_id}/{collection_name}/volume_{volume_num}/{rtf_path.name}"
-            else:
-                src_path = f"sources/{ve_id}/{rtf_path.name}"
-            
+        # Process each RTF file
+        for file_index, rtf_file in enumerate(rtf_files):
             try:
-                # Convert to TEI XML
-                tei_xml = convert_rtf_to_tei(rtf_path, ve_id, ut_id, src_path)
+                # Generate UT ID
+                ut_id = get_ut_id(ve_id, file_index)
                 
-                # Generate XML filename from RTF filename
-                # volume_029_266.rtf -> UT1PD45495_029_266.xml
-                rtf_stem = rtf_path.stem  # e.g., "volume_029_266"
-                # Extract the volume and file number parts
-                if rtf_stem.startswith('volume_'):
-                    # volume_029_266 -> 029_266
-                    parts = rtf_stem.replace('volume_', '', 1)
-                    xml_filename = f"UT1PD45495_{parts}.xml"
+                # Build source path for metadata
+                if volume_id and collection_name:
+                    src_path = f"{ve_id}/{collection_name}/{volume_id}/{rtf_file.name}"
                 else:
-                    # Fallback to using the full stem
-                    xml_filename = f"UT1PD45495_{rtf_stem}.xml"
+                    src_path = f"{ve_id}/{rtf_file.name}"
                 
-                # Write XML to flat archive structure
-                xml_path = archive_dir / xml_filename
-                with open(xml_path, 'w', encoding='utf-8') as f:
-                    f.write(tei_xml)
+                # Convert to TEI
+                tei_xml = convert_rtf_to_tei(rtf_file, ie_id, ve_id, ut_id, src_path)
                 
-                # Copy RTF to sources
-                dest_rtf = sources_output_dir / rtf_path.name
-                shutil.copy2(rtf_path, dest_rtf)
+                # Write to archive (flat structure)
+                archive_file = archive_dir / f"{ut_id}.xml"
+                archive_file.write_text(tei_xml, encoding='utf-8')
+                
+                # Copy source RTF to sources output
+                dest_rtf = sources_output_dir / rtf_file.name
+                shutil.copy2(rtf_file, dest_rtf)
+                
+                # Also copy corresponding DOC file if it exists
+                doc_file = rtf_file.with_suffix('.doc')
+                if doc_file.exists():
+                    dest_doc = sources_output_dir / doc_file.name
+                    shutil.copy2(doc_file, dest_doc)
+                else:
+                    # Try uppercase extension
+                    doc_file = rtf_file.with_suffix('.DOC')
+                    if doc_file.exists():
+                        dest_doc = sources_output_dir / doc_file.name
+                        shutil.copy2(doc_file, dest_doc)
                 
                 result["success"] += 1
                 
             except Exception as e:
+                logger.error(f"  Failed to process {rtf_file.name}: {e}")
                 result["failed"] += 1
-                result["errors"].append(f"{rtf_path.name}: {str(e)}")
+                result["errors"].append(f"{rtf_file.name}: {str(e)}")
         
-        # Copy all DOC files to sources (after processing RTFs)
-        for doc_file in doc_files:
-            try:
-                dest_doc = sources_output_dir / doc_file.name
-                shutil.copy2(doc_file, dest_doc)
-            except Exception as e:
-                logger.warning(f"Failed to copy DOC file {doc_file.name}: {e}")
-    
+        logger.info(f"  {volume_label}: {result['success']} succeeded, {result['failed']} failed")
+        
     except Exception as e:
-        result["errors"].append(f"Volume error: {str(e)}")
+        logger.error(f"  Failed to process {volume_label}: {e}")
+        result["errors"].append(str(e))
     
     return result
 
 
-# =============================================================================
-# Debug Reporting
-# =============================================================================
-
-def _print_conversion_stats(output_dir: Path):
+def detect_ie_id(base_dir: Path) -> str:
     """
-    Print comprehensive debug information about the conversion.
-    
-    Outputs:
-    - Fonts that were handled (successfully converted)
-    - Fonts that were NOT handled (not in pytiblegenc tables)
-    - Unknown characters per font with sample context
-    - Writes a summary file to output directory
-    """
-    logger.info("")
-    logger.info("=" * 60)
-    logger.info("CONVERSION STATISTICS")
-    logger.info("=" * 60)
-    
-    # 1. Handled fonts
-    if STATS["handled_fonts"]:
-        logger.info("")
-        logger.info("HANDLED FONTS (successfully converted):")
-        for font, count in sorted(STATS["handled_fonts"].items()):
-            logger.info(f"  {font}: {count} characters")
-    else:
-        logger.info("")
-        logger.info("HANDLED FONTS: None recorded")
-    
-    # 2. Unhandled fonts (fonts not in conversion tables)
-    if STATS["unhandled_fonts"]:
-        logger.info("")
-        logger.info("UNHANDLED FONTS (not in pytiblegenc tables):")
-        for font, count in sorted(STATS["unhandled_fonts"].items()):
-            logger.info(f"  {font}: {count} characters NOT converted")
-    else:
-        logger.info("")
-        logger.info("UNHANDLED FONTS: None (all fonts were handled)")
-    
-    # 3. Unknown characters per font (chars that couldn't be mapped)
-    if STATS["unknown_characters"]:
-        logger.info("")
-        logger.info("UNKNOWN CHARACTERS BY FONT:")
-        logger.info("(Characters in handled fonts that have no mapping)")
-        for font, chars in sorted(STATS["unknown_characters"].items()):
-            # Show up to 20 sample characters with their codes
-            sample_chars = list(chars)[:20]
-            char_info = []
-            for c in sample_chars:
-                code = ord(c) if len(c) == 1 else 'multi'
-                char_info.append(f"'{c}'({code})")
-            sample_str = ", ".join(char_info)
-            if len(chars) > 20:
-                sample_str += f", ... (+{len(chars) - 20} more)"
-            logger.info(f"  {font}: {len(chars)} unknown chars")
-            logger.info(f"    Samples: {sample_str}")
-    else:
-        logger.info("")
-        logger.info("UNKNOWN CHARACTERS: None (all characters were mapped)")
-    
-    # 4. Skipped non-Dedris text with suspicious characters
-    if "skipped_non_dedris" in STATS and STATS["skipped_non_dedris"]:
-        logger.info("")
-        logger.info("SKIPPED NON-DEDRIS TEXT (potential wrong font context):")
-        logger.info("(ASCII chars in non-Dedris fonts that might be legacy encoding)")
-        for item in STATS["skipped_non_dedris"][:20]:  # Show first 20
-            logger.info(f"  Font: '{item['font']}'")
-            logger.info(f"    Text: '{item['text']}'")
-            logger.info(f"    ASCII chars: {', '.join(item['chars'][:10])}")
-        if len(STATS["skipped_non_dedris"]) > 20:
-            logger.info(f"  ... and {len(STATS['skipped_non_dedris']) - 20} more")
-    
-    # 5. Diffs with UTFC (for debugging pytiblegenc)
-    if STATS["diffs_with_utfc"]:
-        logger.info("")
-        logger.info(f"DIFFS WITH UTFC: {len(STATS['diffs_with_utfc'])} differences found")
-    
-    # 6. Error characters count
-    if STATS["error_characters"] > 0:
-        logger.info("")
-        logger.info(f"ERROR CHARACTERS: {STATS['error_characters']} conversion errors")
-    
-    logger.info("")
-    logger.info("=" * 60)
-    
-    # Write summary file to output directory
-    summary_path = output_dir / "conversion_stats.txt"
-    try:
-        with open(summary_path, 'w', encoding='utf-8') as f:
-            f.write("CONVERSION STATISTICS\n")
-            f.write("=" * 60 + "\n\n")
-            
-            f.write("HANDLED FONTS:\n")
-            if STATS["handled_fonts"]:
-                for font, count in sorted(STATS["handled_fonts"].items()):
-                    f.write(f"  {font}: {count} characters\n")
-            else:
-                f.write("  None recorded\n")
-            
-            f.write("\nUNHANDLED FONTS (not in pytiblegenc tables):\n")
-            if STATS["unhandled_fonts"]:
-                for font, count in sorted(STATS["unhandled_fonts"].items()):
-                    f.write(f"  {font}: {count} characters NOT converted\n")
-            else:
-                f.write("  None (all fonts were handled)\n")
-            
-            f.write("\nUNKNOWN CHARACTERS BY FONT:\n")
-            if STATS["unknown_characters"]:
-                for font, chars in sorted(STATS["unknown_characters"].items()):
-                    f.write(f"  {font}: {len(chars)} unknown characters\n")
-                    # Write all unknown chars for this font
-                    for c in sorted(chars, key=lambda x: ord(x) if len(x) == 1 else 0):
-                        code = ord(c) if len(c) == 1 else 'multi'
-                        f.write(f"    '{c}' (code {code})\n")
-            else:
-                f.write("  None (all characters were mapped)\n")
-            
-            f.write("\nSKIPPED NON-DEDRIS TEXT (potential wrong font context):\n")
-            if "skipped_non_dedris" in STATS and STATS["skipped_non_dedris"]:
-                for item in STATS["skipped_non_dedris"]:
-                    f.write(f"  Font: '{item['font']}'\n")
-                    f.write(f"    Text: '{item['text']}'\n")
-                    f.write(f"    ASCII chars: {', '.join(item['chars'][:10])}\n")
-            else:
-                f.write("  None\n")
-            
-            f.write(f"\nERROR CHARACTERS: {STATS['error_characters']}\n")
-            
-        logger.info(f"Stats written to: {summary_path}")
-    except Exception as e:
-        logger.warning(f"Could not write stats file: {e}")
-
-
-# =============================================================================
-# Main Processing Functions
-# =============================================================================
-
-def process_collection(source_base: Path, output_dir: Path, workers: int) -> tuple:
-    """
-    Process all volumes in the collection using multiprocessing.
+    Auto-detect IE_ID from base directory name.
     
     Args:
-        source_base: Base path for sources
-        output_dir: Output directory
-        workers: Number of parallel workers
+        base_dir: Base directory path
         
     Returns:
-        Tuple of (total_success, total_failed)
+        IE_ID string (e.g., "IE1GS58442")
     """
-    volumes = get_volume_folders(source_base)
+    # Try to extract IE_ID from the directory name
+    dir_name = base_dir.name
+    
+    # Check if directory name matches IE pattern (IE followed by alphanumeric)
+    ie_match = re.match(r'(IE[A-Z0-9]+)', dir_name, re.IGNORECASE)
+    if ie_match:
+        return ie_match.group(1).upper()
+    
+    # If not found in directory name, raise error
+    raise ValueError(
+        f"Could not detect IE_ID from directory name: {dir_name}\n"
+        f"Expected format: IE followed by alphanumeric characters (e.g., IE1GS58442)"
+    )
+
+
+def process_collection(ie_id: str, base_dir: Path, ve_id_filter: str = None) -> dict:
+    """
+    Process a single collection.
+    
+    Args:
+        ie_id: Image Entity ID
+        base_dir: Base directory containing sources folder
+        ve_id_filter: Optional VE_ID to process only a specific volume entity
+        
+    Returns:
+        dict with summary statistics
+    """
+    sources_dir = base_dir / "sources"
+    output_dir = base_dir / f"{ie_id}_output"
+    
+    logger.info(f"Processing {ie_id}")
+    if ve_id_filter:
+        logger.info(f"  Filtering for VE_ID: {ve_id_filter}")
+    logger.info(f"  Input: {sources_dir}")
+    logger.info(f"  Output: {output_dir}")
+    
+    # Discover volumes
+    volumes = get_volume_folders(ie_id, sources_dir)
+    
+    # Filter by VE_ID if specified
+    if ve_id_filter:
+        volumes = [v for v in volumes if v[0] == ve_id_filter]
+        if not volumes:
+            logger.warning(f"  No volumes found for VE_ID: {ve_id_filter}")
+            return {"success": 0, "failed": 0}
     
     if not volumes:
-        logger.warning(f"  No volumes found in {source_base}")
-        return 0, 0
+        logger.warning(f"  No volumes found in {sources_dir}")
+        return {"success": 0, "failed": 0}
     
-    logger.info(f"  Found {len(volumes)} volumes, processing with {workers} workers...")
+    logger.info(f"  Found {len(volumes)} volumes")
     
-    # Calculate starting index for each volume to maintain sequential numbering across volumes
-    # Group volumes by VE_ID to maintain proper indexing
-    ve_index_map = {}  # Maps (ve_id, volume_num) -> starting_index
-    current_indices = {}  # Tracks current index for each ve_id
-    
-    for ve_id, volume_num, volume_folder, collection_name in volumes:
-        if ve_id not in current_indices:
-            current_indices[ve_id] = 0
-        
-        rtf_count = len(list(volume_folder.glob("*.rtf")))
-        ve_index_map[(ve_id, volume_num)] = current_indices[ve_id]
-        current_indices[ve_id] += rtf_count
-    
-    # Prepare arguments for workers with starting indices
-    work_items = [
-        (ve_id, volume_num, volume_folder, output_dir, collection_name, ve_index_map[(ve_id, volume_num)])
-        for ve_id, volume_num, volume_folder, collection_name in volumes
-    ]
-    
+    # Process each volume
     total_success = 0
     total_failed = 0
     
-    # Use multiprocessing for volumes
-    with ProcessPoolExecutor(max_workers=workers) as executor:
-        futures = {executor.submit(process_volume, item): item for item in work_items}
-        
-        for future in as_completed(futures):
-            result = future.result()
-            total_success += result["success"]
-            total_failed += result["failed"]
-            
-            status = "[OK]" if result["failed"] == 0 else "[FAIL]"
-            logger.info(f"    {status} {result['volume_label']}: {result['success']} success, {result['failed']} failed")
-            
-            if result["errors"]:
-                for error in result["errors"][:3]:  # Show max 3 errors
-                    logger.error(f"      - {error}")
+    for ve_id, volume_id, volume_folder, collection_name in volumes:
+        result = process_volume(ie_id, ve_id, volume_id, volume_folder, output_dir, collection_name)
+        total_success += result["success"]
+        total_failed += result["failed"]
     
-    return total_success, total_failed
-
-
-def convert_all_files(output_dir: Path = None, source_base: Path = None, workers: int = None):
-    """
-    Convert all volume RTF files to TEI XML using multiprocessing.
-    
-    Args:
-        output_dir: Output directory (default: OUTPUT_DIR)
-        source_base: Base path for sources (default: SOURCE_RTF_BASE)
-        workers: Number of parallel workers (default: DEFAULT_WORKERS)
-    """
-    if output_dir is None:
-        output_dir = OUTPUT_DIR
-    if source_base is None:
-        source_base = SOURCE_RTF_BASE
-    if workers is None:
-        workers = DEFAULT_WORKERS
-    
-    logger.info("=" * 70)
-    logger.info(f"RTF TO TEI XML CONVERTER - {IE_ID}")
-    logger.info("=" * 70)
-    logger.info(f"Source base: {source_base}")
-    logger.info(f"Output: {output_dir}")
-    logger.info(f"Workers: {workers}")
-    logger.info("=" * 70)
-    
-    success, failed = process_collection(source_base, output_dir, workers)
-    
-    logger.info("")
-    logger.info("=" * 70)
-    logger.info("CONVERSION COMPLETE")
-    logger.info("=" * 70)
-    logger.info(f"  Success: {success}")
-    logger.info(f"  Failed: {failed}")
+    logger.info(f"")
+    logger.info(f"Summary for {ie_id}:")
+    logger.info(f"  Total files processed: {total_success + total_failed}")
+    logger.info(f"  Succeeded: {total_success}")
+    logger.info(f"  Failed: {total_failed}")
     logger.info(f"  Output: {output_dir}")
-    logger.info("=" * 70)
     
-    # Enhanced debug reporting
-    _print_conversion_stats(output_dir)
+    return {"success": total_success, "failed": total_failed}
 
 
 # =============================================================================
@@ -995,120 +760,75 @@ def convert_all_files(output_dir: Path = None, source_base: Path = None, workers
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Convert IE1PD45495 (Taranatha Gsung Qbum) RTF files to TEI XML"
+        description="Convert RTF files to TEI XML format"
     )
     
     parser.add_argument(
-        "--all", "-a",
-        action="store_true",
-        default=True,
-        help="Convert all volumes (default behavior)"
-    )
-    parser.add_argument(
-        "--single", "-s",
-        metavar="VE_ID",
-        help="Convert a single volume (e.g., VE1PD45495_001)"
-    )
-    parser.add_argument(
-        "--output", "-o",
-        metavar="DIR",
+        "base_dir",
         type=Path,
-        default=OUTPUT_DIR,
-        help=f"Output directory (default: {OUTPUT_DIR})"
+        nargs='?',
+        default=None,
+        help="Base directory containing sources folder (e.g., /path/to/IE1GS58442)"
     )
+    
     parser.add_argument(
-        "--workers", "-w",
-        type=int,
-        default=DEFAULT_WORKERS,
-        help=f"Number of parallel workers (default: {DEFAULT_WORKERS})"
+        "--ie-id",
+        type=str,
+        default=None,
+        help="Override IE_ID (auto-detected from directory name if not provided)"
+    )
+    
+    parser.add_argument(
+        "--ve-id",
+        type=str,
+        default=None,
+        help="Process only a specific VE_ID (e.g., VE1PD45495_001)"
     )
     
     args = parser.parse_args()
     
-    if args.single:
-        # Process single volume
-        ve_id = args.single
-        volumes = get_volume_folders(SOURCE_RTF_BASE)
-        
-        # Filter to just this VE ID
-        volumes = [(vid, vnum, vfolder, cname) for vid, vnum, vfolder, cname in volumes if vid == ve_id]
-        
-        if not volumes:
-            logger.error(f"No volumes found for {ve_id}")
-            return
-        
-        logger.info(f"Processing {len(volumes)} volume(s) for {ve_id}")
-        
-        # Calculate indices for this VE ID
-        ve_index_map = {}
-        current_index = 0
-        for vid, vnum, vfolder, cname in volumes:
-            rtf_count = len(list(vfolder.glob("*.rtf")))
-            ve_index_map[(vid, vnum)] = current_index
-            current_index += rtf_count
-        
-        # Process volumes
-        total_success = 0
-        total_failed = 0
-        for vid, vnum, vfolder, cname in volumes:
-            result = process_volume((vid, vnum, vfolder, args.output, cname, ve_index_map[(vid, vnum)]))
-            total_success += result["success"]
-            total_failed += result["failed"]
-            
-            status = "[OK]" if result["failed"] == 0 else "[FAIL]"
-            logger.info(f"  {status} {result['volume_label']}: {result['success']} success, {result['failed']} failed")
-            
-            if result["errors"]:
-                for error in result["errors"]:
-                    logger.error(f"    - {error}")
-        
-        logger.info(f"\nCompleted: {total_success} success, {total_failed} failed")
+    # Determine base directory
+    if args.base_dir is None:
+        # Use current working directory
+        base_dir = Path.cwd()
     else:
-        # Process all volumes
-        convert_all_files(args.output, SOURCE_RTF_BASE, args.workers)
+        base_dir = args.base_dir
+    
+    if not base_dir.exists():
+        logger.error(f"Base directory not found: {base_dir}")
+        return
+    
+    sources_dir = base_dir / "sources"
+    if not sources_dir.exists():
+        logger.error(f"Sources directory not found: {sources_dir}")
+        logger.error(f"Expected structure: {base_dir}/sources/{{VE_ID}}/{{collection_name}}/{{VOL_ID}}/*.rtf")
+        return
+    
+    # Auto-detect or use provided IE_ID
+    if args.ie_id:
+        ie_id = args.ie_id.upper()
+    else:
+        try:
+            ie_id = detect_ie_id(base_dir)
+            logger.info(f"Auto-detected IE_ID: {ie_id}")
+        except ValueError as e:
+            logger.error(str(e))
+            return
+    
+    logger.info("=" * 70)
+    logger.info(f"{ie_id} RTF TO TEI XML CONVERTER")
+    logger.info("=" * 70)
+    logger.info(f"Base directory: {base_dir}")
+    logger.info("")
+    
+    # Process the collection
+    process_collection(ie_id, base_dir, ve_id_filter=args.ve_id)
+    
+    logger.info("")
+    logger.info("=" * 70)
+    logger.info("CONVERSION COMPLETE")
+    logger.info("=" * 70)
 
 
 if __name__ == "__main__":
-    # Set DEBUG_MODE = True to test a single volume, False to run all volumes
-    DEBUG_MODE = False
-    DEBUG_VOLUME = "VE1PD45495_001"
-    
-    if DEBUG_MODE:
-        logger.info("=== DEBUG MODE ===")
-        logger.info(f"Testing with volume: {DEBUG_VOLUME}")
-        
-        volumes = get_volume_folders(SOURCE_RTF_BASE)
-        volumes = [(vid, vnum, vfolder, cname) for vid, vnum, vfolder, cname in volumes if vid == DEBUG_VOLUME]
-        
-        if not volumes:
-            logger.error(f"No volumes found for {DEBUG_VOLUME}")
-        else:
-            logger.info(f"Found {len(volumes)} volume(s)")
-            
-            # Calculate indices
-            ve_index_map = {}
-            current_index = 0
-            for vid, vnum, vfolder, cname in volumes:
-                rtf_count = len(list(vfolder.glob("*.rtf")))
-                ve_index_map[(vid, vnum)] = current_index
-                current_index += rtf_count
-            
-            # Process volumes
-            total_success = 0
-            total_failed = 0
-            for vid, vnum, vfolder, cname in volumes:
-                result = process_volume((vid, vnum, vfolder, OUTPUT_DIR, cname, ve_index_map[(vid, vnum)]))
-                total_success += result["success"]
-                total_failed += result["failed"]
-                
-                status = "[OK]" if result["failed"] == 0 else "[FAIL]"
-                logger.info(f"  {status} {result['volume_label']}: {result['success']} success, {result['failed']} failed")
-                
-                if result["errors"]:
-                    for error in result["errors"]:
-                        logger.error(f"    - {error}")
-            
-            logger.info(f"\nCompleted: {total_success} success, {total_failed} failed")
-    else:
-        # Run batch conversion for all volumes
-        main()
+    main()
