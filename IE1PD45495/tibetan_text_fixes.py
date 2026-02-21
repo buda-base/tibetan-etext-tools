@@ -206,14 +206,14 @@ def fix_ascii_to_tibetan(text: str) -> str:
     Mappings:
         . (period)      -> ད (Tibetan letter DA) - preserves ellipsis (2+ dots)
         - (hyphen)      -> ་ (Tibetan tseg/syllable separator)
-        0 (zero)        -> པ (Tibetan letter PA)
+        0 (zero)        -> པ (Tibetan letter PA) - BUT NOT in digit sequences (preserved as numbers)
         , (comma)       -> ཐ (Tibetan letter THA)
         } (right brace) -> སྔ (Tibetan SA + NGA)
         ( (left paren)  -> ༼ (Tibetan left bracket)
         ) (right paren) -> ༽ (Tibetan right bracket)
         \\ (backslash)  -> གླ (Tibetan GA + LA subscript)
     
-    Note: Ellipsis (sequences of 2+ periods) are preserved as-is.
+    Note: Ellipsis (sequences of 2+ periods) and numbers (digit sequences) are preserved.
     
     Args:
         text: Input text with ASCII characters
@@ -224,15 +224,18 @@ def fix_ascii_to_tibetan(text: str) -> str:
     if not text:
         return text
     
+    # Use simple placeholder
+    ELLIPSIS_PLACEHOLDER = '\uE000'
+    
     # First, protect ellipsis by temporarily replacing sequences of 2+ periods
-    # Use a placeholder that won't appear in normal text
-    ELLIPSIS_PLACEHOLDER = '\uE000'  # Private Use Area character
     text = re.sub(r'\.{2,}', lambda m: ELLIPSIS_PLACEHOLDER * len(m.group()), text)
     
-    # Apply character replacements
+    # Apply character replacements (but NOT on zeros that are part of numbers)
     text = text.replace('.', 'ད')  # period -> DA (only single periods now)
     text = text.replace('-', '་')  # hyphen -> tseg
-    text = text.replace('0', 'པ')  # zero -> PA
+    # Convert ONLY standalone zeros or zeros surrounded by non-digits
+    # This regex converts 0 to པ only when NOT part of a digit sequence
+    text = re.sub(r'(?<!\d)0(?!\d)', 'པ', text)
     text = text.replace(',', 'ཐ')  # comma -> THA
     text = text.replace('}', 'སྔ')  # right brace -> SA + NGA
     text = text.replace('(', '༼')  # left paren -> Tibetan left bracket

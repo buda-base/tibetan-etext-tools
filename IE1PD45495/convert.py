@@ -398,6 +398,22 @@ def convert_rtf_to_tei(rtf_path: Path, ie_id: str, ve_id: str, ut_id: str, src_p
         font_name = stream.get("font", {}).get("name", "")
         font_size = stream.get("font", {}).get("size", 12)
         
+        # Fix corrupted dot leaders (from any font)
+        # These appear in table of contents as corrupted patterns
+        # Pattern 1: ．£®．£® (fullwidth dot + pound + registered) - usually SimSun
+        # Pattern 2: ·¤·¤ (middle dot + currency sign) - can be any font
+        # Replace with proper dots
+        
+        # Pattern 1: Replace fullwidth dot patterns (SimSun specific)
+        if font_name and font_name.lower() in ('simsun', '@simsun'):
+            text = text.replace('．£®', '．')
+            text = text.replace('．｡®', '．')
+            text = text.replace('£®', '')
+            text = text.replace('｡®', '')
+        
+        # Pattern 2: Replace middle dot + currency sign (apply to all fonts)
+        # This fixes ·¤·¤·¤ → ·······
+        text = text.replace('·¤', '·') 
         # Convert Dedris to Unicode
         unicode_text = dedris_to_unicode(text, font_name)
         
@@ -495,6 +511,13 @@ def convert_rtf_to_tei(rtf_path: Path, ie_id: str, ve_id: str, ut_id: str, src_p
     # This fixes cases where ༔ and vowels are in separate RTF streams
     if ENABLE_NORMALIZATION:
         body_content = normalize_unicode(body_content)
+    
+    # Final cleanup: Remove any remaining corrupted dot leader patterns
+    # that might have been created during processing
+    # Pattern 1: ·¤ (middle dot U+00B7 + currency sign U+00A4)
+    body_content = body_content.replace('·¤', '·')
+    # Pattern 2: ．ད (fullwidth dot + Tibetan DA) - period was wrongly converted to ད in dot leaders
+    body_content = body_content.replace('．ད', '．')
     
     # Fix hi tag spacing and remove empty hi tags (only if font classification is enabled)
     if ENABLE_FONT_CLASSIFICATION:
