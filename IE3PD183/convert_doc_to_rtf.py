@@ -83,6 +83,16 @@ MAX_RETRIES = 5
 INITIAL_RETRY_DELAY = 1  # seconds
 RETRY_BACKOFF_MULTIPLIER = 2
 
+def is_lock_or_temp_file(path: Path) -> bool:
+    """Return True if path looks like a lock or temp file """
+    name = path.name
+    if name.startswith('~$'):
+        return True
+    if name.startswith('~'):
+        return False
+    if name.lower().endswith('.tmp'):
+        return True
+    return False
 
 def get_credentials():
     """Get valid user credentials from storage or prompt for authorization (Google Drive only)."""
@@ -530,7 +540,11 @@ def main():
     for doc_path in doc_files:
         # Create output path: same location, change extension to .rtf
         output_path = doc_path.with_suffix(args.output_suffix)
-        
+        if is_lock_or_temp_file(doc_path):
+            skipped_count+=1
+            continue
+
+        output_path = doc_path.with_suffix(args.output_suffix)
         # Skip if RTF already exists
         if output_path.exists():
             skipped_count += 1
