@@ -9,14 +9,13 @@ This script implements a 4-step pipeline:
 4. Convert to TEI - Generate TEI XML with proper structure
 
 Usage:
-    python convert_pdf.py <input_folder> <output_folder>
+    python pdf_to_xml.py <input_folder> <output_folder>
     
 Example:
-    python convert_pdf.py /path/to/IE3KG690_INPUT /path/to/IE3KG690_OUTPUT
+    python pdf_to_xml.py /path/to/IE3KG690_INPUT /path/to/IE3KG690_OUTPUT
 """
 
 import sys
-import os
 import re
 import hashlib
 import shutil
