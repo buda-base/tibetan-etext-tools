@@ -2,17 +2,6 @@
 """
 Convert RTF files to TEI XML format.
 
-Input structure:
-    {IE_ID}/sources/{VE_ID}/{collection_name}/{VOL_ID}/*.rtf
-    Example: IE1PD45495/sources/VE1PD45495_001/taranatha-gsung-qbum/volume_001/*.rtf
-    
-    Or single subfolder: {IE_ID}/sources/{VE_ID}/*.rtf
-    Example: IE1PD45495/sources/VE1PD45495_001/*.rtf
-
-Output structure:
-    Archive (flat): {IE_ID}_output/archive/{VE_ID}/UT{suffix}_{FILE_NUM}.xml
-    Sources (nested): {IE_ID}_output/sources/{VE_ID}/{collection_name}/{VOL_ID}/*.rtf and *.doc
-
 Usage:
     # Process all VE folders in current directory (auto-detects IE_ID):
     python convert.py
@@ -518,7 +507,7 @@ def convert_rtf_to_tei(rtf_path: Path, ie_id: str, ve_id: str, ut_id: str, src_p
     body_content = body_content.replace('·¤', '·')
     # Pattern 2: ．ད (fullwidth dot + Tibetan DA) - period was wrongly converted to ད in dot leaders
     body_content = body_content.replace('．ད', '．')
-    
+    body_content = body_content.replace('$$ ', ' ')
     # Fix hi tag spacing and remove empty hi tags (only if font classification is enabled)
     if ENABLE_FONT_CLASSIFICATION:
         body_content = fix_hi_tag_spacing(body_content)
