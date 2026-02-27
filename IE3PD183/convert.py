@@ -122,9 +122,22 @@ SUPPORTED_EXTENSIONS = {'.rtf', '.doc','.txt'}
 # Recursive file discovery (from IE1PD104832)
 # =============================================================================
 
+def is_lock_or_temp_file(path: Path) -> bool:
+    """Return True if the file is a lock or temp file that should be skipped."""
+    name = path.name
+    if name.startswith('~$'):
+        return True
+    if name.startswith('~'):
+        return True
+    if name.lower().endswith(('.tmp', '.lock')):
+        return True
+    return False
+
+
 def find_files_recursive(directory: Path, extensions: set = None) -> list:
     """
     Recursively find all files with given extensions in directory.
+    Skips lock and temp files (e.g. ~$*.doc, ~*.rtf, *.tmp, *.lock).
     
     Args:
         directory: Directory to search
@@ -141,7 +154,7 @@ def find_files_recursive(directory: Path, extensions: set = None) -> list:
         files.extend(directory.rglob(f"*{ext}"))
         files.extend(directory.rglob(f"*{ext.upper()}"))
     
-    return files
+    return [f for f in files if not is_lock_or_temp_file(f)]
 
 
 def _rtf_pict_keyword_end(s: str, i: int) -> int:
@@ -364,6 +377,7 @@ def get_volume_rtf_files(rtf_dir: Path = None) -> list:
         return []
     
     rtf_files = list(rtf_dir.glob("*.rtf"))
+    rtf_files = [f for f in rtf_files if not is_lock_or_temp_file(f)]
     logger.info(f"Found {len(rtf_files)} total RTF files")
     
     volume_files = [f for f in rtf_files if is_volume_file(f.name)]
@@ -407,6 +421,7 @@ def get_volume_files_from_toprocess(ve_ids: list, toprocess_path: Path = None,sr
             files_in_folder = list(folder.rglob("*.txt")) + list(folder.rglob("*.TXT"))
         else:
             files_in_folder = list(folder.rglob("*.rtf")) + list(folder.rglob("*.RTF"))
+        files_in_folder = [f for f in files_in_folder if not is_lock_or_temp_file(f)]
         files = natsorted(files_in_folder, key=lambda x: (x.parent.name, x.name))
         result.append((ve_id, files))
     total = sum(len(files) for _, files in result)
@@ -470,14 +485,14 @@ def find_all_related_source_files(volume_base: str, rtf_dir: Path = None, doc_di
     # Find RTF files (search recursively so sources in subdirs like sources/volume_001/ are found)
     if rtf_dir.exists():
         for rtf_file in rtf_dir.rglob(f"{volume_base}*.rtf"):
-            if "_output" in rtf_file.parts:
+            if "_output" in rtf_file.parts or is_lock_or_temp_file(rtf_file):
                 continue
             name_without_ext = rtf_file.stem
             if name_without_ext == volume_base or name_without_ext.startswith(f"{volume_base}-"):
                 related_files.append(rtf_file)
         if include_txt:
             for txt_file in list(rtf_dir.rglob(f"{volume_base}*.txt")) + list(rtf_dir.rglob(f"{volume_base}*.TXT")):
-                if "_output" in txt_file.parts:
+                if "_output" in txt_file.parts or is_lock_or_temp_file(txt_file):
                     continue
                 name_without_ext = txt_file.stem
                 if name_without_ext == volume_base or name_without_ext.startswith(f"{volume_base}-"):
@@ -486,7 +501,7 @@ def find_all_related_source_files(volume_base: str, rtf_dir: Path = None, doc_di
     # Find DOC files (search recursively)
     if doc_dir.exists():
         for doc_file in doc_dir.rglob(f"{volume_base}*.doc"):
-            if "_output" in doc_file.parts:
+            if "_output" in doc_file.parts or is_lock_or_temp_file(doc_file):
                 continue
             name_without_ext = doc_file.stem
             if name_without_ext == volume_base or name_without_ext.startswith(f"{volume_base}-"):
@@ -494,7 +509,7 @@ def find_all_related_source_files(volume_base: str, rtf_dir: Path = None, doc_di
     
     if dcp_dir.exists():
         for dcp_file in dcp_dir.rglob(f"{volume_base}*.dcp"):
-            if "_output" in dcp_file.parts:
+            if "_output" in dcp_file.parts or is_lock_or_temp_file(dcp_file):
                 continue
             name_without_ext = dcp_file.stem
             if name_without_ext == volume_base or name_without_ext.startswith(f"{volume_base}-"):

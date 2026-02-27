@@ -79,58 +79,78 @@ class RTFCleaner:
         return text, ''
     
     def clean_rtf_commands(self, text: str) -> Tuple[str, int]:
-        """Remove RTF command patterns from text (one subn per pattern, capped length)."""
-        prefix, suffix = self._cap_body(text)
+        """Remove RTF command patterns from text (one subn per pattern). Processes in chunks so the whole body is cleaned."""
         removal_count = 0
-        for pattern_re, _ in self._rtf_compiled:
-            prefix, n = pattern_re.subn('', prefix)
-            removal_count += n
-        return prefix + suffix, removal_count
-    
+        parts = []
+        rest = text
+        while rest:
+            chunk = rest[:MAX_BODY_LEN_FOR_REGEX]
+            rest = rest[MAX_BODY_LEN_FOR_REGEX:]
+            for pattern_re, _ in self._rtf_compiled:
+                chunk, n = pattern_re.subn('', chunk)
+                removal_count += n
+            parts.append(chunk)
+        return ''.join(parts), removal_count
+
     def clean_spurious_text(self, text: str) -> Tuple[str, int]:
-        """Remove spurious text patterns (one subn per pattern, capped length)."""
-        prefix, suffix = self._cap_body(text)
+        """Remove spurious text patterns (one subn per pattern). Processes in chunks so the whole body is cleaned (e.g. underscores in tail of large files)."""
         removal_count = 0
-        for pattern_re, _ in self._spurious_compiled:
-            prefix, n = pattern_re.subn('', prefix)
-            removal_count += n
-        for pattern_re, _ in self._additional_compiled:
-            prefix, n = pattern_re.subn('', prefix)
-            removal_count += n
-        return prefix + suffix, removal_count
-    
+        parts = []
+        rest = text
+        while rest:
+            chunk = rest[:MAX_BODY_LEN_FOR_REGEX]
+            rest = rest[MAX_BODY_LEN_FOR_REGEX:]
+            for pattern_re, _ in self._spurious_compiled:
+                chunk, n = pattern_re.subn('', chunk)
+                removal_count += n
+            for pattern_re, _ in self._additional_compiled:
+                chunk, n = pattern_re.subn('', chunk)
+                removal_count += n
+            parts.append(chunk)
+        return ''.join(parts), removal_count
+
     def clean_hi_wrappers(self, text: str) -> Tuple[str, int]:
         """Unwrap <hi rend="head"> around single vowel/shad/tsek (ི ུ ེ ོ ། ་); keep the character, remove the tag.
         Also unwraps short heads: single dash, བ, ༔, and 1-2 char fragments without shad.
-        Removes empty <hi rend="..."></hi> tags (open/close with no content)."""
-        prefix, suffix = self._cap_body(text)
-        removal_count = 0
-        # Remove empty <hi rend="small"></hi>, <hi rend="head"></hi>, etc.
-        prefix, n = EMPTY_HI_RE.subn('', prefix)
-        removal_count += n
-        for pattern_re, repl in HI_WRAPPER_PATTERNS:
-            prefix, n = pattern_re.subn(repl, prefix)
-            removal_count += n
-        for pattern_re, repl in HI_SHORT_HEAD_PATTERNS:
-            prefix, n = pattern_re.subn(repl, prefix)
-            removal_count += n
-        # 1-2 char head: unwrap only if content has no shad
+        Removes empty <hi rend="..."></hi> tags (open/close with no content). Processes in chunks so the whole body is cleaned."""
         def replace_short_head(m):
             content = m.group(1)
             return content if SHAD not in content else m.group(0)
-        for m in HI_SHORT_HEAD_1_2_RE.finditer(prefix):
-            if SHAD not in m.group(1):
-                removal_count += 1
-        prefix = HI_SHORT_HEAD_1_2_RE.sub(replace_short_head, prefix)
-        return prefix + suffix, removal_count
-    
+        removal_count = 0
+        parts = []
+        rest = text
+        while rest:
+            chunk = rest[:MAX_BODY_LEN_FOR_REGEX]
+            rest = rest[MAX_BODY_LEN_FOR_REGEX:]
+            chunk, n = EMPTY_HI_RE.subn('', chunk)
+            removal_count += n
+            for pattern_re, repl in HI_WRAPPER_PATTERNS:
+                chunk, n = pattern_re.subn(repl, chunk)
+                removal_count += n
+            for pattern_re, repl in HI_SHORT_HEAD_PATTERNS:
+                chunk, n = pattern_re.subn(repl, chunk)
+                removal_count += n
+            for m in HI_SHORT_HEAD_1_2_RE.finditer(chunk):
+                if SHAD not in m.group(1):
+                    removal_count += 1
+            chunk = HI_SHORT_HEAD_1_2_RE.sub(replace_short_head, chunk)
+            parts.append(chunk)
+        return ''.join(parts), removal_count
+
     def clean_dedris_corruption(self, text: str) -> Tuple[str, int]:
-        """Apply table-based Dedris corruption substitutions (e.g. ,ོ→དོ, ་.་→་ན་)."""
+        """Apply table-based Dedris corruption substitutions (e.g. ,ོ→དོ, ་.་→་ན་). Processes in chunks so the whole body is cleaned."""
         if fix_dedris_corruption_with_count is None:
             return text, 0
-        prefix, suffix = self._cap_body(text)
-        prefix, count = fix_dedris_corruption_with_count(prefix)
-        return prefix + suffix, count
+        total_count = 0
+        parts = []
+        rest = text
+        while rest:
+            chunk = rest[:MAX_BODY_LEN_FOR_REGEX]
+            rest = rest[MAX_BODY_LEN_FOR_REGEX:]
+            chunk, count = fix_dedris_corruption_with_count(chunk)
+            total_count += count
+            parts.append(chunk)
+        return ''.join(parts), total_count
     
     def clean_non_tibetan_lines(self, text: str) -> Tuple[str, int]:
         """Remove lines that contain no Tibetan characters (capped line count for huge files)."""
