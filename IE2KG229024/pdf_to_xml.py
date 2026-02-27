@@ -9,7 +9,7 @@ This script implements a 4-step pipeline:
 4. Convert to TEI - Generate TEI XML with proper structure
 
 Usage:
-    python convert_pdf.py <input_folder> <output_folder>
+    python pdf_to_xml.py <input_folder> <output_folder>
     
 Example:
     python pdf_to_xml.py /path/to/IE2KG229024_INPUT /path/to/IE2KG229024_OUTPUT
@@ -508,6 +508,9 @@ def convert_markup_to_tei(text: str) -> str:
     text = text.replace(ARTIFACT_LINE, "")
     text = text.replace(ARTIFACT_STRIP_FROM_XML, "")
     text = text.replace(ARTIFACT_STRIP_FROM_XML.replace("<", "&lt;"), "")
+
+    # Remove orphaned <lb/> left when the artifact was on its own line (collapse empty-line breaks)
+    text = re.sub(r'<lb/>\s*\n\s*<lb/>', r'<lb/>', text)
 
     return text
 
