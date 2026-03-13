@@ -2,7 +2,7 @@
 """
 DOCX to TEI XML Converter for IE1AB2
 
-This script converts DOCX files from the sources folder to TEI XML format.
+This script converts DOCX files from the toprocess folder to TEI XML format.
 Files are already in Unicode, so no Dedris conversion is needed.
 
 Usage:
@@ -77,11 +77,11 @@ def save_checkpoint(file_path: str):
 
 
 def get_all_docx_files() -> dict:
-    """Get all DOCX files organized by VE ID from sources folder."""
+    """Get all DOCX files organized by VE ID from toprocess folder."""
     docx_by_ve = {}
     
     if not TOPROCESS_DIR.exists():
-        logger.error(f"sources directory not found: {TOPROCESS_DIR}")
+        logger.error(f"toprocess directory not found: {TOPROCESS_DIR}")
         return {}
     
     for ve_folder in TOPROCESS_DIR.iterdir():
@@ -105,8 +105,16 @@ def convert_docx_to_tei(docx_path: Path, ve_id: str, sequence: int, folder_name:
     parser = BasicDOCX()
     parser.parse_file(str(docx_path))
     streams = parser.get_streams()
+    footnotes = parser.get_footnotes()
     
     logger.info(f"  Parsed {len(streams)} text streams")
+    if footnotes:
+        logger.info(f"  Found {len(footnotes)} footnotes")
+    
+    # Normalize footnote text
+    normalized_footnotes = {}
+    for footnote_id, footnote_text in footnotes.items():
+        normalized_footnotes[footnote_id] = normalize_unicode(footnote_text)
     
     # Skip Dedris conversion - text is already Unicode
     converted_streams = []
@@ -118,6 +126,21 @@ def convert_docx_to_tei(docx_path: Path, ve_id: str, sequence: int, folder_name:
         text = stream.get("text", "")
         font_size = stream.get("font", {}).get("size", 12)
         
+        # Check if this is a footnote marker
+        is_footnote_marker = stream.get("is_footnote_marker", False)
+        footnote_id = stream.get("footnote_id")
+        
+        # Skip normalization for footnote markers (they contain control characters)
+        if is_footnote_marker:
+            converted_stream = {
+                "text": text,  # Keep marker as-is
+                "font_size": font_size,
+                "is_footnote_marker": True,
+                "footnote_id": footnote_id
+            }
+            converted_streams.append(converted_stream)
+            continue
+        
         # Direct normalization (no dedris_to_unicode call)
         normalized_text = normalize_unicode(text)
         
@@ -125,14 +148,16 @@ def convert_docx_to_tei(docx_path: Path, ve_id: str, sequence: int, folder_name:
         if not normalized_text:
             continue
         
-        converted_streams.append({
+        converted_stream = {
             "text": normalized_text,
             "font_size": font_size
-        })
+        }
+        
+        converted_streams.append(converted_stream)
     
     logger.info(f"  Stage 1: Processed {len(converted_streams)} streams (already Unicode)")
     
-    body_content = build_tei_body(converted_streams, ENABLE_FONT_CLASSIFICATION)
+    body_content = build_tei_body(converted_streams, ENABLE_FONT_CLASSIFICATION, normalized_footnotes)
     
     if ENABLE_NORMALIZATION:
         logger.info(f"  Stage 2: Applying normalization...")
@@ -147,7 +172,7 @@ def convert_docx_to_tei(docx_path: Path, ve_id: str, sequence: int, folder_name:
     # Use full folder name (IE_ID-VE_ID) for sources path
     if folder_name is None:
         folder_name = f"{IE_ID}-{ve_id}"
-    src_path = f"sources/{folder_name}/{docx_path.name}"
+    src_path = f"{folder_name}/{docx_path.name}"
     
     tei_xml = generate_tei_xml(
         body_content=body_content,
@@ -306,7 +331,7 @@ def convert_all_files():
 
 def main():
     parser = argparse.ArgumentParser(description="Convert DOCX files to TEI XML")
-    parser.add_argument("--single", "-s", metavar="PATH", help="Convert a single file (path relative to sources/, e.g., IE2KG5037-VE3KG1/file.docx)")
+    parser.add_argument("--single", "-s", metavar="PATH", help="Convert a single file (path relative to toprocess/, e.g., IE2KG5037-VE3KG1/file.docx)")
     parser.add_argument("--no-font-tags", action="store_true", help="Disable font classification")
     parser.add_argument("--no-normalization", action="store_true", help="Disable Unicode normalization")
     args = parser.parse_args()

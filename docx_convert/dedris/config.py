@@ -1,5 +1,5 @@
-"""
-Shared Configuration for IE1AB1 Conversion Pipeline
+f"""
+Shared Configuration for FOLDER_NAME Conversion Pipeline
 
 This module contains all path configurations and constants used across
 the conversion scripts.
@@ -10,17 +10,17 @@ from pathlib import Path
 # =============================================================================
 # Project Configuration
 # =============================================================================
-
-IE_ID = "IE1ER172"
+# Edit this line to change the IE_ID
+IE_ID = "IE7477"
 
 # Base directory for the project
 BASE_DIR = Path(r"/Users/tenzinmonlam/Documents/dharmaduta/file_convert_4")
 
-# Input: DOCX files in sources folder
-TOPROCESS_DIR = BASE_DIR / "IE1ER172" / "sources"
+# Input: DOCX files in toprocess folder
+TOPROCESS_DIR = BASE_DIR / "IE7477" / "toprocess"
 
 # Output: Final XML files and source copies
-OUTPUT_DIR = BASE_DIR / "IE1ER172_output"
+OUTPUT_DIR = BASE_DIR / "IE7477_output"
 
 # =============================================================================
 # Output Subdirectories

@@ -2,7 +2,7 @@
 """
 DOCX to TEI XML Converter for IE1AB2
 
-This script converts DOCX files from the sources folder to TEI XML format.
+This script converts DOCX files from the source folder to TEI XML format.
 Files are already in Unicode, so no Dedris conversion is needed.
 
 Usage:
@@ -147,11 +147,17 @@ def convert_docx_to_tei(docx_path: Path, ve_id: str, sequence: int, folder_name:
     # Use full folder name (IE_ID-VE_ID) for sources path
     if folder_name is None:
         folder_name = f"{IE_ID}-{ve_id}"
-    src_path = f"sources/{folder_name}/{docx_path.name}"
+    src_path = f"{folder_name}/{docx_path.name}"
+
+    title = docx_path.stem
+    if ENABLE_NORMALIZATION:
+        title = normalize_unicode(title)
+        src_path = normalize_unicode(src_path)
+    title = title.strip()
     
     tei_xml = generate_tei_xml(
         body_content=body_content,
-        title=docx_path.stem,
+        title=title,
         src_path=src_path,
         sha256=sha256,
         ve_id=ve_id,

@@ -2,7 +2,7 @@
 """
 DOCX to TEI XML Converter for IE1AB2
 
-This script converts DOCX files from the sources folder to TEI XML format.
+This script converts DOCX files from the toprocess folder to TEI XML format.
 Files are already in Unicode, so no Dedris conversion is needed.
 
 Usage:
@@ -76,25 +76,105 @@ def save_checkpoint(file_path: str):
         f.write(f"{file_path}\n")
 
 
+def get_ve_folders() -> list:
+    """Get VE folders from toprocess root (IE_ID-VE...)."""
+    ve_folders = []
+    for folder in TOPROCESS_DIR.iterdir():
+        if not folder.is_dir():
+            continue
+        ve_id = extract_ve_id_from_folder(folder.name)
+        if ve_id:
+            ve_folders.append({"ve_id": ve_id, "folder_name": folder.name})
+    return natsorted(ve_folders, key=lambda item: item["folder_name"])
+
+
+def get_numbered_folders(include_empty: bool = False) -> list:
+    """
+    Get numbered folders under toprocess/1v-30v.
+
+    By default, only folders containing at least one non-temp DOCX are returned.
+    This keeps VE mapping aligned when placeholders like "8" are empty but "8+"
+    contains actual files.
+    """
+    volume_root = TOPROCESS_DIR / "1v-30v"
+    if not volume_root.exists():
+        return []
+
+    numbered_folders = natsorted(
+        [p for p in volume_root.iterdir() if p.is_dir()],
+        key=lambda p: p.name,
+    )
+    if include_empty:
+        return numbered_folders
+
+    folders_with_docx = []
+    for number_folder in numbered_folders:
+        has_docx = any(
+            p.suffix.lower() == ".docx" and not p.name.startswith("~$")
+            for p in number_folder.iterdir()
+            if p.is_file()
+        )
+        if has_docx:
+            folders_with_docx.append(number_folder)
+    return folders_with_docx
+
+
+def get_docx_files(number_folder: Path) -> list:
+    """Return non-temp DOCX files from a numbered folder."""
+    return natsorted(
+        [p for p in number_folder.glob("*.docx") if not p.name.startswith("~$")],
+        key=lambda p: p.name,
+    )
+
+
 def get_all_docx_files() -> dict:
-    """Get all DOCX files organized by VE ID from sources folder."""
+    """Get DOCX files from 1v-30v/{number} and map them to VE IDs."""
     docx_by_ve = {}
     
     if not TOPROCESS_DIR.exists():
-        logger.error(f"sources directory not found: {TOPROCESS_DIR}")
+        logger.error(f"toprocess directory not found: {TOPROCESS_DIR}")
         return {}
-    
-    for ve_folder in TOPROCESS_DIR.iterdir():
-        if ve_folder.is_dir():
-            ve_id = extract_ve_id_from_folder(ve_folder.name)
-            if ve_id:
-                docx_files = list(ve_folder.glob("*.docx"))
-                if docx_files:
-                    # Store both VE_ID and full folder name (IE_ID-VE_ID)
-                    docx_by_ve[ve_id] = {
-                        'files': natsorted(docx_files, key=lambda p: p.name),
-                        'folder_name': ve_folder.name
-                    }
+
+    volume_root = TOPROCESS_DIR / "1v-30v"
+    if not volume_root.exists():
+        logger.error(f"Numbered volume folder not found: {volume_root}")
+        return {}
+
+    # Keep expected canonical order: 1, 2, ..., 7, 8, 8+, 9, ... 30.
+    # VE index advances only for folders that contain DOCX files.
+    numbered_folders = get_numbered_folders(include_empty=True)
+    ve_folders = get_ve_folders()
+
+    if not ve_folders:
+        logger.error(f"No VE folders found under: {TOPROCESS_DIR}")
+        return {}
+
+    non_empty_count = len(get_numbered_folders(include_empty=False))
+    if non_empty_count != len(ve_folders):
+        logger.warning(
+            f"Folder count mismatch: {non_empty_count} non-empty numbered folders vs "
+            f"{len(ve_folders)} VE folders. Mapping by sorted order."
+        )
+
+    ve_idx = 0
+    for number_folder in numbered_folders:
+        docx_files = get_docx_files(number_folder)
+        if not docx_files:
+            continue
+        if ve_idx >= len(ve_folders):
+            logger.warning(
+                f"Not enough VE folders for numbered folder '{number_folder.name}'. "
+                f"Skipping remaining numbered folders."
+            )
+            break
+
+        ve_info = ve_folders[ve_idx]
+        docx_by_ve[ve_info["ve_id"]] = {
+            "files": docx_files,
+            "folder_name": ve_info["folder_name"],
+            "number_folder": number_folder.name,
+        }
+        ve_idx += 1
     
     return docx_by_ve
 
@@ -147,11 +227,16 @@ def convert_docx_to_tei(docx_path: Path, ve_id: str, sequence: int, folder_name:
     # Use full folder name (IE_ID-VE_ID) for sources path
     if folder_name is None:
         folder_name = f"{IE_ID}-{ve_id}"
-    src_path = f"sources/{folder_name}/{docx_path.name}"
+    src_path = f"{folder_name}/{docx_path.name}"
     
+    title = docx_path.stem
+    if ENABLE_NORMALIZATION:
+        title = normalize_unicode(title)
+    title = title.strip()
+
     tei_xml = generate_tei_xml(
         body_content=body_content,
-        title=docx_path.stem,
+        title=title,
         src_path=src_path,
         sha256=sha256,
         ve_id=ve_id,
@@ -181,26 +266,47 @@ def copy_sources_to_output(folder_name: str, docx_files: list):
 
 def convert_single_file(relative_path: str):
     """Convert a single DOCX file to TEI XML."""
-    # Parse relative path: IE2KG5037-VE3KG1/file.docx
+    # Parse relative path: 1v-30v/1/file.docx
     parts = Path(relative_path).parts
-    if len(parts) < 2:
-        logger.error(f"Invalid path format. Expected: IE2KG5037-VE3KG1/file.docx")
+    if len(parts) < 3:
+        logger.error(f"Invalid path format. Expected: 1v-30v/1/file.docx")
         return
-    
-    folder_name = parts[0]
+
+    volume_group = parts[0]
+    number_folder = parts[1]
     filename = parts[-1]
-    
-    ve_id = extract_ve_id_from_folder(folder_name)
-    if not ve_id:
-        logger.error(f"Could not extract VE ID from folder name: {folder_name}")
-        return
-    
-    docx_path = TOPROCESS_DIR / folder_name / filename
-    
+
+    docx_path = TOPROCESS_DIR / volume_group / number_folder / filename
     if not docx_path.exists():
         logger.error(f"DOCX file not found: {docx_path}")
         return
-    
+
+    ve_folders = get_ve_folders()
+    numbered_folders = get_numbered_folders(include_empty=True)
+
+    if number_folder not in [p.name for p in numbered_folders]:
+        logger.error(f"Unknown numbered folder: {number_folder}")
+        return
+
+    index_map = {folder.name: idx for idx, folder in enumerate(numbered_folders)}
+    folder_pos = index_map[number_folder]
+
+    non_empty_before_target = 0
+    for folder in numbered_folders[: folder_pos + 1]:
+        if get_docx_files(folder):
+            non_empty_before_target += 1
+    folder_idx = non_empty_before_target - 1
+
+    if folder_idx < 0 or folder_idx >= len(ve_folders):
+        logger.error(
+            f"No VE folder mapped for numbered folder '{number_folder}' "
+            f"(index {folder_idx})"
+        )
+        return
+
+    ve_id = ve_folders[folder_idx]["ve_id"]
+    folder_name = ve_folders[folder_idx]["folder_name"]
+
     sequence = 1
     ut_id = get_ut_id(ve_id, sequence)
     
@@ -259,6 +365,8 @@ def convert_all_files():
         folder_name = ve_info['folder_name']
         
         logger.info(f"\nProcessing {ve_id} ({len(docx_files)} files)")
+        if "number_folder" in ve_info:
+            logger.info(f"  Source folder: 1v-30v/{ve_info['number_folder']}")
         
         archive_ve_dir = ARCHIVE_DIR / ve_id
         archive_ve_dir.mkdir(parents=True, exist_ok=True)
@@ -306,16 +414,16 @@ def convert_all_files():
 
 def main():
     parser = argparse.ArgumentParser(description="Convert DOCX files to TEI XML")
-    parser.add_argument("--single", "-s", metavar="PATH", help="Convert a single file (path relative to sources/, e.g., IE2KG5037-VE3KG1/file.docx)")
+    parser.add_argument("--single", "-s", metavar="PATH", help="Convert a single file (path relative to toprocess/, e.g., 1v-30v/1/file.docx)")
     parser.add_argument("--no-font-tags", action="store_true", help="Disable font classification")
     parser.add_argument("--no-normalization", action="store_true", help="Disable Unicode normalization")
     args = parser.parse_args()
     
     global ENABLE_FONT_CLASSIFICATION, ENABLE_NORMALIZATION
     if args.no_font_tags:
-        ENABLE_FONT_CLASSIFICATION = False
+        ENABLE_FONT_CLASSIFICATION = True
     if args.no_normalization:
-        ENABLE_NORMALIZATION = False
+        ENABLE_NORMALIZATION = True
     
     if args.single:
         convert_single_file(args.single)

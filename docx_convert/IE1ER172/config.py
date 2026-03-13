@@ -1,6 +1,6 @@
 """
 Shared Configuration for IE1AB1 Conversion Pipeline
-
+toprocess/sources
 This module contains all path configurations and constants used across
 the conversion scripts.
 """
@@ -11,10 +11,10 @@ from pathlib import Path
 # Project Configuration
 # =============================================================================
 
-IE_ID = "IE1ER172"
+IE_ID = "IE1PD192038"
 
 # Base directory for the project
-BASE_DIR = Path(r"/Users/tenzinmonlam/Documents/dharmaduta/file_convert_4")
+BASE_DIR = Path(r"/Users/tenzinmonlam/Documents/dharmaduta/file_convert_4/doc/docx")
 
 # Input: DOCX files in sources folder
 TOPROCESS_DIR = BASE_DIR / "IE1ER172" / "sources"

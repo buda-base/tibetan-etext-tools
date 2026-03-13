@@ -2,8 +2,8 @@
 """
 DOCX to TEI XML Converter for IE1AB2
 
-This script converts DOCX files from the sources folder to TEI XML format.
-Files are already in Unicode, so no Dedris conversion is needed.
+This script converts DOCX files from the toprocess folder to TEI XML format.
+Files may use Dedris legacy fonts and are converted to Unicode before TEI generation.
 
 Usage:
     python convert.py           # Convert all DOCX files
@@ -33,6 +33,14 @@ from tei_generator import (
     generate_tei_xml, calculate_sha256, escape_xml
 )
 
+try:
+    from pytiblegenc import convert_string
+except ImportError as e:
+    raise ImportError(
+        "pytiblegenc is required for Dedris conversion. Install with:\n"
+        "  pip install -U git+https://github.com/buda-base/py-tiblegenc.git"
+    ) from e
+
 
 def setup_logging():
     """Configure logging with file and console output."""
@@ -56,6 +64,44 @@ logger = setup_logging()
 ENABLE_FONT_CLASSIFICATION = True
 ENABLE_NORMALIZATION = True
 
+# Global stats for pytiblegenc conversion
+STATS = {
+    "handled_fonts": {},
+    "unhandled_fonts": {},
+    "unknown_characters": {},
+    "diffs_with_utfc": {},
+    "error_characters": 0,
+}
+
+
+def dedris_to_unicode(text: str, font_name: str) -> str:
+    """
+    Convert Dedris-encoded text to Unicode using pytiblegenc.
+
+    Conversion is applied only to known Dedris fonts and known suspicious
+    fallback fonts where Dedris text can be mis-attributed by source DOCX.
+    """
+    if not text:
+        return text
+
+    suspicious_fonts = {"simsun", "@simsun", "simsun western"}
+    normalized_font = (font_name or "").strip().lower()
+    is_dedris = normalized_font.startswith(("dedris", "ededris"))
+    is_suspicious = normalized_font in suspicious_fonts
+
+    if not (is_dedris or is_suspicious):
+        return text
+
+    try:
+        converted = convert_string(text, font_name, STATS)
+        if converted is None or converted == "":
+            return text
+        return converted
+    except Exception as e:
+        logger.warning(f"Failed Dedris conversion for font '{font_name}': {e}")
+        STATS["error_characters"] += len(text)
+        return text
+
 
 def load_checkpoints() -> set:
     """Load previously converted files from checkpoint."""
@@ -77,11 +123,11 @@ def save_checkpoint(file_path: str):
 
 
 def get_all_docx_files() -> dict:
-    """Get all DOCX files organized by VE ID from sources folder."""
+    """Get all DOCX files organized by VE ID from toprocess folder."""
     docx_by_ve = {}
     
     if not TOPROCESS_DIR.exists():
-        logger.error(f"sources directory not found: {TOPROCESS_DIR}")
+        logger.error(f"toprocess directory not found: {TOPROCESS_DIR}")
         return {}
     
     for ve_folder in TOPROCESS_DIR.iterdir():
@@ -105,34 +151,58 @@ def convert_docx_to_tei(docx_path: Path, ve_id: str, sequence: int, folder_name:
     parser = BasicDOCX()
     parser.parse_file(str(docx_path))
     streams = parser.get_streams()
+    footnotes = parser.get_footnotes()
     
     logger.info(f"  Parsed {len(streams)} text streams")
+    if footnotes:
+        logger.info(f"  Found {len(footnotes)} footnotes")
     
-    # Skip Dedris conversion - text is already Unicode
+    # Normalize footnote text
+    normalized_footnotes = {}
+    for footnote_id, footnote_text in footnotes.items():
+        normalized_footnotes[footnote_id] = normalize_unicode(footnote_text)
+
+    # Convert Dedris streams to Unicode using per-run font information
     converted_streams = []
     
     for stream in streams:
         # Include headers and footers (they may contain actual content like TOC)
-        stream_type = stream.get("type")
-        
         text = stream.get("text", "")
+        font_name = stream.get("font", {}).get("name", "")
         font_size = stream.get("font", {}).get("size", 12)
         
-        # Direct normalization (no dedris_to_unicode call)
-        normalized_text = normalize_unicode(text)
+        # Check if this is a footnote marker
+        is_footnote_marker = stream.get("is_footnote_marker", False)
+        footnote_id = stream.get("footnote_id")
+        
+        # Skip normalization for footnote markers (they contain control characters)
+        if is_footnote_marker:
+            converted_stream = {
+                "text": text,  # Keep marker as-is
+                "font_size": font_size,
+                "is_footnote_marker": True,
+                "footnote_id": footnote_id
+            }
+            converted_streams.append(converted_stream)
+            continue
+        
+        unicode_text = dedris_to_unicode(text, font_name)
+        normalized_text = normalize_unicode(unicode_text)
         
         # Skip only if completely empty, but preserve newlines
         if not normalized_text:
             continue
         
-        converted_streams.append({
+        converted_stream = {
             "text": normalized_text,
             "font_size": font_size
-        })
+        }
+        
+        converted_streams.append(converted_stream)
     
-    logger.info(f"  Stage 1: Processed {len(converted_streams)} streams (already Unicode)")
+    logger.info(f"  Stage 1: Converted and normalized {len(converted_streams)} streams")
     
-    body_content = build_tei_body(converted_streams, ENABLE_FONT_CLASSIFICATION)
+    body_content = build_tei_body(converted_streams, ENABLE_FONT_CLASSIFICATION, normalized_footnotes)
     
     if ENABLE_NORMALIZATION:
         logger.info(f"  Stage 2: Applying normalization...")
@@ -147,7 +217,7 @@ def convert_docx_to_tei(docx_path: Path, ve_id: str, sequence: int, folder_name:
     # Use full folder name (IE_ID-VE_ID) for sources path
     if folder_name is None:
         folder_name = f"{IE_ID}-{ve_id}"
-    src_path = f"sources/{folder_name}/{docx_path.name}"
+    src_path = f"{folder_name}/{docx_path.name}"
     
     tei_xml = generate_tei_xml(
         body_content=body_content,
@@ -162,12 +232,13 @@ def convert_docx_to_tei(docx_path: Path, ve_id: str, sequence: int, folder_name:
 
 
 def copy_sources_to_output(folder_name: str, docx_files: list):
-    """Copy source DOCX files to output directory."""
+    """Copy source DOCX and DOC files to output directory."""
     sources_ve_dir = SOURCES_OUTPUT_DIR / folder_name
     sources_ve_dir.mkdir(parents=True, exist_ok=True)
     
     copied_count = 0
     
+    # Copy DOCX files
     for docx_path in docx_files:
         docx_dest = sources_ve_dir / docx_path.name
         try:
@@ -175,6 +246,19 @@ def copy_sources_to_output(folder_name: str, docx_files: list):
             copied_count += 1
         except Exception as e:
             logger.warning(f"Failed to copy DOCX {docx_path.name}: {e}")
+    
+    # Also copy corresponding DOC files if they exist
+    for docx_path in docx_files:
+        # Look for .doc file with same base name
+        doc_path = docx_path.with_suffix('.doc')
+        if doc_path.exists():
+            doc_dest = sources_ve_dir / doc_path.name
+            try:
+                shutil.copy2(doc_path, doc_dest)
+                copied_count += 1
+                logger.info(f"  Also copied original .doc file: {doc_path.name}")
+            except Exception as e:
+                logger.warning(f"Failed to copy DOC {doc_path.name}: {e}")
     
     logger.info(f"  Copied {copied_count} source files to sources/{folder_name}/")
 
@@ -306,7 +390,7 @@ def convert_all_files():
 
 def main():
     parser = argparse.ArgumentParser(description="Convert DOCX files to TEI XML")
-    parser.add_argument("--single", "-s", metavar="PATH", help="Convert a single file (path relative to sources/, e.g., IE2KG5037-VE3KG1/file.docx)")
+    parser.add_argument("--single", "-s", metavar="PATH", help="Convert a single file (path relative to toprocess/, e.g., IE2KG5037-VE3KG1/file.docx)")
     parser.add_argument("--no-font-tags", action="store_true", help="Disable font classification")
     parser.add_argument("--no-normalization", action="store_true", help="Disable Unicode normalization")
     args = parser.parse_args()

@@ -1,11 +1,12 @@
 """
 BasicDOCX Parser Module
 
-Parser for DOCX files that extracts text runs with font information.
+Parser for DOCX files that extracts text runs with font information and footnotes.
 DOCX files are ZIP archives containing XML. The main content is in:
 - word/document.xml - Main document content with text runs
 - word/styles.xml - Style definitions
 - word/fontTable.xml - Font table
+- word/footnotes.xml - Footnote definitions
 
 Output format matches BasicRTF for compatibility:
 {
@@ -16,8 +17,11 @@ Output format matches BasicRTF for compatibility:
         "size": 12
     }
 }
+
+Footnote references are detected and marked for inline insertion.
 """
 
+import re
 import zipfile
 import xml.etree.ElementTree as ET
 import logging
@@ -32,6 +36,9 @@ NSMAP = {
     'wp': 'http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing',
 }
 
+# Footnote marker to track where footnotes should be inserted
+FOOTNOTE_MARKER = "\x00FOOTNOTE_{}\x00"
+
 
 def _get_tag(ns_prefix: str, local_name: str) -> str:
     """Build a fully qualified XML tag name."""
@@ -40,12 +47,13 @@ def _get_tag(ns_prefix: str, local_name: str) -> str:
 
 class BasicDOCX:
     """
-    Parser for DOCX files that extracts text runs with font information.
+    Parser for DOCX files that extracts text runs with font information and footnotes.
     
     DOCX files are ZIP archives containing XML. The main content is in:
     - word/document.xml - Main document content with text runs
     - word/styles.xml - Style definitions
     - word/fontTable.xml - Font table
+    - word/footnotes.xml - Footnote definitions
     
     Output format matches BasicRTF for compatibility:
     {
@@ -56,6 +64,8 @@ class BasicDOCX:
             "size": 12
         }
     }
+    
+    Footnote references are detected and marked with special metadata for inline insertion.
     """
     
     def __init__(self):
@@ -66,6 +76,8 @@ class BasicDOCX:
         self._default_font = "Times New Roman"
         self._default_size = 12
         self._show_progress = False
+        self._footnotes = {}  # Map footnote ID to footnote text
+        self._zipfile = None  # Store zipfile reference for footnote parsing
     
     def parse_file(self, file_path: str, show_progress: bool = True):
         """
@@ -79,6 +91,7 @@ class BasicDOCX:
         self._fonts = []
         self._font_map = {}
         self._styles = {}
+        self._footnotes = {}
         self._show_progress = show_progress
         
         if show_progress:
@@ -86,6 +99,8 @@ class BasicDOCX:
         
         try:
             with zipfile.ZipFile(file_path, 'r') as zf:
+                self._zipfile = zf
+                
                 # Parse font table
                 if 'word/fontTable.xml' in zf.namelist():
                     self._parse_font_table(zf.read('word/fontTable.xml'))
@@ -93,6 +108,12 @@ class BasicDOCX:
                 # Parse styles
                 if 'word/styles.xml' in zf.namelist():
                     self._parse_styles(zf.read('word/styles.xml'))
+                
+                # Parse footnotes
+                if 'word/footnotes.xml' in zf.namelist():
+                    self._parse_footnotes(zf.read('word/footnotes.xml'))
+                    if show_progress and self._footnotes:
+                        logger.info(f"  Found {len(self._footnotes)} footnotes")
                 
                 # Parse headers and footers first (before main document)
                 for name in zf.namelist():
@@ -106,6 +127,8 @@ class BasicDOCX:
                     self._parse_document(zf.read('word/document.xml'))
                 else:
                     logger.error(f"No word/document.xml found in {file_path}")
+                
+                self._zipfile = None
         except zipfile.BadZipFile:
             logger.error(f"Invalid DOCX file (not a valid ZIP): {file_path}")
         except Exception as e:
@@ -115,6 +138,67 @@ class BasicDOCX:
         
         if show_progress:
             logger.info(f"  Parsed {len(self._streams)} text streams")
+    
+    def _parse_footnotes(self, xml_data: bytes):
+        """
+        Parse word/footnotes.xml to extract footnote text.
+        
+        Args:
+            xml_data: XML content of footnotes.xml
+        """
+        try:
+            root = ET.fromstring(xml_data)
+            
+            # Find all footnote elements
+            for footnote_elem in root.iter(_get_tag('w', 'footnote')):
+                footnote_id = footnote_elem.get(_get_tag('w', 'id'))
+                if not footnote_id:
+                    footnote_id = footnote_elem.get('id')
+                
+                if not footnote_id:
+                    continue
+                
+                # Skip special footnotes (separator, continuation separator)
+                footnote_type = footnote_elem.get(_get_tag('w', 'type'))
+                if footnote_type in ('separator', 'continuationSeparator'):
+                    continue
+                
+                # Extract text from all paragraphs and runs in this footnote
+                footnote_text_parts = []
+                
+                for para in footnote_elem.iter(_get_tag('w', 'p')):
+                    para_parts = []
+                    
+                    for run in para.iter(_get_tag('w', 'r')):
+                        # Extract text content
+                        for text_elem in run.iter(_get_tag('w', 't')):
+                            if text_elem.text:
+                                para_parts.append(text_elem.text)
+                        
+                        # Handle special elements
+                        for tab in run.iter(_get_tag('w', 'tab')):
+                            para_parts.append('\t')
+                        
+                        for br in run.iter(_get_tag('w', 'br')):
+                            para_parts.append(' ')
+                    
+                    if para_parts:
+                        footnote_text_parts.append(''.join(para_parts))
+                
+                # Join paragraphs with space
+                footnote_text = ' '.join(footnote_text_parts)
+                
+                # Clean the text: strip whitespace and remove leading footnote numbers
+                footnote_text = footnote_text.strip()
+                
+                # Remove leading footnote number if present (e.g., "1 This is the note" -> "This is the note")
+                footnote_text = re.sub(r'^\d+\s*', '', footnote_text)
+                
+                if footnote_text:
+                    self._footnotes[footnote_id] = footnote_text
+                    
+        except ET.ParseError as e:
+            logger.warning(f"Error parsing footnotes.xml: {e}")
     
     def _parse_font_table(self, xml_data: bytes):
         """Parse word/fontTable.xml to extract font definitions."""
@@ -261,6 +345,29 @@ class BasicDOCX:
                 # Process runs in paragraph
                 para_has_content = False
                 for run in para.iter(_get_tag('w', 'r')):
+                    # Check for footnote reference first
+                    footnote_ref = run.find(_get_tag('w', 'footnoteReference'))
+                    if footnote_ref is not None:
+                        footnote_id = footnote_ref.get(_get_tag('w', 'id'))
+                        if not footnote_id:
+                            footnote_id = footnote_ref.get('id')
+                        
+                        if footnote_id and footnote_id in self._footnotes:
+                            # Insert footnote marker
+                            marker = FOOTNOTE_MARKER.format(footnote_id)
+                            self._streams.append({
+                                "text": marker,
+                                "font": {
+                                    "id": 0,
+                                    "name": self._default_font,
+                                    "size": self._default_size
+                                },
+                                "is_footnote_marker": True,
+                                "footnote_id": footnote_id
+                            })
+                            para_has_content = True
+                        continue
+                    
                     # Get run properties
                     run_font = para_font or self._default_font
                     run_size = para_size or self._default_size
@@ -460,3 +567,7 @@ class BasicDOCX:
     def get_fonts(self):
         """Return list of fonts found in the document."""
         return self._fonts
+    
+    def get_footnotes(self):
+        """Return dictionary of footnote ID to footnote text."""
+        return self._footnotes

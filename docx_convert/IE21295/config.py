@@ -1,7 +1,7 @@
 """
-Shared Configuration for IE1AB1 Conversion Pipeline
-
-This module contains all path configurations and constants used across
+Shared Configuration for IE21295 Conversion Pipeline.
+toprocess/1-30v/
+This module contains path configuration and constants used across
 the conversion scripts.
 """
 
@@ -11,16 +11,19 @@ from pathlib import Path
 # Project Configuration
 # =============================================================================
 
-IE_ID = "IE1ER172"
+IE_ID = "IE1PD192038"
 
 # Base directory for the project
-BASE_DIR = Path(r"/Users/tenzinmonlam/Documents/dharmaduta/file_convert_4")
+BASE_DIR = Path(r"/Users/tenzinmonlam/Documents/dharmaduta/file_convert_4/doc/docx")
 
-# Input: DOCX files in sources folder
-TOPROCESS_DIR = BASE_DIR / "IE1ER172" / "sources"
+# Input root:
+#   {BASE_DIR}/IE21295/toprocess/
+#     - 1v-30v/{number}/*.docx (actual input files)
+#     - IE21295-VE...          (often empty, used to identify VE IDs)
+TOPROCESS_DIR = BASE_DIR / IE_ID / "toprocess"
 
 # Output: Final XML files and source copies
-OUTPUT_DIR = BASE_DIR / "IE1ER172_output"
+OUTPUT_DIR = BASE_DIR / f"{IE_ID}_output"
 
 # =============================================================================
 # Output Subdirectories
@@ -66,26 +69,20 @@ def ensure_directories():
 
 def extract_ve_id_from_folder(folder_name: str) -> str:
     """
-    Extract VE ID from folder name like 'IE1AB2-VE3KG59' -> 'VE3KG59'.
-    
-    Args:
-        folder_name: Folder name containing IE_ID and VE_ID
-        
-    Returns:
-        VE ID string or None if pattern doesn't match
+    Extract VE ID from folder name like 'IE21295-VE5CN107' -> 'VE5CN107'.
     """
-    if folder_name.startswith(f'{IE_ID}-'):
-        return folder_name.replace(f'{IE_ID}-', '')
+    if folder_name.startswith(f"{IE_ID}-"):
+        return folder_name.replace(f"{IE_ID}-", "")
     return None
 
 
 def get_ut_id(ve_id: str, sequence: int = 1) -> str:
     """
     Generate UT ID from VE ID and sequence number.
-    
+
     Examples:
-        VE3KG59, 1 -> UT3KG59_0001
-        VE3KG59, 2 -> UT3KG59_0002
+        VE5CN107, 1 -> UT5CN107_0001
+        VE5CN107, 2 -> UT5CN107_0002
     """
     ve_suffix = ve_id[2:]  # Remove 'VE' prefix
     return f"UT{ve_suffix}_{sequence:04d}"
