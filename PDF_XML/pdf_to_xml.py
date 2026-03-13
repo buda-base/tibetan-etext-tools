@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Convert PDF files from IE2KG229024 to TEI XML format.
+Convert PDF (BOOK FORMAT) files from IE2KG229024 to TEI XML format.
 
 This script implements a 4-step pipeline:
 1. PDF to Text - Extract text from PDFs using py-tiblegenc with font size tracking
