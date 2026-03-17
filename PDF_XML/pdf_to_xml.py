@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Convert PDF (BOOK FORMAT) files from IE2KG229024 to TEI XML format.
-
+note : conversion files are stored in toprocess
 This script implements a 4-step pipeline:
 1. PDF to Text - Extract text from PDFs using py-tiblegenc with font size tracking
 2. Normalize - Simplify font size markup and apply Unicode normalization
@@ -38,13 +38,6 @@ from normalization import normalize_unicode
 IE_ID = "IE2KG229024"
 PAGE_BREAK_STR = "ZZZZ"
 FONT_SIZE_FORMAT = "<fs:{}>"
-
-# Known print/glyph artifact line to strip from extracted text
-ARTIFACT_LINE = "K$- .0 J - :. A - ( R ?- . A /- . - : 2 =- o - =? , 5 S %- 2 + &lt;- 3 A - ( R $- 0- .$ R %?- :)$?- 8 ,"
-
-# Exact artifact string to strip from final XML output (raw and XML-escaped forms)
-ARTIFACT_STRIP_FROM_XML = "K$-.0J-:.A-(R?-.A/-.-:2=-o-=?,�5S%-2+<-3A-(R$-0-.$R%?-:)$?-8,"
-
 
 
 # =============================================================================
@@ -503,11 +496,6 @@ def convert_markup_to_tei(text: str) -> str:
 
     # Remove consecutive <pb/> tags (keep only one)
     text = re.sub(r'(<pb/>[\s\n]*)+', r'<pb/>\n', text)
-
-    # Remove known artifact string from final output (raw and XML-escaped forms)
-    text = text.replace(ARTIFACT_LINE, "")
-    text = text.replace(ARTIFACT_STRIP_FROM_XML, "")
-    text = text.replace(ARTIFACT_STRIP_FROM_XML.replace("<", "&lt;"), "")
 
     # Remove orphaned <lb/> left when the artifact was on its own line (collapse empty-line breaks)
     text = re.sub(r'<lb/>\s*\n\s*<lb/>', r'<lb/>', text)
