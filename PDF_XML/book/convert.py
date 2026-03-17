@@ -85,8 +85,6 @@ BLANK_PAGE_STR  = "WWWW"   # sentinel for pages with no text and no visible obje
 UNREADABLE_LINE_STR = "XXXX_UNREADABLE_LINE_XXXX"  # line with likely unextractable text
 FONT_SIZE_FORMAT = "<fs:{}>"
 
-IE_ID = "IE2KG229024"
-
 # Confidence levels for glyph→Unicode mapping
 CONF_HIGH   = "high"    # ToUnicode CMap
 CONF_MEDIUM = "medium"  # embedded font cmap via fontTools
@@ -949,7 +947,9 @@ def _generate_tei_header(pdf_path: Path,
                          title: str  = "XXX") -> str:
     sha      = _sha256(pdf_path)
     src_path = f"{ve_id}/{pdf_path.name}" if ve_id else pdf_path.name
-    ie_value = ie_id or IE_ID
+    ie_value = ie_id.strip()
+    if not ie_value:
+        raise ValueError("IE ID is required and could not be inferred from input path.")
 
     return f"""<teiHeader>
 <fileDesc>
@@ -1180,11 +1180,18 @@ def main():
         print(f"ERROR: {exc}")
         sys.exit(1)
 
+    missing_ie = [str(pdf) for pdf, entry_ie_id, _ in pdf_entries if not entry_ie_id]
+    if missing_ie:
+        print("ERROR: IE ID is required for all inputs.")
+        print("Provide --ie-id or use BDRC paths like IE.../sources/VE.../*.pdf.")
+        print(f"First file missing IE ID: {missing_ie[0]}")
+        sys.exit(1)
+
     print(f"{'='*60}")
     print(f"PDF → TEI XML Converter  (BDRC output structure)")
     print(f"Input:  {input_path}")
     print(f"Output: {output_path}")
-    print(f"IE ID:  {ie_id or '(auto from path, fallback constant)'}")
+    print(f"IE ID:  {ie_id or '(auto from path)'}")
     print(f"VE ID:  {ve_id or '(none – using PDF stem)'}")
     print(f"Files:  {len(pdf_entries)}")
     if crop:
