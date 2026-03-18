@@ -82,7 +82,6 @@ except ImportError:
 PAGE_BREAK_STR = "ZZZZ"
 FONT_SIZE_FORMAT = "<fs:{}>"
 
-IE_ID = "IE2KG229024"
 
 # Confidence levels for glyph→Unicode mapping
 CONF_HIGH   = "high"    # ToUnicode CMap
@@ -802,7 +801,7 @@ def _generate_tei_header(pdf_path: Path,
                          title: str  = "XXX") -> str:
     sha      = _sha256(pdf_path)
     src_path = f"{ve_id}/{pdf_path.name}" if ve_id else pdf_path.name
-    ie_value = ie_id or IE_ID
+    ie_value = ie_id
 
     return f"""<teiHeader>
 <fileDesc>
@@ -1028,11 +1027,21 @@ def main():
         print(f"ERROR: {exc}")
         sys.exit(1)
 
+    missing_ie_paths = [str(pdf) for pdf, entry_ie_id, _ in pdf_entries if not entry_ie_id]
+    if missing_ie_paths:
+        print("ERROR: Missing IE ID for one or more PDFs.")
+        print("Provide --ie-id or use paths like IE.../sources/VE.../*.pdf.")
+        for pdf_path in missing_ie_paths[:5]:
+            print(f"  - {pdf_path}")
+        if len(missing_ie_paths) > 5:
+            print(f"  ... and {len(missing_ie_paths) - 5} more")
+        sys.exit(1)
+
     print(f"{'='*60}")
     print(f"PDF → TEI XML Converter  (BDRC output structure)")
     print(f"Input:  {input_path}")
     print(f"Output: {output_path}")
-    print(f"IE ID:  {ie_id or '(auto from path, fallback constant)'}")
+    print(f"IE ID:  {ie_id or '(auto from path)'}")
     print(f"VE ID:  {ve_id or '(none – using PDF stem)'}")
     print(f"Files:  {len(pdf_entries)}")
     if crop:
