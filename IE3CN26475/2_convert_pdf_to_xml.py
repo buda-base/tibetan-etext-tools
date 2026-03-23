@@ -1,0 +1,808 @@
+#!/usr/bin/env python3
+"""
+PDF to TEI XML Converter for IE3CN4059 (with Dedris font conversion)
+
+This script converts PDF files (produced from DOC via Word) to TEI XML format.
+It uses pytiblegenc's pdf_to_txt for text extraction with automatic Dedris font
+conversion, then applies normalization and TEI generation.
+
+Pipeline: DOC -> PDF (step 1) -> TEI XML (this step)
+
+IE3CN4059 has a nested folder structure:
+  toprocess/{IE_ID}-{VE_ID}/{subfolder}/*.doc
+
+This script:
+- Reads PDF files from pdf/{VE_ID}/
+- Finds source DOC files by recursively searching toprocess
+- Copies BOTH DOC and PDF files to sources/
+
+Usage:
+    python 2_convert_pdf_to_xml.py                              # Convert all PDF files
+    python 2_convert_pdf_to_xml.py --single VE5CN1124/file.pdf  # Convert single file
+    python 2_convert_pdf_to_xml.py --no-font-tags               # Disable font classification
+    python 2_convert_pdf_to_xml.py --no-normalization           # Disable Unicode normalization
+"""
+
+import sys
+import re
+import shutil
+import argparse
+import logging
+from pathlib import Path
+from collections import Counter
+from natsort import natsorted
+
+script_dir = Path(__file__).parent
+sys.path.insert(0, str(script_dir))
+
+from config import (
+    IE_ID, TOPROCESS_DIR, PDF_DIR, OUTPUT_DIR, ARCHIVE_DIR, SOURCES_OUTPUT_DIR,
+    PDF_TO_XML_LOG, PDF_TO_XML_CHECKPOINT, ensure_directories, get_ut_id,
+    extract_ve_id_from_folder
+)
+from normalization import normalize_unicode
+from tibetan_text_fixes import fix_hi_tag_spacing, fix_toc_leader_dots
+from dedris_converter import (
+    dedris_to_unicode, reset_stats, print_conversion_stats, write_stats_file
+)
+from tei_generator import (
+    post_process_body, generate_tei_xml, calculate_sha256, escape_xml
+)
+
+try:
+    from pytiblegenc import pdf_to_txt
+    PYTIBLEGENC_AVAILABLE = True
+except ImportError:
+    PYTIBLEGENC_AVAILABLE = False
+    print("Error: pytiblegenc not installed. Run: pip install git+https://github.com/buda-base/py-tiblegenc.git")
+    sys.exit(1)
+
+
+def setup_logging():
+    """Configure logging with file and console output."""
+    ensure_directories()
+
+    if hasattr(sys.stdout, 'reconfigure'):
+        sys.stdout.reconfigure(line_buffering=True)
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler(PDF_TO_XML_LOG, encoding='utf-8'),
+            logging.StreamHandler(sys.stdout)
+        ]
+    )
+    return logging.getLogger(__name__)
+
+logger = setup_logging()
+
+ENABLE_FONT_CLASSIFICATION = True
+ENABLE_NORMALIZATION = True
+
+PAGE_BREAK_STR = "ZZZZ"
+FONT_SIZE_FORMAT = "<fs:{}>"
+
+
+# =============================================================================
+# PDF Text Extraction
+# =============================================================================
+
+def extract_pdf_to_text(pdf_path: Path) -> str:
+    """
+    Extract text from a PDF file using pytiblegenc.
+
+    pytiblegenc automatically identifies embedded fonts (including Dedris)
+    via glyph hash matching and converts legacy-encoded text to Unicode.
+
+    Args:
+        pdf_path: Path to the PDF file
+
+    Returns:
+        Extracted text with font size markers and page breaks
+    """
+    logger.info(f"    Extracting: {pdf_path.name}")
+
+    try:
+        text = pdf_to_txt(
+            str(pdf_path),
+            page_break_str=f"\n{PAGE_BREAK_STR}\n",
+            track_font_size=True,
+            font_size_format=FONT_SIZE_FORMAT,
+            normalize=False,
+            simplify_font_sizes_option=False,
+        )
+        return text
+
+    except Exception as e:
+        logger.error(f"    ERROR extracting {pdf_path.name}: {e}")
+        import traceback
+        traceback.print_exc()
+        return ""
+
+
+# =============================================================================
+# Font Size Simplification
+# =============================================================================
+
+def simplify_font_sizes(text: str) -> str:
+    """
+    Simplify font size markup by removing layout-related changes.
+
+    Removes font size changes without tsheg or shad before next change,
+    and merges parentheses with adjacent font sizes.
+    """
+    pattern = r'<fs:(\d+)>'
+    parts = re.split(pattern, text)
+
+    segments = []
+    current_fs = None
+
+    for i, part in enumerate(parts):
+        if i % 2 == 0:
+            if part:
+                segments.append((current_fs, part))
+        else:
+            current_fs = part
+
+    if not segments:
+        return text
+
+    processed_segments = []
+
+    for i, (fs, content) in enumerate(segments):
+        if not content:
+            continue
+
+        if content == '༼' and i + 1 < len(segments):
+            next_fs, next_content = segments[i + 1]
+            processed_segments.append((next_fs, '༼' + next_content))
+            segments[i + 1] = (None, '')
+        elif content.startswith('༽') and processed_segments:
+            prev_fs, prev_content = processed_segments[-1]
+            processed_segments[-1] = (prev_fs, prev_content + content)
+        elif content == '༽' and processed_segments:
+            prev_fs, prev_content = processed_segments[-1]
+            processed_segments[-1] = (prev_fs, prev_content + '༽')
+        else:
+            processed_segments.append((fs, content))
+
+    segments = [(fs, c) for fs, c in processed_segments if c]
+
+    merged_segments = []
+
+    for i, (fs, content) in enumerate(segments):
+        has_separator = '་' in content or '།' in content or content.endswith('༽')
+
+        if not has_separator and merged_segments:
+            prev_fs, prev_content = merged_segments[-1]
+            merged_segments[-1] = (prev_fs, prev_content + content)
+        elif not has_separator and not merged_segments and not content.strip():
+            merged_segments.append((None, content))
+        else:
+            merged_segments.append((fs, content))
+
+    final_segments = []
+    for fs, content in merged_segments:
+        if final_segments and final_segments[-1][0] == fs:
+            prev_fs, prev_content = final_segments[-1]
+            final_segments[-1] = (fs, prev_content + content)
+        else:
+            final_segments.append((fs, content))
+
+    result = []
+    for fs, content in final_segments:
+        if fs is not None:
+            result.append(f'<fs:{fs}>{content}')
+        else:
+            result.append(content)
+
+    return ''.join(result)
+
+
+# =============================================================================
+# Font Size Classification
+# =============================================================================
+
+def classify_font_sizes(text: str) -> dict:
+    """
+    Classify font sizes in text into large, regular, and small categories.
+
+    Uses character count and font size to determine classification.
+    Body text is typically the most common size; smaller sizes are yigchung.
+    """
+    pattern = r'<fs:(\d+)>([^<]*)'
+    matches = re.findall(pattern, text)
+
+    if not matches:
+        return {}
+
+    size_counts = Counter()
+    for fs, content in matches:
+        char_count = len([c for c in content if 0x0F00 <= ord(c) <= 0x0FFF])
+        if char_count > 0:
+            size_counts[int(fs)] += char_count
+
+    if not size_counts:
+        return {}
+
+    sizes = sorted(size_counts.keys())
+    total_chars = sum(size_counts.values())
+    size_percentages = {fs: (count / total_chars * 100) for fs, count in size_counts.items()}
+
+    logger.info(f"    Font sizes: {dict(size_counts)}")
+    logger.info(f"    Font percentages: {size_percentages}")
+
+    classifications = {}
+
+    if len(sizes) == 1:
+        classifications[sizes[0]] = 'regular'
+
+    elif len(sizes) == 2:
+        fs1, fs2 = sizes
+        pct1, pct2 = size_percentages[fs1], size_percentages[fs2]
+
+        if pct1 > pct2 and pct2 > 10:
+            classifications[fs2] = 'regular'
+            classifications[fs1] = 'small'
+            logger.info(f"    Inverted classification: {fs1}pt (yigchung) vs {fs2}pt (body)")
+        elif pct1 > pct2:
+            classifications[fs1] = 'regular'
+            classifications[fs2] = 'large'
+        else:
+            classifications[fs2] = 'regular'
+            classifications[fs1] = 'small'
+
+    else:
+        body_text_range = [fs for fs in sizes if 20 <= fs <= 26 and size_percentages[fs] > 5]
+
+        if body_text_range:
+            most_common_fs = max(body_text_range)
+        else:
+            significant_sizes = [fs for fs in sizes if size_percentages[fs] > 10]
+            if significant_sizes:
+                most_common_fs = max(significant_sizes)
+            else:
+                most_common_fs = max(size_counts.items(), key=lambda x: x[1])[0]
+
+        classifications[most_common_fs] = 'regular'
+
+        for fs in sizes:
+            if fs == most_common_fs:
+                continue
+            if fs > most_common_fs:
+                classifications[fs] = 'large'
+            else:
+                classifications[fs] = 'small'
+
+    logger.info(f"    Classifications: {classifications}")
+    return classifications
+
+
+def apply_font_markup(text: str, classifications: dict) -> str:
+    """
+    Apply <large> and <small> markup based on font size classifications.
+    Replaces <fs:xx> tags with semantic markup.
+    """
+    def replace_fs(match):
+        fs = int(match.group(1))
+        classification = classifications.get(fs, 'regular')
+        if classification == 'large':
+            return '<LARGE_START>'
+        elif classification == 'small':
+            return '<SMALL_START>'
+        else:
+            return '<REGULAR_START>'
+
+    text = re.sub(r'<fs:(\d+)>', replace_fs, text)
+
+    result = []
+    current_state = 'regular'
+
+    parts = re.split(r'(<(?:LARGE|SMALL|REGULAR)_START>)', text)
+
+    for part in parts:
+        if part == '<LARGE_START>':
+            if current_state == 'small':
+                result.append('</small>')
+            if current_state != 'large':
+                result.append('<large>')
+                current_state = 'large'
+
+        elif part == '<SMALL_START>':
+            if current_state == 'large':
+                result.append('</large>')
+            if current_state != 'small':
+                result.append('<small>')
+                current_state = 'small'
+
+        elif part == '<REGULAR_START>':
+            if current_state == 'large':
+                result.append('</large>')
+            elif current_state == 'small':
+                result.append('</small>')
+            current_state = 'regular'
+
+        else:
+            result.append(part)
+
+    if current_state == 'large':
+        result.append('</large>')
+    elif current_state == 'small':
+        result.append('</small>')
+
+    text = ''.join(result)
+
+    text = re.sub(r'(<(?:large|small)>)(\s)', r'\2\1', text)
+    text = re.sub(r'(\s)(</(?:large|small)>)', r'\2\1', text)
+    text = re.sub(r'<large></large>', '', text)
+    text = re.sub(r'<small></small>', '', text)
+
+    return text
+
+
+# =============================================================================
+# TEI XML Body Generation
+# =============================================================================
+
+def convert_markup_to_tei(text: str) -> str:
+    """
+    Convert markup to TEI format.
+
+    - <large> -> <hi rend="head">
+    - <small> -> <hi rend="small">
+    - Line breaks -> <lb/>
+    - ZZZZ -> <pb/>
+    """
+    def escape_content(text_part):
+        """Escape XML special characters but preserve temporary markup."""
+        text_part = text_part.replace('<large>', '\x00LARGE\x00')
+        text_part = text_part.replace('</large>', '\x00/LARGE\x00')
+        text_part = text_part.replace('<small>', '\x00SMALL\x00')
+        text_part = text_part.replace('</small>', '\x00/SMALL\x00')
+
+        text_part = text_part.replace('&', '&amp;')
+        text_part = text_part.replace('<', '&lt;')
+        text_part = text_part.replace('>', '&gt;')
+
+        text_part = text_part.replace('\x00LARGE\x00', '<large>')
+        text_part = text_part.replace('\x00/LARGE\x00', '</large>')
+        text_part = text_part.replace('\x00SMALL\x00', '<small>')
+        text_part = text_part.replace('\x00/SMALL\x00', '</small>')
+
+        return text_part
+
+    text = escape_content(text)
+
+    if text.startswith(f'\n{PAGE_BREAK_STR}\n'):
+        text = text[len(PAGE_BREAK_STR) + 2:]
+    elif text.startswith(f'{PAGE_BREAK_STR}\n'):
+        text = text[len(PAGE_BREAK_STR) + 1:]
+
+    text = re.sub(PAGE_BREAK_STR, '<<<PB>>>', text)
+
+    text = '<pb/>\n' + text
+
+    lines = text.split('\n')
+    result = []
+
+    for i, line in enumerate(lines):
+        line = line.rstrip()
+        if i > 0:
+            result.append('\n<lb/>')
+        result.append(line)
+
+    text = ''.join(result)
+
+    text = re.sub(r'<<<PB>>>', '<pb/>', text)
+
+    text = re.sub(r'\n<lb/>\s*(?=<pb)', r'\n', text)
+    text = re.sub(r'<lb/>\s*\n\s*(?=<pb)', r'', text)
+
+    text = re.sub(r'\n<lb/>\s*$', '', text)
+
+    text = text.replace('<large>', '<hi rend="head">')
+    text = text.replace('<small>', '<hi rend="small">')
+    text = text.replace('</large>', '</hi>')
+    text = text.replace('</small>', '</hi>')
+
+    text = re.sub(r'(<lb/>[\s\n]*)+</hi>', r'</hi>', text)
+    text = re.sub(r'<lb/>[\s\n]*<pb', r'<pb', text)
+    text = re.sub(r'(\n)<pb/>[\s]*</hi>', r'</hi>\1<pb/>', text)
+    text = re.sub(r'\n(</hi>)', r'\1\n', text)
+    text = re.sub(r'(<hi rend="[^"]+">)\n<lb/>', r'\n<lb/>\1', text)
+    text = re.sub(r'<lb/> +', r'<lb/>', text)
+    text = re.sub(r'\n\n+', r'\n', text)
+    text = re.sub(r'  +', r' ', text)
+    
+    # Remove empty <lb/> lines (lines with just <lb/> and no text content)
+    # Keep <lb/> only when followed by actual text content on the same line
+    
+    # Split into lines, filter out lines that contain only <lb/> tag(s) and whitespace
+    lines = text.split('\n')
+    filtered_lines = []
+    for line in lines:
+        stripped = line.strip()
+        # Check if line contains ONLY <lb/> tags and whitespace (no actual text)
+        # Remove all <lb/> tags and whitespace - if nothing remains, skip the line
+        content_only = re.sub(r'<lb/>', '', stripped).strip()
+        if content_only == '':
+            # Line has no actual content, just <lb/> tags
+            continue
+        filtered_lines.append(line)
+    text = '\n'.join(filtered_lines)
+    
+    # Remove consecutive <lb/> tags on same line (keep just one)
+    text = re.sub(r'(<lb/>[ \t]*)+<lb/>', r'<lb/>', text)
+
+    return text
+
+
+# =============================================================================
+# Checkpoint Management
+# =============================================================================
+
+def load_checkpoints() -> set:
+    """Load previously converted files from checkpoint."""
+    if PDF_TO_XML_CHECKPOINT.exists():
+        try:
+            content = PDF_TO_XML_CHECKPOINT.read_text(encoding='utf-8').strip()
+            if content:
+                return set(content.split("\n"))
+        except Exception as e:
+            logger.error(f"Error reading checkpoint file: {e}")
+    return set()
+
+
+def save_checkpoint(file_path: str):
+    """Save a converted file to checkpoint."""
+    PDF_TO_XML_CHECKPOINT.parent.mkdir(parents=True, exist_ok=True)
+    with open(PDF_TO_XML_CHECKPOINT, "a", encoding='utf-8') as f:
+        f.write(f"{file_path}\n")
+
+
+# =============================================================================
+# File Discovery
+# =============================================================================
+
+def get_all_pdf_files() -> dict:
+    """Get all PDF files organized by VE ID from the pdf/ directory.
+
+    Returns:
+        Dict mapping VE ID to list of pdf_path objects
+    """
+    pdf_by_ve = {}
+
+    if not PDF_DIR.exists():
+        logger.error(f"PDF directory not found: {PDF_DIR}")
+        return pdf_by_ve
+
+    for ve_folder in PDF_DIR.iterdir():
+        if ve_folder.is_dir() and ve_folder.name.startswith("VE"):
+            ve_id = ve_folder.name
+            pdf_files = list(ve_folder.glob("*.pdf"))
+            if pdf_files:
+                pdf_by_ve[ve_id] = natsorted(pdf_files, key=lambda x: x.name)
+
+    return pdf_by_ve
+
+
+def find_source_doc_file(pdf_path: Path, ve_id: str) -> Path:
+    """Find the source DOC file in toprocess folder for SHA256 computation.
+
+    IE3CN4059 has a nested structure where DOC files are in subfolders:
+        toprocess/{IE_ID}-{VE_ID}/{subfolder}/*.doc
+
+    We need to recursively search for the matching DOC file.
+
+    Args:
+        pdf_path: Path to PDF file (converted from DOC)
+        ve_id: VE ID (e.g., "VE5CN1124")
+
+    Returns:
+        Path to DOC file or None if not found
+    """
+    base_name = pdf_path.stem
+    ve_folder_name = f"{IE_ID}-{ve_id}"
+    ve_folder = TOPROCESS_DIR / ve_folder_name
+
+    if not ve_folder.exists():
+        return None
+
+    # First try direct path (in case structure changes)
+    doc_path = ve_folder / f"{base_name}.doc"
+    if doc_path.exists() and doc_path.is_file():
+        return doc_path
+
+    # Recursively search for the DOC file in all subfolders
+    for doc_path in ve_folder.rglob(f"{base_name}.doc"):
+        if doc_path.is_file():
+            return doc_path
+
+    return None
+
+
+# =============================================================================
+# Main Conversion Logic
+# =============================================================================
+
+def convert_pdf_to_tei(pdf_path: Path, ve_id: str, sequence: int) -> str:
+    """
+    Convert a single PDF file to TEI XML.
+
+    Pipeline:
+    1. pdf_to_txt() -> raw text with <fs:xx> markers (Dedris auto-converted)
+    2. simplify_font_sizes() -> clean up font size markup
+    3. normalize_unicode() -> Unicode normalization
+    4. fix_mixed_dedris_patterns() -> fix remaining Dedris artifacts
+    5. classify_font_sizes() + apply_font_markup() -> large/regular/small
+    6. convert_markup_to_tei() -> TEI body content
+    7. Apply post-processing fixes
+    8. generate_tei_xml() -> complete TEI document
+
+    Args:
+        pdf_path: Path to the PDF file
+        ve_id: Volume ID
+        sequence: Sequence number for UT ID
+
+    Returns:
+        TEI XML string
+    """
+    source_path = find_source_doc_file(pdf_path, ve_id)
+    if not source_path:
+        logger.warning(f"Source DOC file not found for {pdf_path.name}, using PDF for SHA256")
+        source_path = pdf_path
+
+    raw_text = extract_pdf_to_text(pdf_path)
+    if not raw_text:
+        raise ValueError(f"No text extracted from {pdf_path.name}")
+
+    simplified_text = simplify_font_sizes(raw_text)
+
+    if ENABLE_NORMALIZATION:
+        logger.info(f"    Applying normalization...")
+        normalized_text = normalize_unicode(simplified_text)
+    else:
+        normalized_text = simplified_text
+
+    # Apply Dedris post-processing fixes for any remaining artifacts
+    from tei_generator import fix_mixed_dedris_patterns
+    normalized_text = fix_mixed_dedris_patterns(normalized_text)
+    normalized_text = fix_toc_leader_dots(normalized_text)
+
+    if ENABLE_FONT_CLASSIFICATION:
+        classifications = classify_font_sizes(normalized_text)
+    else:
+        classifications = {}
+
+    if classifications:
+        marked_text = apply_font_markup(normalized_text, classifications)
+    else:
+        marked_text = re.sub(r'<fs:\d+>', '', normalized_text)
+
+    tei_body = convert_markup_to_tei(marked_text)
+
+    if ENABLE_NORMALIZATION:
+        tei_body = fix_hi_tag_spacing(tei_body)
+
+    tei_body = post_process_body(tei_body)
+    
+    # Remove empty <lb/> lines (lines with just <lb/> and no text content)
+    # This runs AFTER post_process_body which adds <lb/> to every newline
+    lines = tei_body.split('\n')
+    filtered_lines = []
+    for line in lines:
+        stripped = line.strip()
+        # Check if line contains ONLY <lb/> tags and whitespace (no actual text)
+        content_only = re.sub(r'<lb/>', '', stripped).strip()
+        if content_only == '':
+            continue  # Skip lines with no actual content
+        filtered_lines.append(line)
+    tei_body = '\n'.join(filtered_lines)
+
+    ut_id = get_ut_id(ve_id, sequence)
+    sha256 = calculate_sha256(source_path)
+    src_path = f"sources/{ve_id}/{source_path.name}"
+
+    tei_xml = generate_tei_xml(
+        body_content=tei_body,
+        title=pdf_path.stem,
+        src_path=src_path,
+        sha256=sha256,
+        ve_id=ve_id,
+        ut_id=ut_id,
+    )
+
+    return tei_xml
+
+
+def copy_sources_to_output(ve_id: str, pdf_files: list):
+    """Copy source DOC files AND PDF files to output directory.
+
+    IE3CN4059 requires BOTH DOC and PDF files in the sources folder.
+
+    Args:
+        ve_id: Volume ID
+        pdf_files: List of PDF file paths
+    """
+    sources_ve_dir = SOURCES_OUTPUT_DIR / ve_id
+    sources_ve_dir.mkdir(parents=True, exist_ok=True)
+
+    doc_copied_count = 0
+    pdf_copied_count = 0
+
+    for pdf_path in pdf_files:
+        # Copy DOC file
+        doc_path = find_source_doc_file(pdf_path, ve_id)
+        if doc_path and doc_path.exists():
+            doc_dest = sources_ve_dir / doc_path.name
+            try:
+                shutil.copy2(doc_path, doc_dest)
+                doc_copied_count += 1
+            except Exception as e:
+                logger.warning(f"Failed to copy source DOC {doc_path.name}: {e}")
+
+        # Copy PDF file
+        if pdf_path.exists():
+            pdf_dest = sources_ve_dir / pdf_path.name
+            try:
+                shutil.copy2(pdf_path, pdf_dest)
+                pdf_copied_count += 1
+            except Exception as e:
+                logger.warning(f"Failed to copy PDF {pdf_path.name}: {e}")
+
+    logger.info(f"  Copied {doc_copied_count} DOC and {pdf_copied_count} PDF files to sources/{ve_id}/")
+
+
+# =============================================================================
+# Entry Points
+# =============================================================================
+
+def convert_single_file(relative_path: str, sequence: int = 1):
+    """Convert a single PDF file to TEI XML.
+
+    Args:
+        relative_path: Path to PDF file relative to pdf/ folder
+                      e.g., "VE5CN1124/file.pdf"
+        sequence: Sequence number for UT ID (default: 1)
+    """
+    pdf_path = PDF_DIR / relative_path
+
+    if not pdf_path.exists():
+        logger.error(f"PDF file not found: {pdf_path}")
+        return
+
+    ve_id = pdf_path.parent.name
+    if not ve_id.startswith("VE"):
+        logger.error(f"Could not determine VE ID from path: {relative_path}")
+        return
+
+    ut_id = get_ut_id(ve_id, sequence)
+
+    logger.info(f"Converting: {pdf_path.name}")
+    logger.info(f"  VE ID: {ve_id}")
+    logger.info(f"  UT ID: {ut_id}")
+
+    try:
+        tei_xml = convert_pdf_to_tei(pdf_path, ve_id, sequence)
+    except Exception as e:
+        logger.error(f"Error converting {pdf_path.name}: {e}")
+        import traceback
+        traceback.print_exc()
+        return
+
+    archive_ve_dir = ARCHIVE_DIR / ve_id
+    archive_ve_dir.mkdir(parents=True, exist_ok=True)
+
+    xml_path = archive_ve_dir / f"{ut_id}.xml"
+    with open(xml_path, 'w', encoding='utf-8') as f:
+        f.write(tei_xml)
+
+    logger.info(f"  Output: {xml_path}")
+
+    copy_sources_to_output(ve_id, [pdf_path])
+
+
+def convert_all_files():
+    """Convert all PDF files to TEI XML."""
+    logger.info("=" * 60)
+    logger.info(f"PDF to TEI XML Converter for {IE_ID}")
+    logger.info(f"PDF Source: {PDF_DIR}")
+    logger.info(f"Output: {OUTPUT_DIR}")
+    logger.info("=" * 60)
+
+    ensure_directories()
+
+    reset_stats()
+
+    checkpoints = load_checkpoints()
+    logger.info(f"Existing checkpoint entries: {len(checkpoints)}")
+
+    pdf_by_ve = get_all_pdf_files()
+
+    if not pdf_by_ve:
+        logger.error("No PDF files found")
+        return
+
+    total_files = sum(len(files) for files in pdf_by_ve.values())
+    logger.info(f"Found {len(pdf_by_ve)} VE folders with {total_files} PDF files")
+
+    success_count = 0
+    failed_count = 0
+
+    for ve_id in natsorted(pdf_by_ve.keys()):
+        pdf_files = pdf_by_ve[ve_id]
+
+        logger.info(f"\nProcessing {ve_id} ({len(pdf_files)} files)")
+
+        archive_ve_dir = ARCHIVE_DIR / ve_id
+        archive_ve_dir.mkdir(parents=True, exist_ok=True)
+
+        converted_files = []
+        for idx, pdf_path in enumerate(pdf_files):
+            sequence = idx + 1
+
+            pdf_path_str = str(pdf_path)
+
+            if pdf_path_str in checkpoints:
+                logger.info(f"  Skipping (already converted): {pdf_path.name}")
+                success_count += 1
+                converted_files.append(pdf_path)
+                continue
+
+            ut_id = get_ut_id(ve_id, sequence)
+            logger.info(f"  [{idx + 1}/{len(pdf_files)}] {pdf_path.name} -> {ut_id}")
+
+            try:
+                tei_xml = convert_pdf_to_tei(pdf_path, ve_id, sequence)
+
+                xml_path = archive_ve_dir / f"{ut_id}.xml"
+                with open(xml_path, 'w', encoding='utf-8') as f:
+                    f.write(tei_xml)
+
+                save_checkpoint(pdf_path_str)
+                success_count += 1
+                converted_files.append(pdf_path)
+
+            except Exception as e:
+                logger.error(f"  Error converting {pdf_path.name}: {e}")
+                import traceback
+                traceback.print_exc()
+                failed_count += 1
+
+        if converted_files:
+            copy_sources_to_output(ve_id, converted_files)
+
+    logger.info("\n" + "=" * 60)
+    logger.info("CONVERSION COMPLETE!")
+    logger.info(f"  Success: {success_count}")
+    logger.info(f"  Failed: {failed_count}")
+    logger.info(f"  Output: {OUTPUT_DIR}")
+    logger.info("=" * 60)
+
+    print_conversion_stats()
+    write_stats_file(OUTPUT_DIR / "pdf_conversion_stats.txt")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Convert PDF files to TEI XML (Dedris font conversion)")
+    parser.add_argument("--single", "-s", metavar="PATH", help="Convert a single file (path relative to pdf/)")
+    parser.add_argument("--sequence", type=int, default=1, metavar="N", help="Sequence number for single file UT ID (default: 1)")
+    parser.add_argument("--no-font-tags", action="store_true", help="Disable font classification")
+    parser.add_argument("--no-normalization", action="store_true", help="Disable Unicode normalization")
+    args = parser.parse_args()
+
+    global ENABLE_FONT_CLASSIFICATION, ENABLE_NORMALIZATION
+    if args.no_font_tags:
+        ENABLE_FONT_CLASSIFICATION = False
+    if args.no_normalization:
+        ENABLE_NORMALIZATION = False
+
+    if args.single:
+        convert_single_file(args.single, sequence=args.sequence)
+    else:
+        convert_all_files()
+
+
+if __name__ == "__main__":
+    main()
