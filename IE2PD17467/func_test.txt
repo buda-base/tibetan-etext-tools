@@ -1,0 +1,4 @@
+Input: འགྲོ-བའི་འདྲེན་པ
+Output: འགྲོ་བའི་འདྲེན་པ
+Hyphen in input: True
+Hyphen in output: False
