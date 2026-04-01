@@ -73,37 +73,6 @@ def normalize_spaces(
     return s
 
 
-def fix_character_substitutions(text: str) -> str:
-    """
-    Fix common character substitution errors in Tibetan text.
-    
-    These occur when fonts or PDF extractors map Tibetan glyphs to 
-    visually similar characters from other Unicode blocks.
-    
-    Common corruptions found in PDF extraction and copy/paste operations:
-    - μ (Greek mu) → ག (Tibetan GA)
-    - ¥ (Yen sign) → ཥ (Tibetan SHA) [context-dependent]
-    
-    Add more mappings as they are discovered.
-    """
-    if not text:
-        return text
-    
-    # Character-by-character substitution map
-    CHAR_FIXES = {
-        'μ': 'ག',  # Greek mu → Tibetan GA (U+03BC → U+0F42)
-        # Add more mappings here as discovered
-        # '¥': 'ཥ',  # Yen sign → Tibetan SHA (U+00A5 → U+0F65) - uncomment if needed
-    }
-    
-    result = text
-    for wrong, correct in CHAR_FIXES.items():
-        if wrong in result:
-            result = result.replace(wrong, correct)
-    
-    return result
-
-
 def normalize_unicode(
     text: str,
     strip_control: bool = True,
@@ -113,7 +82,6 @@ def normalize_unicode(
     General-purpose Unicode normalization.
 
     Steps:
-      0. Fix character substitution errors (μ → མ, etc.)
       1. Normalize to NFC.
       2. Convert all line breaks to '\n'.
       3. Remove zero-width / invisible characters (incl. all BOMs).
@@ -127,11 +95,8 @@ def normalize_unicode(
     if not text:
         return ""
 
-    # 0) Fix character substitutions
-    s = fix_character_substitutions(text)
-
     # 1) NFC normalization
-    s = unicodedata.normalize("NFC", s)
+    s = unicodedata.normalize("NFC", text)
 
     # 2) Normalize line breaks
     s = _LINEBREAKS_RE.sub("\n", s)
@@ -222,21 +187,8 @@ def charcat(c):
     return Cats.Other
 
 
-# debug:
-# for i, c in enumerate(CATEGORIES):
-#    print("%x : %d" % (0x0F00 + i , c.value))
-
-
 def unicode_reorder(txt):
-    # case of a syllable starting with a diacritic (ex: a vowel or subscript)
-    # we push it after the first main letter
-    # txt = re.sub(r"^([\u0f71-\u0f84\u0f8d-\u0fbc]+)([\u0f40-\u0f6c])", r"\2", txt)
-    # return txt, True
-    # inpired from code for Khmer Unicode provided by SIL
-    # https://docs.microsoft.com/en-us/typography/script-development/tibetan#reor
-    # https://docs.microsoft.com/en-us/typography/script-development/use#glyph-reordering
     charcats = [charcat(c) for c in txt]
-    # find subranges of base+non other and sort components in the subrange
     i = 0
     res = []
     valid = True
@@ -248,12 +200,9 @@ def unicode_reorder(txt):
             res.append(txt[i])
             i += 1
             continue
-        # scan for end of component
         j = i + 1
         while j < len(charcats) and charcats[j].value > Cats.Base.value:
             j += 1
-        # sort syllable based on character categories
-        # sort the char indices by category then position in string
         newindices = sorted(range(i, j), key=lambda e: (charcats[e].value, e))
         replaces = "".join(txt[n] for n in newindices)
         res.append(replaces)
@@ -262,18 +211,11 @@ def unicode_reorder(txt):
 
 
 def normalize_unicode_tib(s, form="nfd"):
-    # first, unify Unicode form:
-    # http://www.unicode.org/faq/normalization.html
-    # https://unicode.org/reports/tr15/
-    # https://unicode.org/charts/normalization/chart_Tibetan.html
-    # although for some reason this chart considers 0f0c -> 0f0b in NFD
-    #
-    # deprecated or discouraged characters
-    s = s.replace("\u0f73", "\u0f71\u0f72")  # use is discouraged
-    s = s.replace("\u0f75", "\u0f71\u0f74")  # use is discouraged
-    s = s.replace("\u0f77", "\u0fb2\u0f71\u0f80")  # deprecated
-    s = s.replace("\u0f79", "\u0fb3\u0f71\u0f80")  # deprecated
-    s = s.replace("\u0f81", "\u0f71\u0f80")  # use is discouraged
+    s = s.replace("\u0f73", "\u0f71\u0f72")
+    s = s.replace("\u0f75", "\u0f71\u0f74")
+    s = s.replace("\u0f77", "\u0fb2\u0f71\u0f80")
+    s = s.replace("\u0f79", "\u0fb3\u0f71\u0f80")
+    s = s.replace("\u0f81", "\u0f71\u0f80")
     if form == "nfd":
         s = s.replace("\u0f43", "\u0f42\u0fb7")
         s = s.replace("\u0f4d", "\u0f4c\u0fb7")
@@ -304,34 +246,11 @@ def normalize_unicode_tib(s, form="nfd"):
         s = s.replace("\u0fa6\u0fb7", "\u0fa7")
         s = s.replace("\u0fab\u0fb7", "\u0fac")
         s = s.replace("\u0f90\u0fb5", "\u0fb9")
-    # 0f00 has not been marked as a composed character in Unicode
-    # This is something that is now seen as a mistake, but it cannot be
-    # changed because of Unicode change policies.
     s = s.replace("\u0f00", "\u0f68\u0f7c\u0f7e")
     s, valid = unicode_reorder(s)
-    # ra doesn't transform into a small rago before anything else than (most) subjoined,
-    # so 0f6a should be replaced with 0f62 in that case
-    # Use negative lookahead to also handle end-of-string cases
-    # we consider that the non-small rago is only above the subjoined 0F99 (nya) 0FAD (wasur), A, ya, ra, la
     s = re.sub("\u0f6a(?![\u0f90-\u0f97\u0f9a-\u0fac\u0fae\u0faf\u0fb4-\u0fbc])", "ར", s)
     s = normalize_invalid_start_string(s)
     return s
-
-def debug_to_unicode(s):
-    res = ""
-    for c in s:
-        res += "\\u%x " % ord(c)
-    return res
-
-
-def assert_conv(orig, expected, expectedValid=True):
-    resultStr = normalize_unicode(orig)
-    assert resultStr == expected, "{} -> {} but {} expected".format(
-        debug_to_unicode(orig), debug_to_unicode(resultStr), debug_to_unicode(expected)
-    )
-    #assert resultValid == expectedValid, "{} valid? -> {} but {} expected".format(
-    #    debug_to_unicode(orig), resultValid, expectedValid
-    #)
 
 
 def is_vowel(char):
@@ -349,7 +268,6 @@ def is_suffix(char):
 def normalize_invalid_start_string(s):
     if len(s) < 2:
         return s
-    # we put the vowel in second place if the string starts with a vowel
     if is_vowel(s[0]) and not is_vowel(s[1]) and not is_suffix(s[1]):
         return s[1] + s[0] + (s[2:] if len(s) > 2 else "")
     if is_suffix(s[0]):
@@ -357,20 +275,3 @@ def normalize_invalid_start_string(s):
     return s
 
 
-def test_normalize_unicode():
-    assert_conv("\u0F7B\u0F56", "\u0F56\u0F7B", False)
-    assert_conv("\u0f40\u0f77", "\u0f40\u0fb2\u0f71\u0f80", False)
-    # k M o A u = k A u o M
-    assert_conv("\u0f40\u0f7e\u0f7c\u0f71\u0f74", "\u0f40\u0f71\u0f74\u0f7c\u0f7e")
-    assert_conv("\u0f58\u0f74\u0fb0\u0f83", "\u0f58\u0fb0\u0f74\u0f83")
-    assert_conv("\u0F51\u0FB7\u0F74\u0FB0", "\u0F51\u0FB7\u0fb0\u0F74")
-    assert_conv("\u0F66\u0F7C\u0FB1", "\u0F66\u0FB1\u0F7C")
-    assert_conv("\u0F0B\u0F7E", "\u0F0B\u0F7E", False)
-    assert_conv("\u0f6a\u0f99\u0f7a\u0f7a", "\u0f62\u0f99\u0f7a\u0f7a")
-    assert_conv("\u0f6a\u0f72", "\u0f62\u0f72")
-    assert_conv("\u0f6a\u0f90", "\u0f6a\u0f90")
-    assert_conv("\u0f01\u0f83", "\u0f01\u0f83") # should be valid
-
-
-if __name__ == "__main__":
-    test_normalize_unicode()
