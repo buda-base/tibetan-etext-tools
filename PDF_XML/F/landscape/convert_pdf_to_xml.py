@@ -61,6 +61,7 @@ from normalization import normalize_unicode
 from tibetan_text_fixes import (
     fix_hi_balance,
     fix_hi_tag_spacing,
+    fix_mixed_dedris_patterns,
     fix_small_wrapped_volume_running_title,
     fix_toc_leader_dots,
     fix_split_hi_close_digit_footer_line,
@@ -619,9 +620,7 @@ def convert_pdf_to_tei(pdf_path: Path, ve_id: str, sequence: int) -> str:
     else:
         normalized_text = simplified_text
 
-    from tei_generator import fix_mixed_dedris_patterns
-
-    normalized_text = fix_mixed_dedris_patterns(normalized_text)
+    #normalized_text = fix_mixed_dedris_patterns(normalized_text)
     normalized_text = fix_toc_leader_dots(normalized_text)
 
     if ENABLE_FONT_CLASSIFICATION:

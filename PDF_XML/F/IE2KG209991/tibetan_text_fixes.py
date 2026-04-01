@@ -3,7 +3,7 @@
 Tibetan Text Fixes Module
 
 This module provides functions to fix common issues in Tibetan text that occur
-during RTF to Unicode conversion.
+during PDF to unicode conversion.
 """
 
 import re
@@ -249,4 +249,113 @@ def count_tibetan_chars(text: str) -> int:
     """Count the number of Tibetan characters in a string."""
     return sum(1 for c in text if is_tibetan_char(c))
 
+
+def fix_mixed_dedris_patterns(text: str) -> str:
+    """
+    Fix remaining mixed Dedris patterns that weren't converted during stream processing.
+
+    Handles cases where ASCII Dedris stand-ins and Tibetan Unicode were in separate
+    text streams and thus not detected as mixed content during conversion.
+
+    Maps ASCII ``(`` / ``)`` to Tibetan ཡ / འ in these repairs, along with other stand-ins.
+    """
+    consonant_before_vowel = {
+        '.': 'ད',
+        '0': 'ས',
+        '{': 'ཆ',
+        '\\': 'ས',
+        '/': 'ཤ',
+        '(': 'ཡ',
+        ')': 'འ',
+        '}': 'ས',
+        ',': 'ཐ',
+    }
+
+    syllable_before_consonant = {
+        '.': 'དུ',
+        '0': 'སུ',
+        '{': 'ཆུ',
+        '\\': 'སུ',
+        '/': 'ཤུ',
+        '(': 'ཡུ',
+        ')': 'འུ',
+        '}': 'སུ',
+        ',': 'ཐུ',
+    }
+
+    tibetan_vowels_literal = 'ཱིེོུཾཿ'
+    vowel_pattern = '[' + tibetan_vowels_literal + '\u0F71-\u0F84]'
+
+    tibetan_consonants = 'ཀཁགངཅཆཇཉཏཐདནཔཕབམཙཚཛཝཞཟའཡརལཤསཧཨ'
+    tsheg = '་'
+    shad = '།'
+
+    result = text
+
+    for ascii_char, tibetan_consonant in consonant_before_vowel.items():
+        escaped_char = re.escape(ascii_char)
+        pattern = escaped_char + '(' + vowel_pattern + ')'
+        result = re.sub(pattern, tibetan_consonant + r'\1', result)
+
+    for ascii_char, tibetan_syllable in syllable_before_consonant.items():
+        escaped_char = re.escape(ascii_char)
+        pattern = (
+            '([' + tibetan_consonants + '])'
+            + escaped_char
+            + '([' + tibetan_consonants + tsheg + '])'
+        )
+        result = re.sub(pattern, r'\1' + tibetan_syllable + r'\2', result)
+
+    for ascii_char, tibetan_consonant in consonant_before_vowel.items():
+        escaped_char = re.escape(ascii_char)
+        pattern = escaped_char + '([' + tibetan_consonants + '])'
+        result = re.sub(pattern, tibetan_consonant + r'\1', result)
+
+    for ascii_char, tibetan_consonant in consonant_before_vowel.items():
+        escaped_char = re.escape(ascii_char)
+        pattern = escaped_char + tsheg
+        result = re.sub(pattern, tibetan_consonant + tsheg, result)
+
+    for ascii_char, tibetan_consonant in consonant_before_vowel.items():
+        escaped_char = re.escape(ascii_char)
+        pattern = (
+            '([' + tibetan_consonants + tibetan_vowels_literal + '])'
+            + escaped_char
+            + '([' + shad + '])'
+        )
+        result = re.sub(pattern, r'\1' + tibetan_consonant + r'\2', result)
+
+    result = re.sub(r'\.་', 'ད་', result)
+
+    tibetan_range = '\u0F00-\u0FFF'
+    hyphen_pattern = '([' + tibetan_range + '])-([' + tibetan_range + '])'
+
+    result = re.sub(hyphen_pattern, r'\1' + tsheg + r'\2', result)
+    result = re.sub(hyphen_pattern, r'\1' + tsheg + r'\2', result)
+
+    result = re.sub(r'([' + tibetan_range + '])-(<(?:/hi|lb))', r'\1་\2', result)
+    result = re.sub(r'(>)-([' + tibetan_range + '])', r'\1་\2', result)
+
+    for ascii_char, tibetan_consonant in consonant_before_vowel.items():
+        escaped_char = re.escape(ascii_char)
+        result = re.sub(
+            r'([' + tibetan_consonants + tibetan_vowels_literal + '])'
+            + escaped_char
+            + r'(<(?:\/hi|lb|,))',
+            r'\1' + tibetan_consonant + r'\2',
+            result,
+        )
+
+    for ascii_char, tibetan_consonant in consonant_before_vowel.items():
+        escaped_char = re.escape(ascii_char)
+        result = re.sub(
+            r'([' + tibetan_consonants + tibetan_vowels_literal + '])' + escaped_char + r',',
+            r'\1' + tibetan_consonant + ',',
+            result,
+        )
+
+    result = re.sub(r'([' + tibetan_range + ']),', r'\1།', result)
+    result = re.sub(r'([' + tibetan_range + ']),(<)', r'\1།\2', result)
+
+    return result
 

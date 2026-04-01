@@ -22,7 +22,6 @@ See the module docstring in `convert_main.py` for flags (`--ve`, `--single`, `--
 | Paths, IDs, dirs | `config.py` |
 | CID → Unicode map loader + remap | `cid_remap.py` |
 | Unicode normalization | `normalization.py` |
-| Post-layout text fixes | `tibetan_text_fixes.py` |
 | Dedris conversion helpers / stats | `dedris_converter.py` |
 | TEI XML generation | `tei_generator.py` |
 | Primary CID map (runtime) | `qomolangma_cid_map.json` |

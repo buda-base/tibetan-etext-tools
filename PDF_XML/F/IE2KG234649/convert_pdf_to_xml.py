@@ -68,7 +68,11 @@ from config import (
     CROP_FOOTER_FRACTION,
 )
 from normalization import normalize_unicode
-from tibetan_text_fixes import fix_hi_tag_spacing, fix_toc_leader_dots
+from tibetan_text_fixes import (
+    fix_hi_tag_spacing,
+    fix_mixed_dedris_patterns,
+    fix_toc_leader_dots,
+)
 from dedris_converter import reset_stats, print_conversion_stats, write_stats_file
 from tei_generator import post_process_body, generate_tei_xml, calculate_sha256
 from glyph_decoder import patch_pytiblegenc_cid_decoder
@@ -703,9 +707,7 @@ def convert_pdf_to_tei(pdf_path: Path, ve_id: str, sequence: int) -> str:
     else:
         normalized_text = simplified_text
 
-    from tei_generator import fix_mixed_dedris_patterns
-
-    normalized_text = fix_mixed_dedris_patterns(normalized_text)
+    #normalized_text = fix_mixed_dedris_patterns(normalized_text)
     normalized_text = fix_toc_leader_dots(normalized_text)
 
     if ENABLE_FONT_CLASSIFICATION:

@@ -35,9 +35,8 @@ These are **imported** by `convert_pdf_to_xml.py` for a normal batch or single-f
 | Paths and IDs | `config.py` |
 | PUA + Monlam CID overrides + pytiblegenc patch | `glyph_decoder.py` |
 | Unicode normalization | `normalization.py` |
-| Post-extract fixes (e.g. `<hi>`, TOC dots) | `tibetan_text_fixes.py` |
 | Conversion stats | `dedris_converter.py` |
-| TEI output | `tei_generator.py` |
+| TEI output (`post_process_body`, `generate_tei_xml`, …) | `tei_generator.py` |
 
 **Data:** CID/PUA tables live **inside** `glyph_decoder.py` (`DEFAULT_PUA_TO_UNICODE_OVERRIDES`, `DEFAULT_CID_TO_UNICODE_OVERRIDES`). There is no separate JSON map file in this IE.
 

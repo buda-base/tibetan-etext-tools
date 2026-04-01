@@ -709,9 +709,7 @@ def convert_pdf_to_tei(pdf_path: Path, ve_id: str, sequence: int) -> str:
     else:
         normalized_text = simplified_text
 
-    from tei_generator import fix_mixed_dedris_patterns
-
-    normalized_text = fix_mixed_dedris_patterns(normalized_text)
+    #normalized_text = fix_mixed_dedris_patterns(normalized_text)
     normalized_text = fix_toc_leader_dots(normalized_text)
 
     if ENABLE_FONT_CLASSIFICATION:

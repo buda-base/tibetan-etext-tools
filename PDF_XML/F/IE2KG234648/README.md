@@ -81,8 +81,8 @@ These modules are **imported** by `convert_pdf_to_xml.py` and are needed for the
 2. **Extract** with pytiblegenc; **`glyph_decoder.patch_pytiblegenc_cid_decoder`** resolves `(cid:N)` using embedded font maps + **`DEFAULT_CID_TO_UNICODE_OVERRIDES`** (utfc-derived + manual).
 3. If **`ENABLE_TIBETAN_DECODE_QUALITY_GATE`**: **`tibetan_decode_quality`** may replace text using **`pdf_cmap_extract.extract_text_tt_cmap_first`** (embedded TT cmap, not PDF ToUnicode only).
 4. **Font-size simplification** → **normalization** → Dedris-oriented cleanup where applied.
-5. **`tibetan_text_fixes`**: TOC leader dots, Latin mojibake, strip standalone page numbers after `<pb/>`, dedupe consecutive duplicate lines, etc.
-6. Markup → TEI via **`dedris_converter`** / **`tei_generator`** (`post_process_body`, **`generate_tei_xml`**).
+
+5. Markup → TEI via **`dedris_converter`** / **`tei_generator`** (`post_process_body`, **`generate_tei_xml`**).
 
 ## Decoding caveats
 

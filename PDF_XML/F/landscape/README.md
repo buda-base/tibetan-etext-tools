@@ -78,7 +78,7 @@ python3 convert_pdf_to_xml.py --no-normalization
 1. **Extract** — `pdf_extract.extract_pdf_to_text_full`: optional two-column passes, optional vertical crop merged into pytiblegenc **region** filtering (glyphs outside the region are ignored).
 2. **Font markup** — `<fs:…>` simplified and classified → `<large>` / `<small>` → TEI `<hi rend="head|small">`.
 3. **Page-break** — footer artifacts (page numbers, stray tshegs) trimmed before `<pb/>` where patterns match.
-4. **TEI** — `tei_generator` / `convert_markup_to_tei`, then **`tibetan_text_fixes`** (spacing, TOC leaders, small-span / volume-title repair, optional stripping of duplicate standalone TOC marker lines, `<hi>` balance).
+
 
 
 ## Related files
@@ -87,7 +87,6 @@ python3 convert_pdf_to_xml.py --no-normalization
 |------|---------|
 | `convert_pdf_to_xml.py` | CLI, batch/single conversion, wiring |
 | `pdf_extract.py` | Two-column extraction, crop merged into regions |
-| `tei_generator.py` | TEI body / header |
 | `tibetan_text_fixes.py` | Tibetan-specific TEI text fixes |
 | `dedris_converter.py` | Dedris stats / helpers as used here |
 | `normalization.py` | Optional Unicode normalization |

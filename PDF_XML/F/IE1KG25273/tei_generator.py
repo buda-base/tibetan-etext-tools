@@ -152,8 +152,6 @@ def post_process_body(body_content: str) -> str:
     """Post-process TEI body content with line breaks and tag fixes."""
     body_content = body_content.strip()
     
-    # First pass: Fix Dedris patterns before tag processing
-    body_content = fix_mixed_dedris_patterns(body_content)
     
     body_content = body_content.replace('\n', '\n<lb/>')
     body_content = re.sub(r' *<lb/> *', '\n<lb/>', body_content)
@@ -168,8 +166,8 @@ def post_process_body(body_content: str) -> str:
     body_content = re.sub(r'<hi rend="[^"]+">[\s]*</hi>', '', body_content)
     body_content = body_content.strip()
     
-    # Second pass: Fix Dedris patterns that may have been exposed by tag removal
-    body_content = fix_mixed_dedris_patterns(body_content)
+    #  Fix Dedris patterns that may have been exposed by tag removal
+    #body_content = fix_mixed_dedris_patterns(body_content)
     
     # Fix numbered list markers where ) was incorrectly converted to འ
     # Pattern: (1འ → (1), (2འ → (2), etc.

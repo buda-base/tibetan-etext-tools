@@ -1,7 +1,8 @@
 """
 TEI XML Generator Module
 
-This module provides functions to generate TEI XML from parsed RTF content.
+Builds TEI body markup from converted streams, post-processes TEI fragments,
+and emits full TEI P5 documents with BDRC-oriented header metadata.
 """
 
 import re
@@ -11,6 +12,7 @@ from collections import Counter
 import logging
 
 from config import IE_ID
+from tibetan_text_fixes import fix_mixed_dedris_patterns
 
 logger = logging.getLogger(__name__)
 
@@ -146,160 +148,10 @@ def build_tei_body(converted_streams: list, enable_font_classification: bool = T
     return body_content
 
 
-def fix_mixed_dedris_patterns(text: str) -> str:
-    """
-    Fix remaining mixed Dedris patterns that weren't converted during stream processing.
-    
-    This handles cases where ASCII Dedris characters and Tibetan Unicode were in
-    separate text streams and thus not detected as mixed content.
-    
-    Patterns to fix:
-    - .ེ → དེ (dot + Tibetan vowel sign e)
-    - 0ོ → སོ (zero + Tibetan vowel sign o)
-    - {འ → ཆའ (brace + Tibetan a-chung)
-    - \ི → སི (backslash + Tibetan vowel sign i)
-    - ག.ལ → གདུལ (consonant + dot + consonant becomes consonant + du + consonant)
-    - མ,ན → མཐུན (consonant + comma + consonant becomes consonant + thu + consonant)
-    - འགྲོ-བ → འགྲོ་བ (hyphen-minus as tsheg)
-    """
-    # Mapping: ASCII char before vowel sign → Tibetan consonant
-    CONSONANT_BEFORE_VOWEL = {
-        '.': 'ད',   # da - .ེ → དེ
-        '0': 'ས',   # sa - 0ོ → སོ
-        '{': 'ཆ',   # cha - {འ → ཆའ
-        '\\': 'ས',  # sa - \ི → སི
-        '/': 'ཤ',   # sha
-        '(': 'ཡ',   # ya
-        ')': 'འ',   # a-chung
-        '}': 'ས',   # sa
-        ',': 'ཐ',   # tha - ,ུ → ཐུ
-    }
-    
-    # Mapping: ASCII char before consonant/tsheg → syllable (consonant + inherent u)
-    SYLLABLE_BEFORE_CONSONANT = {
-        '.': 'དུ',  # du - ག.ལ → གདུལ
-        '0': 'སུ',  # su
-        '{': 'ཆུ',  # chu
-        '\\': 'སུ', # su
-        '/': 'ཤུ',  # shu
-        '(': 'ཡུ',  # yu
-        ')': 'འུ',  # u
-        '}': 'སུ',  # su
-        ',': 'ཐུ',  # thu - མ,ན → མཐུན
-    }
-    
-    # Tibetan vowel signs (combining marks)
-    TIBETAN_VOWELS = 'ཱིེོུཾཿ'
-    # Pattern: vowel signs including dependent vowel signs U+0F71-U+0F84
-    VOWEL_PATTERN = '[' + TIBETAN_VOWELS + '\u0F71-\u0F84]'
-    
-    # Tibetan consonants and tsheg
-    TIBETAN_CONSONANTS = 'ཀཁགངཅཆཇཉཏཐདནཔཕབམཙཚཛཝཞཟའཡརལཤསཧཨ'
-    TSHEG = '་'
-    SHAD = '།'
-    
-    result = text
-    
-    # Fix ASCII + vowel sign patterns
-    for ascii_char, tibetan_consonant in CONSONANT_BEFORE_VOWEL.items():
-        # Escape special regex chars
-        escaped_char = re.escape(ascii_char)
-        # Pattern: ASCII char followed by Tibetan vowel sign
-        pattern = escaped_char + '(' + VOWEL_PATTERN + ')'
-        replacement = tibetan_consonant + r'\1'
-        result = re.sub(pattern, replacement, result)
-    
-    # Fix patterns where ASCII is between two Tibetan consonants: ག.ལ → གདུལ
-    for ascii_char, tibetan_syllable in SYLLABLE_BEFORE_CONSONANT.items():
-        escaped_char = re.escape(ascii_char)
-        # Pattern: Tibetan consonant + ASCII + Tibetan consonant/tsheg
-        pattern = '([' + TIBETAN_CONSONANTS + '])' + escaped_char + '([' + TIBETAN_CONSONANTS + TSHEG + '])'
-        replacement = r'\1' + tibetan_syllable + r'\2'
-        result = re.sub(pattern, replacement, result)
-    
-    # Fix ASCII followed by Tibetan consonant (after tsheg or at start): {འ → ཆའ
-    # This handles cases like ས་{འི་རྒྱལ་ → ས་ཆའི་རྒྱལ་
-    # NOTE: We ALLOW matches after tsheg since tsheg marks syllable boundary
-    for ascii_char, tibetan_consonant in CONSONANT_BEFORE_VOWEL.items():
-        escaped_char = re.escape(ascii_char)
-        # Pattern: (tsheg or non-Tibetan) + ASCII + Tibetan consonant
-        # Match after tsheg, space, start of line, or any non-Tibetan character
-        pattern = '(?:^|[^' + TIBETAN_CONSONANTS + TIBETAN_VOWELS + '])' + escaped_char + '([' + TIBETAN_CONSONANTS + '])'
-        replacement_func = lambda m, tc=tibetan_consonant: (m.group(0)[0] if m.group(0)[0] != escaped_char[0] else '') + tc + m.group(1)
-        # Simpler approach: just match ASCII + consonant anywhere
-        pattern = escaped_char + '([' + TIBETAN_CONSONANTS + '])'
-        replacement = tibetan_consonant + r'\1'
-        result = re.sub(pattern, replacement, result)
-    
-    # Fix ASCII directly followed by tsheg: {་ → ཆ་
-    # This handles cases like {་རྒྱལ་ where { is a complete syllable
-    for ascii_char, tibetan_consonant in CONSONANT_BEFORE_VOWEL.items():
-        escaped_char = re.escape(ascii_char)
-        # Pattern: ASCII + tsheg
-        pattern = escaped_char + TSHEG
-        replacement = tibetan_consonant + TSHEG
-        result = re.sub(pattern, replacement, result)
-    
-    # Fix standalone ASCII before shad: འགོ.། → འགོད།
-    for ascii_char, tibetan_consonant in CONSONANT_BEFORE_VOWEL.items():
-        escaped_char = re.escape(ascii_char)
-        # Pattern: Tibetan consonant/vowel + ASCII + shad
-        pattern = '([' + TIBETAN_CONSONANTS + TIBETAN_VOWELS + '])' + escaped_char + '([' + SHAD + '])'
-        replacement = r'\1' + tibetan_consonant + r'\2'
-        result = re.sub(pattern, replacement, result)
-    
-    # Fix isolated .་ pattern (dot followed by tsheg): ས.་གནས → སད་གནས
-    result = re.sub(r'\.་', 'ད་', result)
-    
-    # Fix hyphen-minus used as tsheg: འགྲོ-བ → འགྲོ་བ
-    # Pattern: Any Tibetan character (U+0F00-U+0FFF) + hyphen-minus + any Tibetan character
-    tibetan_range = '\u0F00-\u0FFF'
-    hyphen_pattern = '([' + tibetan_range + '])-([' + tibetan_range + '])'
-    tsheg = '་'  # U+0F0B
-    
-    result = re.sub(hyphen_pattern, r'\1' + tsheg + r'\2', result)
-    
-    # Second pass for nested hyphens (e.g., a-b-c → a་b་c)
-    result = re.sub(hyphen_pattern, r'\1' + tsheg + r'\2', result)
-    
-    # Fix hyphens adjacent to HTML tags:
-    # Pattern: Tibetan + hyphen + </hi> ... <hi> + Tibetan → Tibetan + tsheg + </hi> ... <hi> + Tibetan
-    # First, fix hyphen before closing tag: རྗེ-</hi> → རྗེ་</hi>
-    result = re.sub(r'([' + tibetan_range + '])-(<(?:/hi|lb))', r'\1་\2', result)
-    
-    # Fix hyphen after opening tag: <hi...>-བ → <hi...>་བ (hyphen at start of tag content)
-    result = re.sub(r'(>)-([' + tibetan_range + '])', r'\1་\2', result)
-    
-    # Fix dots and commas adjacent to tags similarly
-    # Dot before closing tag: བྱེ.</hi> → བྱེད</hi>
-    for ascii_char, tibetan_consonant in CONSONANT_BEFORE_VOWEL.items():
-        escaped_char = re.escape(ascii_char)
-        result = re.sub(r'([' + TIBETAN_CONSONANTS + TIBETAN_VOWELS + '])' + escaped_char + r'(<(?:\/hi|lb|,))', 
-                       r'\1' + tibetan_consonant + r'\2', result)
-    
-    # ASCII char before comma (often used as pause): བྱེ., → བྱེད,
-    for ascii_char, tibetan_consonant in CONSONANT_BEFORE_VOWEL.items():
-        escaped_char = re.escape(ascii_char)
-        result = re.sub(r'([' + TIBETAN_CONSONANTS + TIBETAN_VOWELS + '])' + escaped_char + r',', 
-                       r'\1' + tibetan_consonant + ',', result)
-    
-    # Convert comma to shad (།) when it follows Tibetan text
-    # In Dedris encoding, comma represents the Tibetan shad punctuation
-    tibetan_range = '\u0F00-\u0FFF'
-    result = re.sub(r'([' + tibetan_range + ']),', r'\1།', result)
-    
-    # Also fix commas at end of hi tags: ཤིང་,</hi> → ཤིང་།</hi>
-    result = re.sub(r'([' + tibetan_range + ']),(<)', r'\1།\2', result)
-    
-    return result
-
-
 def post_process_body(body_content: str) -> str:
     """Post-process TEI body content with line breaks and tag fixes."""
     body_content = body_content.strip()
     
-    # First pass: Fix Dedris patterns before tag processing
-    body_content = fix_mixed_dedris_patterns(body_content)
     
     body_content = body_content.replace('\n', '\n<lb/>')
     body_content = re.sub(r' *<lb/> *', '\n<lb/>', body_content)
@@ -314,8 +166,8 @@ def post_process_body(body_content: str) -> str:
     body_content = re.sub(r'<hi rend="[^"]+">[\s]*</hi>', '', body_content)
     body_content = body_content.strip()
     
-    # Second pass: Fix Dedris patterns that may have been exposed by tag removal
-    body_content = fix_mixed_dedris_patterns(body_content)
+    #  Fix Dedris patterns that may have been exposed by tag removal
+    #body_content = fix_mixed_dedris_patterns(body_content)
     
     # Fix numbered list markers where ) was incorrectly converted to འ
     # Pattern: (1འ → (1), (2འ → (2), etc.
@@ -361,7 +213,7 @@ def generate_tei_xml(
 </teiHeader>
 <text>
 <body xml:lang="bo">
-<p xml:space="preserve">
+<p>
 {body_content}
 </p>
 </body>
