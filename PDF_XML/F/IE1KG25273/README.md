@@ -60,7 +60,7 @@ With **`--no-normalization`**, full NFC/Tibetan normalization is skipped, but **
 1. **Extract** — `extract_pdf_to_text`: `rawdict`, per-span **`<fs:N>`**, Wingdings spans skipped (`_is_wingdings_font`), optional redaction when crop fractions are non-zero.
 2. **Simplify font sizes** — `simplify_font_sizes` merges adjacent size segments where configured.
 3. **Normalize** — `normalize_unicode`: NFC, spaces, stray Latin **`m`** cleanup (`remove_stray_latin_m`), **Wingdings PUA** removal, Tibetan Unicode normalization (unless `--no-normalization`).
-4. **Text fixes** — `fix_mixed_dedris_patterns` (`tei_generator`): leftover Dedris-like ASCII next to Tibetan (dots, braces, commas, etc.). **ASCII `(` / `)` are not mapped to Tibetan** here, so gloss parentheses from Unicode PDFs stay literal. **`fix_toc_leader_dots`**, **`fix_paren_ya_before_de_yang`** (narrow fallback, e.g. legacy `ཡདེ་ཡང་` → `(དེ་ཡང་`).
+4. **Text fixes** — `fix_mixed_dedris_patterns` (`tibetan_text_fixes`): leftover Dedris-like ASCII next to Tibetan (dots, braces, commas, etc.). **ASCII `(` / `)` are not mapped to Tibetan** here, so gloss parentheses from Unicode PDFs stay literal. **`fix_toc_leader_dots`**, **`fix_paren_ya_before_de_yang`** (narrow fallback, e.g. legacy `ཡདེ་ཡང་` → `(དེ་ཡང་`).
 5. **Font markup** — Classify sizes → `<large>` / `<small>` (or strip `<fs:>` if `--no-font-tags`).
 6. **TEI body** — `convert_markup_to_tei` inserts **`<pb/>`** / **`<lb/>`**, strips page-number/header artefacts, maps to **`<hi rend="head|small">`**, then **`post_process_body`** and empty-line cleanup.
 
@@ -75,6 +75,6 @@ Each **newline** from extraction (one PyMuPDF **line** in `rawdict`) becomes a *
 | `convert_pdf_to_xml.py` | CLI: PyMuPDF `rawdict` extraction, redaction, normalization, TEI assembly |
 | `config.py` | `IE_ID`, `BASE_DIR`, paths, `CROP_HEADER_FRACTION` / `CROP_FOOTER_FRACTION` |
 | `normalization.py` | Unicode + Tibetan normalization, stray `m`, Wingdings PUA strip |
-| `tibetan_text_fixes.py` | `<hi>` spacing, TOC leaders, `fix_paren_ya_before_de_yang` |
-| `tei_generator.py` | `fix_mixed_dedris_patterns`, `post_process_body`, `generate_tei_xml`, SHA256 helper |
+| `tibetan_text_fixes.py` | `fix_mixed_dedris_patterns`, `<hi>` spacing, TOC leaders, `fix_paren_ya_before_de_yang` |
+| `tei_generator.py` | `post_process_body`, `generate_tei_xml`, font-size → `<hi>`, SHA256 helper |
 | `dedris_converter.py` | Dedris conversion helpers and conversion stats (logging/stats in this pipeline) |

@@ -71,6 +71,7 @@ from config import (
 from normalization import normalize_unicode, remove_wingdings_private_use
 from tibetan_text_fixes import (
     fix_hi_tag_spacing,
+    fix_mixed_dedris_patterns,
     fix_paren_ya_before_de_yang,
     fix_toc_leader_dots,
 )
@@ -739,8 +740,6 @@ def convert_pdf_to_tei(pdf_path: Path, ve_id: str, sequence: int) -> str:
     else:
         # Still strip Wingdings PUA when full normalization is off (font artefact only).
         normalized_text = remove_wingdings_private_use(simplified_text)
-
-    from tei_generator import fix_mixed_dedris_patterns
 
     normalized_text = fix_mixed_dedris_patterns(normalized_text)
     normalized_text = fix_toc_leader_dots(normalized_text)
