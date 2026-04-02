@@ -1,7 +1,3 @@
-"""
-PDF in flat sources/ -> TEI XML (pytiblegenc).
-"""
-
 from pathlib import Path
 
 IE_ID = "IE1KG25273"
