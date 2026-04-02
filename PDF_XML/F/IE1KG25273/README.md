@@ -57,12 +57,11 @@ With **`--no-normalization`**, full NFC/Tibetan normalization is skipped, but **
 
 ## Pipeline
 
-1. **Extract** — `extract_pdf_to_text`: `rawdict`, per-span **`<fs:N>`**, Wingdings spans skipped (`_is_wingdings_font`), optional redaction when crop fractions are non-zero.
+1. **Extract** — `pdf_extract.extract_pdf_to_text` (PyMuPDF `rawdict` or `pytiblegenc.pdf_to_txt`): per-span **`<fs:N>`**, Wingdings skipped on the pymupdf path, optional header/footer redaction.
 2. **Simplify font sizes** — `simplify_font_sizes` merges adjacent size segments where configured.
 3. **Normalize** — `normalize_unicode`: NFC, spaces, stray Latin **`m`** cleanup (`remove_stray_latin_m`), **Wingdings PUA** removal, Tibetan Unicode normalization (unless `--no-normalization`).
-4. **Text fixes** — `fix_mixed_dedris_patterns` (`tibetan_text_fixes`): leftover Dedris-like ASCII next to Tibetan (dots, braces, commas, etc.). **ASCII `(` / `)` are not mapped to Tibetan** here, so gloss parentheses from Unicode PDFs stay literal. **`fix_toc_leader_dots`**.
-5. **Font markup** — Classify sizes → `<large>` / `<small>` (or strip `<fs:>` if `--no-font-tags`).
-6. **TEI body** — `convert_markup_to_tei` inserts **`<pb/>`** / **`<lb/>`**, strips page-number/header artefacts, maps to **`<hi rend="head|small">`**, then **`post_process_body`** and empty-line cleanup.
+4. **Font markup** — Classify sizes → `<large>` / `<small>` (or strip `<fs:>` if `--no-font-tags`).
+5. **TEI body** — `convert_markup_to_tei` inserts **`<pb/>`** / **`<lb/>`**, strips page-number/header artefacts, maps to **`<hi rend="head|small">`**, then **`post_process_body`** and empty-line cleanup.
 
 ### `<lb/>` and printed lines
 
@@ -72,9 +71,9 @@ Each **newline** from extraction (one PyMuPDF **line** in `rawdict`) becomes a *
 
 | File | Purpose |
 |------|---------|
-| `convert_pdf_to_xml.py` | CLI: PyMuPDF `rawdict` extraction, redaction, normalization, TEI assembly |
+| `convert_pdf_to_xml.py` | CLI: batch/single conversion, normalization, TEI assembly |
+| `pdf_extract.py` | PDF → text: PyMuPDF `rawdict` or `pytiblegenc`, crop temp PDF, `PAGE_BREAK_STR` |
 | `config.py` | `IE_ID`, `BASE_DIR`, paths, `CROP_HEADER_FRACTION` / `CROP_FOOTER_FRACTION` |
 | `normalization.py` | Unicode + Tibetan normalization, stray `m`, Wingdings PUA strip |
 | `tibetan_text_fixes.py` | `fix_mixed_dedris_patterns`, `<hi>` spacing, TOC leaders, `fix_paren_ya_before_de_yang` |
 | `tei_generator.py` | `post_process_body`, `generate_tei_xml`, font-size → `<hi>`, SHA256 helper |
-| `dedris_converter.py` | Dedris conversion helpers and conversion stats (logging/stats in this pipeline) |

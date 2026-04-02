@@ -1,17 +1,21 @@
 #!/usr/bin/env python3
 """
-IE1KG25273: PDF under ``sources/`` → TEI XML (**PyMuPDF** ``page.get_text("rawdict")``).
+IE1KG25273: PDF under ``sources/`` → TEI XML.
 
-- Walks MuPDF text **block → line → span**, emits one ``\\n`` per typographic line;
-  later steps map each newline to ``<lb/>`` (PDF layout, not sentence breaks).
-  Skips **Wingdings** spans via ``_is_wingdings_font`` so bullets/symbols do not
-  pollute Tibetan runs.
-- Aimed at **MonlamUniOuChan** PDFs (Unicode); PyMuPDF’s ToUnicode/CMap handling
-  avoids pdfminer-style CID glitches (e.g. stray Latin ``m``). For **pytiblegenc**
-  ``pdf_to_txt`` extraction, use ``convert2.py`` instead.
-- Optional **header/footer redaction**: ``--crop-top`` / ``--crop-bottom`` or
-  ``config.CROP_HEADER_FRACTION`` / ``CROP_FOOTER_FRACTION`` (temp PDF with bands
-  blanked before extract).
+**Extractors** (``--extractor``):
+
+- **pymupdf** (default): ``page.get_text("rawdict")`` — one ``\\n`` per MuPDF
+  **line** (block → line → span); skips **Wingdings**; optional **header/footer
+  crop** (``--crop-top`` / ``--crop-bottom`` or config). Suited to
+  **MonlamUniOuChan** Unicode PDFs.
+
+- **pytiblegenc**: ``pytiblegenc.pdf_to_txt()`` with the same options as
+  IE3KG664 / Desktop SRC_CODE — line breaks follow that library’s layout.
+  Header/footer **crop** uses the same redacted temp PDF as **pymupdf**
+  (requires PyMuPDF to build it). Requires:
+  ``pip install git+https://github.com/buda-base/py-tiblegenc.git``
+
+Later steps map each extractor newline to ``<lb/>`` (layout, not linguistics).
 
 Optional: matching ``.doc`` in ``toprocess/<IE_ID>-<VE_ID>/`` for SHA256; else
 checksum from the PDF.
@@ -25,6 +29,7 @@ Usage:
     python convert_pdf_to_xml.py --no-font-tags
     python convert_pdf_to_xml.py --no-normalization
     python convert_pdf_to_xml.py --crop-top 0.09 --crop-bottom 0.08
+    python convert_pdf_to_xml.py --extractor pytiblegenc
 """
 
 import sys
@@ -36,18 +41,6 @@ from pathlib import Path
 from typing import Optional
 from collections import Counter
 from natsort import natsorted
-import tempfile
-import os
-
-try:
-    import pymupdf as fitz          # PyMuPDF ≥ 1.23  (import name changed)
-    PYMUPDF_AVAILABLE = True
-except ImportError:
-    try:
-        import fitz                 # PyMuPDF < 1.23
-        PYMUPDF_AVAILABLE = True
-    except ImportError:
-        PYMUPDF_AVAILABLE = False
 
 script_dir = Path(__file__).parent
 sys.path.insert(0, str(script_dir))
@@ -69,19 +62,14 @@ from config import (
     CROP_FOOTER_FRACTION,
 )
 from normalization import normalize_unicode, remove_wingdings_private_use
-from tibetan_text_fixes import (
-    fix_hi_tag_spacing,
-    fix_mixed_dedris_patterns,
-    fix_toc_leader_dots,
-)
-from dedris_converter import reset_stats, print_conversion_stats, write_stats_file
+#from tibetan_text_fixes import fix_hi_tag_spacing, fix_toc_leader_dots
 from tei_generator import post_process_body, generate_tei_xml, calculate_sha256
-
-try:
-    from pytiblegenc import pdf_to_txt
-    PYTIBLEGENC_AVAILABLE = True
-except ImportError:
-    PYTIBLEGENC_AVAILABLE = False
+from pdf_extract import (
+    PAGE_BREAK_STR,
+    PYMUPDF_AVAILABLE,
+    PYTIBLEGENC_AVAILABLE,
+    extract_pdf_to_text,
+)
 
 
 def setup_logging():
@@ -107,11 +95,11 @@ logger = setup_logging()
 ENABLE_FONT_CLASSIFICATION = True
 ENABLE_NORMALIZATION = True
 
+# "pymupdf" | "pytiblegenc" — set from CLI ``--extractor`` in ``main()``.
+PDF_EXTRACTOR: str = "pymupdf"
+
 CROP_TOP_FRACTION: float = CROP_HEADER_FRACTION   
 CROP_BOTTOM_FRACTION: float = CROP_FOOTER_FRACTION
-
-PAGE_BREAK_STR = "ZZZZ"
-FONT_SIZE_FORMAT = "<fs:{}>"
 
 # Tibetan tsheg (U+0F0B), vowel ུ (U+0F74), ASCII digits, fullwidth digits (U+FF10-U+FF19)
 _PAGE_ARTIFACT_CHARS = r"\u0F0B\u0F740-9\uFF10-\uFF19\s"
@@ -159,149 +147,6 @@ def strip_page_header_artifacts(text: str) -> str:
     text = re.sub(r'(<hi rend="head">)[IVXLCDM]+\s*\n<lb/>', r'\1', text)
     
     return text
-
-
-def create_cropped_pdf(pdf_path: Path, top_frac: float, bottom_frac: float) -> Optional[Path]:
-    """
-    Temp PDF with header/footer bands physically redacted (text removed, white fill).
-
-    Uses ``add_redact_annot`` + ``apply_redactions`` on ``page.rect`` fractions.
-    """
-    if top_frac == 0.0 and bottom_frac == 0.0:
-        return None
-
-    if not PYMUPDF_AVAILABLE:
-        logger.warning(
-            "Header/footer redaction requested but PyMuPDF is not installed. "
-            "pip install pymupdf — continuing without redaction."
-        )
-        return None
-
-    try:
-        doc = fitz.open(str(pdf_path))
-
-        for page in doc:
-            r = page.rect
-            h = r.height
-
-            if top_frac > 0.0:
-                page.add_redact_annot(
-                    fitz.Rect(r.x0, r.y0, r.x1, r.y0 + h * top_frac)
-                )
-
-            if bottom_frac > 0.0:
-                page.add_redact_annot(
-                    fitz.Rect(r.x0, r.y0 + h * (1.0 - bottom_frac), r.x1, r.y1)
-                )
-
-            page.apply_redactions(
-                images=fitz.PDF_REDACT_IMAGE_NONE,
-                graphics=0,
-                text=fitz.PDF_REDACT_TEXT_REMOVE,
-            )
-
-        tmp = tempfile.NamedTemporaryFile(
-            suffix=".pdf", delete=False, dir=tempfile.gettempdir()
-        )
-        tmp_path = Path(tmp.name)
-        tmp.close()
-
-        doc.save(str(tmp_path), garbage=4, deflate=True)
-        doc.close()
-
-        logger.info(
-            f"    Redacted temp PDF: {tmp_path.name} "
-            f"(top={top_frac*100:.1f}%, bottom={bottom_frac*100:.1f}%)"
-        )
-        return tmp_path
-
-    except Exception as e:
-        logger.warning(
-            f"    Failed to redact header/footer on {pdf_path.name}: {e} — using original PDF."
-        )
-        return None
-
-
-def _is_wingdings_font(font_name: str) -> bool:
-    """
-    True if span uses Wingdings / Wingdings2 / Wingdings3.
-
-    PDF subset names look like ``NKCIWT+Wingdings2``; some files use ``Wingdings 2`` (space).
-    """
-    if not font_name:
-        return False
-    base = font_name.split("+")[-1]
-    compact = base.lower().replace(" ", "")
-    return "wingdings" in compact
-
-def extract_pdf_to_text(pdf_path: Path) -> str:
-    """
-    Extract text from a PDF using PyMuPDF ``rawdict``.
-
-    **Line breaks:** After each rawdict ``line`` (all spans on one typographic
-    row), a single ``\\n`` is appended. There is no sentence or clause
-    segmentation; ``convert_markup_to_tei`` later maps each ``\\n`` to
-    ``<lb/>``. So ``<lb/>`` reflects **PDF layout**, not linguistics. Justified
-    pecha lines often end near ``།`` or syllable boundaries, so breaks can
-    *look* sentence-like by coincidence.
-
-    When ``CROP_TOP_FRACTION`` and/or ``CROP_BOTTOM_FRACTION`` are non-zero,
-    a temporary PDF is built first with those bands **physically redacted**
-    so header/footer text is removed before extraction (reliable vs bbox-less
-    spans in rawdict).
-    """
-    logger.info(f"    Extracting (PyMuPDF rawdict): {pdf_path.name}")
-
-    if not PYMUPDF_AVAILABLE:
-        logger.error("PyMuPDF is required for IE1KG25273.  pip install pymupdf")
-        return ""
-
-    tmp_pdf: Optional[Path] = None
-
-    try:
-        if CROP_TOP_FRACTION > 0.0 or CROP_BOTTOM_FRACTION > 0.0:
-            tmp_pdf = create_cropped_pdf(
-                pdf_path, CROP_TOP_FRACTION, CROP_BOTTOM_FRACTION
-            )
-
-        target_pdf = tmp_pdf if tmp_pdf else pdf_path
-        doc = fitz.open(str(target_pdf))
-        parts: list[str] = []
-
-        for page in doc:
-            page_dict = page.get_text("rawdict")
-            for block in page_dict.get("blocks", []):
-                if block.get("type", 1) != 0:
-                    continue
-                for line in block.get("lines", []):
-                    for span in line.get("spans", []):
-                        if _is_wingdings_font(span.get("font") or ""):
-                            continue
-                        fs = round(span.get("size", 12))
-                        parts.append(FONT_SIZE_FORMAT.format(fs))
-                        char_objs = span.get("chars") or []
-                        if char_objs:
-                            for char_obj in char_objs:
-                                parts.append(char_obj.get("c", ""))
-                        else:
-                            parts.append(span.get("text") or "")
-                    parts.append("\n")
-            parts.append(f"\n{PAGE_BREAK_STR}\n")
-
-        doc.close()
-        return "".join(parts)
-
-    except Exception as e:
-        logger.error(f"    ERROR extracting {pdf_path.name}: {e}")
-        import traceback
-        traceback.print_exc()
-        return ""
-    finally:
-        if tmp_pdf is not None and tmp_pdf.exists():
-            try:
-                os.unlink(tmp_pdf)
-            except OSError:
-                pass
 
 
 def simplify_font_sizes(text: str) -> str:
@@ -506,10 +351,6 @@ def apply_font_markup(text: str, classifications: dict) -> str:
 
 def convert_markup_to_tei(text: str) -> str:
     """Convert markup to TEI format.
-
-    Inserts ``<lb/>`` before every line that follows a newline in *text* (i.e.
-    one ``<lb/>`` per extractor newline). See ``extract_pdf_to_text`` for why
-    those newlines exist.
     """
 
     def escape_content(text_part):
@@ -727,7 +568,12 @@ def convert_pdf_to_tei(pdf_path: Path, ve_id: str, sequence: int) -> str:
         logger.warning(f"Source DOC file not found for {pdf_path.name}, using PDF for SHA256")
         source_path = pdf_path
 
-    raw_text = extract_pdf_to_text(pdf_path)
+    raw_text = extract_pdf_to_text(
+        pdf_path,
+        PDF_EXTRACTOR,
+        crop_top=CROP_TOP_FRACTION,
+        crop_bottom=CROP_BOTTOM_FRACTION,
+    )
     if not raw_text:
         raise ValueError(f"No text extracted from {pdf_path.name}")
 
@@ -740,8 +586,7 @@ def convert_pdf_to_tei(pdf_path: Path, ve_id: str, sequence: int) -> str:
         # Still strip Wingdings PUA when full normalization is off (font artefact only).
         normalized_text = remove_wingdings_private_use(simplified_text)
 
-    #normalized_text = fix_mixed_dedris_patterns(normalized_text)
-    normalized_text = fix_toc_leader_dots(normalized_text)
+    # normalized_text = fix_toc_leader_dots(normalized_text)
 
     if ENABLE_FONT_CLASSIFICATION:
         classifications = classify_font_sizes(normalized_text)
@@ -755,8 +600,8 @@ def convert_pdf_to_tei(pdf_path: Path, ve_id: str, sequence: int) -> str:
 
     tei_body = convert_markup_to_tei(marked_text)
 
-    if ENABLE_NORMALIZATION:
-        tei_body = fix_hi_tag_spacing(tei_body)
+    #if ENABLE_NORMALIZATION:
+    #    tei_body = fix_hi_tag_spacing(tei_body)
 
     tei_body = post_process_body(tei_body)
 
@@ -880,6 +725,7 @@ def convert_single_file(relative_path: str, ve_id: Optional[str], sequence: Opti
     ut_id = get_ut_id(ve_id, sequence)
 
     logger.info(f"Converting: {pdf_path.name}")
+    logger.info(f"  Extractor: {PDF_EXTRACTOR}")
     logger.info(f"  VE ID: {ve_id}")
     logger.info(f"  UT ID: {ut_id}")
 
@@ -914,6 +760,7 @@ def convert_all_files(
     """
     logger.info("=" * 60)
     logger.info(f"PDF to TEI XML Converter for {IE_ID}")
+    logger.info(f"Extractor: {PDF_EXTRACTOR}")
     if ve_filter:
         logger.info(f"Filtering: {ve_filter} only")
     logger.info(f"PDF Source: {SOURCES_DIR}")
@@ -951,8 +798,6 @@ def convert_all_files(
         f"PDFs under {SOURCES_DIR}: {total_files} file(s) -> {len(pdf_by_ve)} volume(s): "
         f"{natsorted(pdf_by_ve.keys())}"
     )
-
-    reset_stats()
 
     checkpoints = load_checkpoints()
     logger.info(f"Existing checkpoint entries: {len(checkpoints)}")
@@ -1012,13 +857,22 @@ def convert_all_files(
     logger.info(f"  Output: {OUTPUT_DIR}")
     logger.info("=" * 60)
 
-    print_conversion_stats()
-    write_stats_file(OUTPUT_DIR / "pdf_conversion_stats.txt")
-
 
 def main():
     parser = argparse.ArgumentParser(
-        description="IE1KG25273: Convert sources/*.pdf and sources/<VE>/**/*.pdf to TEI XML (PyMuPDF rawdict)"
+        description=(
+            "IE1KG25273: Convert sources/*.pdf and sources/<VE>/**/*.pdf to TEI XML "
+            "(PyMuPDF rawdict or pytiblegenc pdf_to_txt)"
+        )
+    )
+    parser.add_argument(
+        "--extractor",
+        choices=["pymupdf", "pytiblegenc"],
+        default="pymupdf",
+        help=(
+            "PDF text extraction backend: pymupdf = MuPDF rawdict line breaks (default); "
+            "pytiblegenc = same pdf_to_txt options as IE3KG664 / Desktop SRC_CODE"
+        ),
     )
     parser.add_argument(
         "--single",
@@ -1049,7 +903,7 @@ def main():
         help=(
             "Fraction of page height to physically redact at the TOP (running header). "
             "E.g. 0.08 blanks the top 8%% and removes text there. Overrides config.CROP_HEADER_FRACTION. "
-            "Requires pymupdf (pip install pymupdf)."
+            "Used for both extractors (redacted temp PDF; pip install pymupdf)."
         ),
     )
     parser.add_argument(
@@ -1060,10 +914,20 @@ def main():
         help=(
             "Fraction of page height to physically redact at the BOTTOM (running footer). "
             "E.g. 0.07 blanks the bottom 7%% and removes text there. Overrides config.CROP_FOOTER_FRACTION. "
-            "Requires pymupdf (pip install pymupdf)."
+            "Used for both extractors (redacted temp PDF; pip install pymupdf)."
         ),
     )
     args = parser.parse_args()
+
+    if args.extractor == "pytiblegenc" and not PYTIBLEGENC_AVAILABLE:
+        parser.error(
+            "pytiblegenc is not installed. pip install git+https://github.com/buda-base/py-tiblegenc.git"
+        )
+    if args.extractor == "pymupdf" and not PYMUPDF_AVAILABLE:
+        parser.error("PyMuPDF is not installed. pip install pymupdf")
+
+    global PDF_EXTRACTOR
+    PDF_EXTRACTOR = args.extractor
 
     global ENABLE_FONT_CLASSIFICATION, ENABLE_NORMALIZATION
     global CROP_TOP_FRACTION, CROP_BOTTOM_FRACTION

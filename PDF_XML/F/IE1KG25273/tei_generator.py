@@ -12,7 +12,6 @@ from collections import Counter
 import logging
 
 from config import IE_ID
-from tibetan_text_fixes import fix_mixed_dedris_patterns
 
 logger = logging.getLogger(__name__)
 
@@ -166,8 +165,6 @@ def post_process_body(body_content: str) -> str:
     body_content = re.sub(r'<hi rend="[^"]+">[\s]*</hi>', '', body_content)
     body_content = body_content.strip()
     
-    #  Fix Dedris patterns that may have been exposed by tag removal
-    #body_content = fix_mixed_dedris_patterns(body_content)
     
     # Fix numbered list markers where ) was incorrectly converted to འ
     # Pattern: (1འ → (1), (2འ → (2), etc.
