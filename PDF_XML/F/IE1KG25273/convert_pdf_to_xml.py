@@ -72,7 +72,6 @@ from normalization import normalize_unicode, remove_wingdings_private_use
 from tibetan_text_fixes import (
     fix_hi_tag_spacing,
     fix_mixed_dedris_patterns,
-    fix_paren_ya_before_de_yang,
     fix_toc_leader_dots,
 )
 from dedris_converter import reset_stats, print_conversion_stats, write_stats_file
@@ -741,9 +740,8 @@ def convert_pdf_to_tei(pdf_path: Path, ve_id: str, sequence: int) -> str:
         # Still strip Wingdings PUA when full normalization is off (font artefact only).
         normalized_text = remove_wingdings_private_use(simplified_text)
 
-    normalized_text = fix_mixed_dedris_patterns(normalized_text)
+    #normalized_text = fix_mixed_dedris_patterns(normalized_text)
     normalized_text = fix_toc_leader_dots(normalized_text)
-    normalized_text = fix_paren_ya_before_de_yang(normalized_text)
 
     if ENABLE_FONT_CLASSIFICATION:
         classifications = classify_font_sizes(normalized_text)

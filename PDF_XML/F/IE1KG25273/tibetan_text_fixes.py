@@ -61,16 +61,6 @@ def fix_hi_tag_spacing(text: str) -> str:
     return text
 
 
-def fix_paren_ya_before_de_yang(text: str) -> str:
-    """
-    Opening '(' mis-decoded as Tibetan ཡ before the common phrase དེ་ཡང་.
-
-    Observed: ``ཡདེ་ཡང་`` → expected ``(དེ་ཡང་`` (Monlam/PDF glyph vs Unicode).
-    """
-    if not text:
-        return text
-    return text.replace("ཡདེ་ཡང་", "(དེ་ཡང་")
-
 
 def fix_toc_leader_dots(text: str) -> str:
     """

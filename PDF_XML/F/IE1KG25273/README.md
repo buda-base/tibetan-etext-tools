@@ -60,7 +60,7 @@ With **`--no-normalization`**, full NFC/Tibetan normalization is skipped, but **
 1. **Extract** — `extract_pdf_to_text`: `rawdict`, per-span **`<fs:N>`**, Wingdings spans skipped (`_is_wingdings_font`), optional redaction when crop fractions are non-zero.
 2. **Simplify font sizes** — `simplify_font_sizes` merges adjacent size segments where configured.
 3. **Normalize** — `normalize_unicode`: NFC, spaces, stray Latin **`m`** cleanup (`remove_stray_latin_m`), **Wingdings PUA** removal, Tibetan Unicode normalization (unless `--no-normalization`).
-4. **Text fixes** — `fix_mixed_dedris_patterns` (`tibetan_text_fixes`): leftover Dedris-like ASCII next to Tibetan (dots, braces, commas, etc.). **ASCII `(` / `)` are not mapped to Tibetan** here, so gloss parentheses from Unicode PDFs stay literal. **`fix_toc_leader_dots`**, **`fix_paren_ya_before_de_yang`** (narrow fallback, e.g. legacy `ཡདེ་ཡང་` → `(དེ་ཡང་`).
+4. **Text fixes** — `fix_mixed_dedris_patterns` (`tibetan_text_fixes`): leftover Dedris-like ASCII next to Tibetan (dots, braces, commas, etc.). **ASCII `(` / `)` are not mapped to Tibetan** here, so gloss parentheses from Unicode PDFs stay literal. **`fix_toc_leader_dots`**.
 5. **Font markup** — Classify sizes → `<large>` / `<small>` (or strip `<fs:>` if `--no-font-tags`).
 6. **TEI body** — `convert_markup_to_tei` inserts **`<pb/>`** / **`<lb/>`**, strips page-number/header artefacts, maps to **`<hi rend="head|small">`**, then **`post_process_body`** and empty-line cleanup.
 
