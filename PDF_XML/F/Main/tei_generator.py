@@ -1,6 +1,8 @@
 """
 TEI XML Generator Module
 
+Builds TEI body markup from converted streams, post-processes TEI fragments,
+and emits full TEI P5 documents with BDRC-oriented header metadata.
 """
 
 import re
@@ -10,7 +12,6 @@ from collections import Counter
 import logging
 
 from config import IE_ID
-from tibetan_text_fixes import fix_mixed_dedris_patterns
 
 logger = logging.getLogger(__name__)
 
@@ -149,23 +150,27 @@ def build_tei_body(converted_streams: list, enable_font_classification: bool = T
 def post_process_body(body_content: str) -> str:
     """Post-process TEI body content with line breaks and tag fixes."""
     body_content = body_content.strip()
-    
-    
+    body_content = re.sub(r"<pb/>\s*</hi>", r"</hi>\n<pb/>", body_content)
+
     body_content = body_content.replace('\n', '\n<lb/>')
     body_content = re.sub(r' *<lb/> *', '\n<lb/>', body_content)
     body_content = re.sub(r'<lb/>\s*<pb/>', '<pb/>', body_content)
     body_content = re.sub(r'(<pb/>\s*){2,}', '<pb/>\n', body_content)
     body_content = body_content.strip()
-    
+    # Blanket \n -> \n<lb/> can leave </hi> on its own line as <lb/></hi>; fold onto prior <lb/> line.
+    body_content = re.sub(r'(<lb/>[^\n]+)\n+<lb/></hi>', r'\1</hi>', body_content)
+    # Remove spurious <lb/> between </hi> and <pb/> (inline hi must end before page break).
+    body_content = re.sub(r"(</hi>)\s*\n\s*<lb/>\s*\n*\s*(<pb/>)", r"\1\n\2", body_content)
+
     body_content = re.sub(r'<hi rend="[^"]+">[\s]*(?:<lb/>[\s]*)*</hi>', '', body_content)
     body_content = re.sub(r'(<hi rend="[^"]+">)\s*\n<lb/>', r'\n<lb/>\1', body_content)
     body_content = re.sub(r'\n<lb/></hi>', r'</hi>\n<lb/>', body_content)
+    # Newline injection can stack <lb/> right after <pb/>; keep a single source line break.
+    body_content = re.sub(r"(<pb/>)\s*\n\s*<lb/>\s*\n\s*<lb/>", r"\1\n<lb/>", body_content)
     body_content = re.sub(r'\n\n+', '\n', body_content)
     body_content = re.sub(r'<hi rend="[^"]+">[\s]*</hi>', '', body_content)
     body_content = body_content.strip()
     
-    #  Fix Dedris patterns that may have been exposed by tag removal
-    #body_content = fix_mixed_dedris_patterns(body_content)
     
     # Fix numbered list markers where ) was incorrectly converted to འ
     # Pattern: (1འ → (1), (2འ → (2), etc.

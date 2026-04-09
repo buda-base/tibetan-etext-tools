@@ -2,6 +2,18 @@ import re
 import unicodedata
 from enum import Enum
 
+
+# Wingdings / Wingdings2 ToUnicode often maps bullets and symbols to U+F020–U+F0FF (PUA).
+_WINGDINGS_MS_PUA = re.compile(r"[\uF020-\uF0FF]")
+
+
+def remove_wingdings_private_use(text: str) -> str:
+    """Remove legacy Microsoft Wingdings/Wingdings2 private-use symbols from extracted text."""
+    if not text:
+        return text
+    return _WINGDINGS_MS_PUA.sub("", text)
+
+
 # -------------------------------------------------------------------------
 # Precompiled patterns & translation tables
 
@@ -88,7 +100,9 @@ def normalize_unicode(
       4. Map Unicode spaces and tabs to plain ASCII space.
       5. Optionally remove control characters (except newline).
       6. Normalize spaces (including Tibetan-specific rules).
-      7. Apply Tibetan Unicode normalization.
+      7. Remove stray Latin 'm' (Monlam extract artefacts).
+      8. Remove Wingdings/Wingdings2 PUA symbols (U+F020–U+F0FF).
+      9. Apply Tibetan Unicode normalization.
 
     Keeps ZWJ/ZWNJ (joiners) intact.
     """
@@ -116,8 +130,11 @@ def normalize_unicode(
 
     # 6) Normalize spaces
     s = normalize_spaces(s, collapse_internal_spaces=collapse_internal_spaces)
+   
+    # 8) Wingdings/Wingdings2 bullets and dingbats (PUA safety net)
+    s = remove_wingdings_private_use(s)
 
-    # 7) Tibetan Unicode normalization
+    # 9) Tibetan Unicode normalization
     s = normalize_unicode_tib(s)
     # no graphical distinction between 0f0b and 0f0c
     s = s.replace("\u0f0c", "\u0f0b")

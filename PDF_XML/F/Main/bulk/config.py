@@ -1,30 +1,35 @@
-"""
-PDF in flat sources/ -> TEI XML (pytiblegenc).
-"""
-
+import os
 from pathlib import Path
 
-IE_ID = "IE1KG15934"
+# Default single-workset layout. Batch driver sets PDF_BULK_BASE_DIR and PDF_BULK_IE_ID.
+_DEFAULT_BASE = Path(r"/Users/tenzinmonlam/Documents/dharmaduta/pdf_convert_5/1-11")
+_DEFAULT_IE = "IE1KG25273"
 
-BASE_DIR = Path(r"/Users/tenzinmonlam/Documents/dharmaduta/pdf_convert_5/1-11")
-# Input PDFs (flat)
-SOURCES_DIR = BASE_DIR / "IE1KG15934" / "sources"
+_b = os.environ.get("PDF_BULK_BASE_DIR")
+_i = os.environ.get("PDF_BULK_IE_ID")
+BASE_DIR = Path(_b).expanduser().resolve() if _b else _DEFAULT_BASE
+IE_ID = _i if _i else _DEFAULT_IE
 
-TOPROCESS_DIR = BASE_DIR / "IE1KG15934" / "toprocess"
-
-OUTPUT_DIR = BASE_DIR / "IE1KG15934_output"
+SOURCES_DIR = BASE_DIR / IE_ID / "sources"
+TOPROCESS_DIR = BASE_DIR / IE_ID / "toprocess"
+OUTPUT_DIR = BASE_DIR / f"{IE_ID}_output"
 ARCHIVE_DIR = OUTPUT_DIR / "archive"
 SOURCES_OUTPUT_DIR = OUTPUT_DIR / "sources"
 
-LOG_DIR = BASE_DIR / "logs"
-CHECKPOINT_DIR = BASE_DIR / "checkpoints"
+# Flat logs/checkpoints when running convert_pdf_to_xml.py alone; nested per IE when
+# bulk_multi_ie.py sets both PDF_BULK_BASE_DIR and PDF_BULK_IE_ID (parallel safety).
+_bulk_env = bool(_b and _i)
+if _bulk_env:
+    LOG_DIR = BASE_DIR / "logs" / IE_ID
+    CHECKPOINT_DIR = BASE_DIR / "checkpoints" / IE_ID
+else:
+    LOG_DIR = BASE_DIR / "logs"
+    CHECKPOINT_DIR = BASE_DIR / "checkpoints"
 
 PDF_TO_XML_LOG = LOG_DIR / "pdf_to_xml.log"
 PDF_TO_XML_CHECKPOINT = CHECKPOINT_DIR / "pdf_to_xml_checkpoint.txt"
-# ─── Page crop settings ───────────────────────────────────────────────
-# Fraction of page height to remove from top (header) and bottom (footer).
-# 0.0 = no crop. Typical values: 0.07–0.12 (7–12 % of page height).
-# Override at runtime with --crop-top / --crop-bottom CLI flags.
+# ─── Header/footer redaction (physical) ───────────────────────────────
+# 0.0 = none. Typical: 0.07–0.12. Override with --crop-top / --crop-bottom.
 CROP_HEADER_FRACTION: float = 0.00   # e.g. 0.08  strips top 8 %
 CROP_FOOTER_FRACTION: float = 0.00   # e.g. 0.07  strips bottom 7 %
 

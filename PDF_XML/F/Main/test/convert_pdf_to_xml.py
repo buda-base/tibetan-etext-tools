@@ -1,31 +1,35 @@
+#!/usr/bin/env python3
 """
-IE2KG234648: PDF in sources/ to TEI XML (Dedris via pytiblegenc)
+IE1KG25273: PDF under ``sources/`` → TEI XML.
 
-Input (default batch): PDFs only under **sources/<VE_ID>/** — volume ID is the **folder name**
-(e.g. sources/VE1ER1021/*.pdf → output archive/VE1ER1021/). **toprocess is ignored** for which
-volumes run; a mismatched folder like toprocess/IE2KG234648-VE1ER9999 does not affect VE1ER1021.
+**Extractors** (``--extractor``):
 
-Optional: flat sources/*.pdf — use ``--assign-flat-toprocess`` to split those across
-IE2KG234648-VE* folders in toprocess; otherwise root PDFs are skipped (move into sources/<VE_ID>/).
+- **pymupdf** (default): ``page.get_text("rawdict")`` — one ``\\n`` per MuPDF
+  **line** (block → line → span); skips **Wingdings**; optional **header/footer
+  crop** (``--crop-top`` / ``--crop-bottom`` or config). Suited to
+  **MonlamUniOuChan** Unicode PDFs.
 
-toprocess is still checked only for optional matching .doc (IE2KG234648-<same VE as source>) for SHA256.
-Output: IE2KG234648_output/archive/{VE_ID}/UT*.xml and sources/{VE_ID}/ (PDF + optional DOC).
+- **pytiblegenc**: ``pytiblegenc.pdf_to_txt()`` with the same options as
+  IE3KG664 / Desktop SRC_CODE — line breaks follow that library’s layout.
+  Header/footer **crop** uses the same redacted temp PDF as **pymupdf**
+  (requires PyMuPDF to build it). Requires:
+  ``pip install git+https://github.com/buda-base/py-tiblegenc.git``
 
-Optional: matching .doc in toprocess/IE2KG234648-{ve_id}/ for SHA256; otherwise SHA256 from PDF.
+Later steps map each extractor newline to ``<lb/>`` (layout, not linguistics).
 
-``IE_ID`` and directory paths come from ``config.py``; adjust that file for your machine.
-
-This build includes a Tibetan decode-quality gate (TT-cmap-first retry); disable with
-``--no-decode-quality-gate``. Cropping uses ``--crop-top`` / ``--crop-bottom`` (needs PyMuPDF).
+Optional: matching ``.doc`` in ``toprocess/<IE_ID>-<VE_ID>/`` for SHA256; else
+checksum from the PDF.
 
 Usage:
-    python convert_pdf_to_xml.py                    # Convert all PDFs (assigned to VEs)
-    python convert_pdf_to_xml.py --ve VE1ER1021     # One VE only
+    python convert_pdf_to_xml.py
+    python convert_pdf_to_xml.py --ve VE1ER999
     python convert_pdf_to_xml.py --single foo.pdf
-    python convert_pdf_to_xml.py --single VE1ER1021/TI594-01-001.pdf  # path under sources/
-    python convert_pdf_to_xml.py --assign-flat-toprocess   # also assign root *.pdf via toprocess
-    python convert_pdf_to_xml.py --no-decode-quality-gate
-    python convert_pdf_to_xml.py --crop-top 0.08 --crop-bottom 0.07
+    python convert_pdf_to_xml.py --single VE1ER999/TI596-01-001.pdf
+    python convert_pdf_to_xml.py --assign-flat-toprocess
+    python convert_pdf_to_xml.py --no-font-tags
+    python convert_pdf_to_xml.py --no-normalization
+    python convert_pdf_to_xml.py --crop-top 0.09 --crop-bottom 0.08
+    python convert_pdf_to_xml.py --extractor pytiblegenc
 """
 
 import sys
@@ -37,18 +41,6 @@ from pathlib import Path
 from typing import Optional
 from collections import Counter
 from natsort import natsorted
-import tempfile
-import os
-
-try:
-    import pymupdf as fitz          # PyMuPDF ≥ 1.23  (import name changed)
-    PYMUPDF_AVAILABLE = True
-except ImportError:
-    try:
-        import fitz                 # PyMuPDF < 1.23
-        PYMUPDF_AVAILABLE = True
-    except ImportError:
-        PYMUPDF_AVAILABLE = False
 
 script_dir = Path(__file__).parent
 sys.path.insert(0, str(script_dir))
@@ -68,33 +60,16 @@ from config import (
     get_max_archive_sequence,
     CROP_HEADER_FRACTION,
     CROP_FOOTER_FRACTION,
-    ENABLE_TIBETAN_DECODE_QUALITY_GATE,
 )
-from normalization import normalize_unicode
-from tibetan_text_fixes import (
-    dedupe_consecutive_lines,
-    fix_hi_tag_spacing,
-    fix_mixed_dedris_patterns,
-    fix_pdf_latin_mojibake,
-    fix_toc_leader_dots,
-    strip_pb_standalone_page_number_line,
-)
-from dedris_converter import reset_stats, print_conversion_stats, write_stats_file
+from normalization import normalize_unicode, remove_wingdings_private_use
+#from tibetan_text_fixes import fix_hi_tag_spacing, fix_toc_leader_dots
 from tei_generator import post_process_body, generate_tei_xml, calculate_sha256
-from glyph_decoder import patch_pytiblegenc_cid_decoder
-from tibetan_decode_quality import assess_decode_quality, format_report_log
-from pdf_cmap_extract import extract_text_tt_cmap_first
-
-try:
-    from pytiblegenc import pdf_to_txt
-    import pytiblegenc.pdfminer_text_converter as pytiblegenc_text_converter
-    PYTIBLEGENC_AVAILABLE = True
-except ImportError:
-    PYTIBLEGENC_AVAILABLE = False
-    print(
-        "Error: pytiblegenc not installed. Run: pip install git+https://github.com/buda-base/py-tiblegenc.git"
-    )
-    sys.exit(1)
+from pdf_extract import (
+    PAGE_BREAK_STR,
+    PYMUPDF_AVAILABLE,
+    PYTIBLEGENC_AVAILABLE,
+    extract_pdf_to_text,
+)
 
 
 def setup_logging():
@@ -117,13 +92,14 @@ def setup_logging():
 
 logger = setup_logging()
 
-ENABLE_DECODE_QUALITY_GATE = ENABLE_TIBETAN_DECODE_QUALITY_GATE
+ENABLE_FONT_CLASSIFICATION = True
+ENABLE_NORMALIZATION = True
+
+# "pymupdf" | "pytiblegenc" — set from CLI ``--extractor`` in ``main()``.
+PDF_EXTRACTOR: str = "pymupdf"
 
 CROP_TOP_FRACTION: float = CROP_HEADER_FRACTION   
 CROP_BOTTOM_FRACTION: float = CROP_FOOTER_FRACTION
-
-PAGE_BREAK_STR = "ZZZZ"
-FONT_SIZE_FORMAT = "<fs:{}>"
 
 # Tibetan tsheg (U+0F0B), vowel ུ (U+0F74), ASCII digits, fullwidth digits (U+FF10-U+FF19)
 _PAGE_ARTIFACT_CHARS = r"\u0F0B\u0F740-9\uFF10-\uFF19\s"
@@ -162,7 +138,7 @@ def strip_page_header_artifacts(text: str) -> str:
     """
     # Remove standalone Roman numerals after <pb/>
     text = re.sub(r'(<pb/>\s*)\n<lb/>[IVXLCDM]+\s*\n', r'\1\n', text)
-    text = strip_pb_standalone_page_number_line(text)
+    text = re.sub(r'(<pb/>\s*)\n<lb/>\d+\s*\n', r'\1\n', text)
     # Remove <hi rend="small"> blocks with page number + title after <pb/>
     text = re.sub(r'(<pb/>\s*)\n<lb/><hi rend="small">\d+\s*\n<lb/>[^\n]*</hi>\s*\n', r'\1\n', text)
     text = re.sub(r'(<pb/>\s*)\n<lb/><hi rend="head">[IVXLCDM]+\s*\n', r'\1\n<lb/><hi rend="head">', text)
@@ -171,153 +147,6 @@ def strip_page_header_artifacts(text: str) -> str:
     text = re.sub(r'(<hi rend="head">)[IVXLCDM]+\s*\n<lb/>', r'\1', text)
     
     return text
-
-
-def create_cropped_pdf(pdf_path: Path, top_frac: float, bottom_frac: float) -> Optional[Path]:
-    """
-    Return a path to a temporary PDF with headers/footers cropped out.
-
-    Each page's MediaBox is shrunk by *top_frac* from the top and
-    *bottom_frac* from the bottom (both expressed as a fraction of the
-    original page height, e.g. 0.08 = 8 %).
-
-    Returns None and logs a warning when PyMuPDF is not installed or the
-    crop values are both zero (caller should use the original PDF instead).
-    """
-    if top_frac == 0.0 and bottom_frac == 0.0:
-        return None                         # nothing to do
-
-    if not PYMUPDF_AVAILABLE:
-        logger.warning(
-            "Page cropping requested but PyMuPDF is not installed. "
-            "Install with:  pip install pymupdf\n"
-            "Continuing WITHOUT cropping."
-        )
-        return None
-
-    try:
-        src_doc = fitz.open(str(pdf_path))
-        out_doc = fitz.open()               # blank output document
-
-        for page in src_doc:
-            rect = page.rect               # original page rectangle (pts)
-            page_h = rect.height
-
-            # Calculate crop margins in points
-            top_margin    = page_h * top_frac
-            bottom_margin = page_h * bottom_frac
-
-            # New content rectangle: shrink top and bottom
-            crop_rect = fitz.Rect(
-                rect.x0,
-                rect.y0 + top_margin,      # move top edge down
-                rect.x1,
-                rect.y1 - bottom_margin,   # move bottom edge up
-            )
-
-            # Copy the page and apply the new crop box
-            out_doc.insert_pdf(src_doc, from_page=page.number, to_page=page.number)
-            new_page = out_doc[-1]
-            new_page.set_cropbox(crop_rect)
-
-        # Write to a named temp file that survives until we delete it
-        tmp = tempfile.NamedTemporaryFile(
-            suffix=".pdf", delete=False, dir=tempfile.gettempdir()
-        )
-        tmp_path = Path(tmp.name)
-        tmp.close()
-
-        out_doc.save(str(tmp_path))
-        out_doc.close()
-        src_doc.close()
-
-        logger.info(
-            f"    Cropped PDF written to temp: {tmp_path.name} "
-            f"(top={top_frac*100:.1f}%, bottom={bottom_frac*100:.1f}%)"
-        )
-        return tmp_path
-
-    except Exception as e:
-        logger.warning(f"    Failed to crop {pdf_path.name}: {e}  — using original.")
-        return None
-
-def extract_pdf_to_text(pdf_path: Path) -> str:
-    """Extract text from a PDF file using pytiblegenc."""
-    logger.info(f"    Extracting: {pdf_path.name}")
-
-    tmp_pdf: Optional[Path] = None
-
-    try:
-        if CROP_TOP_FRACTION > 0.0 or CROP_BOTTOM_FRACTION > 0.0:
-            tmp_pdf = create_cropped_pdf(pdf_path, CROP_TOP_FRACTION, CROP_BOTTOM_FRACTION)
-
-        target_pdf = tmp_pdf if tmp_pdf else pdf_path
-        with patch_pytiblegenc_cid_decoder(
-            target_pdf,
-            pytiblegenc_text_converter,
-            logger=logger,
-        ) as cid_stats:
-            text = pdf_to_txt(
-                str(target_pdf),
-                page_break_str=f"\n{PAGE_BREAK_STR}\n",
-                track_font_size=True,
-                font_size_format=FONT_SIZE_FORMAT,
-                normalize=False,
-                simplify_font_sizes_option=False,
-            )
-
-        if cid_stats["count"] > 0:
-            logger.info(f"    Decoded unresolved CID glyphs: {cid_stats['count']}")
-
-        if ENABLE_DECODE_QUALITY_GATE:
-            report = assess_decode_quality(text, page_break_marker=PAGE_BREAK_STR)
-            logger.info(f"    Decode quality: {format_report_log(report)}")
-            if not report.passes_gate:
-                logger.warning(
-                    "    Extraction failed Tibetan decode-quality gate — retrying with "
-                    "embedded TrueType cmap first (Phase 2.2 fallback)."
-                )
-                try:
-                    fb = extract_text_tt_cmap_first(
-                        target_pdf,
-                        page_break_str=PAGE_BREAK_STR,
-                        log=logger,
-                    )
-                    rep_fb = assess_decode_quality(
-                        fb, page_break_marker=PAGE_BREAK_STR
-                    )
-                    logger.info(
-                        f"    After TT-cmap-first fallback: {format_report_log(rep_fb)}"
-                    )
-                    if fb and (
-                        rep_fb.passes_gate
-                        or rep_fb.tibetan_ratio > report.tibetan_ratio
-                    ):
-                        text = fb
-                    else:
-                        logger.warning(
-                            "    TT-cmap-first fallback did not improve Tibetan ratio — "
-                            "keeping primary pytiblegenc extraction."
-                        )
-                except Exception as ex:
-                    logger.warning(
-                        f"    TT-cmap-first fallback failed ({ex}); keeping primary extraction."
-                    )
-
-        return text
-
-    except Exception as e:
-        logger.error(f"    ERROR extracting {pdf_path.name}: {e}")
-        import traceback
-        traceback.print_exc()
-        return ""
-    finally:
-        # Always remove the temporary cropped file
-        if tmp_pdf and tmp_pdf.exists():
-            try:
-                os.unlink(tmp_pdf)
-            except Exception:
-                pass
 
 
 def simplify_font_sizes(text: str) -> str:
@@ -521,7 +350,8 @@ def apply_font_markup(text: str, classifications: dict) -> str:
 
 
 def convert_markup_to_tei(text: str) -> str:
-    """Convert markup to TEI format."""
+    """Convert markup to TEI format.
+    """
 
     def escape_content(text_part):
         text_part = text_part.replace("<large>", "\x00LARGE\x00")
@@ -579,7 +409,8 @@ def convert_markup_to_tei(text: str) -> str:
 
     text = re.sub(r"(<lb/>[\s\n]*)+</hi>", r"</hi>", text)
     text = re.sub(r"<lb/>[\s\n]*<pb", r"<pb", text)
-    text = re.sub(r"(\n)<pb/>[\s]*</hi>", r"</hi>\1<pb/>", text)
+    # Inline hi must close before page breaks (<pb/></hi> often when small/head spans a page).
+    text = re.sub(r"<pb/>\s*</hi>", r"</hi>\n<pb/>", text)
     text = re.sub(r"\n(</hi>)", r"\1\n", text)
     text = re.sub(r'(<hi rend="[^"]+">)\n<lb/>', r"\n<lb/>\1", text)
     text = re.sub(r"<lb/> +", r"<lb/>", text)
@@ -621,7 +452,7 @@ def save_checkpoint(file_path: str):
 
 
 def get_ve_ids_from_toprocess():
-    f"""Collect VE IDs from toprocess folders named {IE_ID}-VE*."""
+    """Collect VE IDs from toprocess folders."""
     ve_ids = []
     if not TOPROCESS_DIR.exists():
         return ve_ids
@@ -738,20 +569,30 @@ def convert_pdf_to_tei(pdf_path: Path, ve_id: str, sequence: int) -> str:
         logger.warning(f"Source DOC file not found for {pdf_path.name}, using PDF for SHA256")
         source_path = pdf_path
 
-    raw_text = extract_pdf_to_text(pdf_path)
+    raw_text = extract_pdf_to_text(
+        pdf_path,
+        PDF_EXTRACTOR,
+        crop_top=CROP_TOP_FRACTION,
+        crop_bottom=CROP_BOTTOM_FRACTION,
+    )
     if not raw_text:
         raise ValueError(f"No text extracted from {pdf_path.name}")
 
     simplified_text = simplify_font_sizes(raw_text)
 
-    logger.info("    Applying normalization...")
-    normalized_text = normalize_unicode(simplified_text)
+    if ENABLE_NORMALIZATION:
+        logger.info("    Applying normalization...")
+        normalized_text = normalize_unicode(simplified_text)
+    else:
+        # Still strip Wingdings PUA when full normalization is off (font artefact only).
+        normalized_text = remove_wingdings_private_use(simplified_text)
 
-    #normalized_text = fix_mixed_dedris_patterns(normalized_text)
-    normalized_text = fix_toc_leader_dots(normalized_text)
-    normalized_text = fix_pdf_latin_mojibake(normalized_text)
+    # normalized_text = fix_toc_leader_dots(normalized_text)
 
-    classifications = classify_font_sizes(normalized_text)
+    if ENABLE_FONT_CLASSIFICATION:
+        classifications = classify_font_sizes(normalized_text)
+    else:
+        classifications = {}
 
     if classifications:
         marked_text = apply_font_markup(normalized_text, classifications)
@@ -760,11 +601,10 @@ def convert_pdf_to_tei(pdf_path: Path, ve_id: str, sequence: int) -> str:
 
     tei_body = convert_markup_to_tei(marked_text)
 
-    tei_body = fix_hi_tag_spacing(tei_body)
+    #if ENABLE_NORMALIZATION:
+    #    tei_body = fix_hi_tag_spacing(tei_body)
 
     tei_body = post_process_body(tei_body)
-    tei_body = strip_pb_standalone_page_number_line(tei_body)
-    tei_body = dedupe_consecutive_lines(tei_body)
 
     lines = tei_body.split("\n")
     filtered_lines = []
@@ -826,8 +666,8 @@ def copy_sources_to_output(ve_id: str, pdf_files: list):
 
 
 def _resolve_ve_for_single(explicit_ve: Optional[str]) -> Optional[str]:
-    f"""
-    For a PDF directly in sources/*.pdf (no subfolder): use --ve, or one {IE_ID}-VE* in toprocess.
+    """
+    For a PDF directly in sources/*.pdf (no subfolder): use --ve, or one IE1KG25273-VE* in toprocess.
     toprocess is not used when the path is sources/<VE_ID>/file.pdf (volume from folder name).
     """
     if explicit_ve:
@@ -886,6 +726,7 @@ def convert_single_file(relative_path: str, ve_id: Optional[str], sequence: Opti
     ut_id = get_ut_id(ve_id, sequence)
 
     logger.info(f"Converting: {pdf_path.name}")
+    logger.info(f"  Extractor: {PDF_EXTRACTOR}")
     logger.info(f"  VE ID: {ve_id}")
     logger.info(f"  UT ID: {ut_id}")
 
@@ -920,6 +761,7 @@ def convert_all_files(
     """
     logger.info("=" * 60)
     logger.info(f"PDF to TEI XML Converter for {IE_ID}")
+    logger.info(f"Extractor: {PDF_EXTRACTOR}")
     if ve_filter:
         logger.info(f"Filtering: {ve_filter} only")
     logger.info(f"PDF Source: {SOURCES_DIR}")
@@ -948,8 +790,8 @@ def convert_all_files(
     total_files = sum(len(files) for files in pdf_by_ve.values())
     if not pdf_by_ve or total_files == 0:
         logger.error(
-            f"No PDF files found under sources/<VE_ID>/*.pdf. Put PDFs inside a volume folder "
-            f"(e.g. sources/VE1ER1021/) or use --assign-flat-toprocess with {IE_ID}-VE* in toprocess."
+            "No PDF files found under sources/<VE_ID>/*.pdf. Put PDFs inside a volume folder "
+            "(e.g. sources/VE1ER999/) or use --assign-flat-toprocess with IE1KG25273-VE* in toprocess."
         )
         return
 
@@ -957,8 +799,6 @@ def convert_all_files(
         f"PDFs under {SOURCES_DIR}: {total_files} file(s) -> {len(pdf_by_ve)} volume(s): "
         f"{natsorted(pdf_by_ve.keys())}"
     )
-
-    reset_stats()
 
     checkpoints = load_checkpoints()
     logger.info(f"Existing checkpoint entries: {len(checkpoints)}")
@@ -1018,21 +858,30 @@ def convert_all_files(
     logger.info(f"  Output: {OUTPUT_DIR}")
     logger.info("=" * 60)
 
-    print_conversion_stats()
-    write_stats_file(OUTPUT_DIR / "pdf_conversion_stats.txt")
-
 
 def main():
     parser = argparse.ArgumentParser(
-        description="IE2KG234648: Convert sources/*.pdf and sources/<VE>/**/*.pdf to TEI XML (pytiblegenc)"
+        description=(
+            "IE1KG25273: Convert sources/*.pdf and sources/<VE>/**/*.pdf to TEI XML "
+            "(PyMuPDF rawdict or pytiblegenc pdf_to_txt)"
+        )
+    )
+    parser.add_argument(
+        "--extractor",
+        choices=["pymupdf", "pytiblegenc"],
+        default="pymupdf",
+        help=(
+            "PDF text extraction backend: pymupdf = MuPDF rawdict line breaks (default); "
+            "pytiblegenc = same pdf_to_txt options as IE3KG664 / Desktop SRC_CODE"
+        ),
     )
     parser.add_argument(
         "--single",
         "-s",
         metavar="PATH",
-        help="One PDF path under sources/ (e.g. file.pdf or VE1ER1021/file.pdf; --ve if ambiguous)",
+        help="One PDF path under sources/ (e.g. file.pdf or VE1ER999/TI596-01-001.pdf; --ve if ambiguous)",
     )
-    parser.add_argument("--ve", metavar="VE_ID", help="VE ID (e.g. VE1ER1021) or filter batch to this VE")
+    parser.add_argument("--ve", metavar="VE_ID", help="VE ID (e.g. VE1ER999) or filter batch to this VE")
     parser.add_argument(
         "--sequence",
         type=int,
@@ -1040,15 +889,12 @@ def main():
         metavar="N",
         help="UT sequence for --single (default: next after max in archive)",
     )
-    parser.add_argument(
-        "--no-decode-quality-gate",
-        action="store_true",
-        help="Disable Phase 2 Tibetan decode check and TT-cmap-first retry",
-    )
+    parser.add_argument("--no-font-tags", action="store_true", help="Disable font classification")
+    parser.add_argument("--no-normalization", action="store_true", help="Disable Unicode normalization")
     parser.add_argument(
         "--assign-flat-toprocess",
         action="store_true",
-        help=f"Also assign sources/*.pdf (root) across {IE_ID}-VE* folders in toprocess (default: ignore root PDFs)",
+        help="Also assign sources/*.pdf (root) across IE1KG25273-VE* folders in toprocess (default: ignore root PDFs)",
     )
     parser.add_argument(
         "--crop-top",
@@ -1056,9 +902,9 @@ def main():
         default=None,
         metavar="FRAC",
         help=(
-            "Fraction of page height to strip from the TOP (running header). "
-            "E.g. 0.08 removes the top 8%%. Overrides config.CROP_HEADER_FRACTION. "
-            "Requires pymupdf (pip install pymupdf)."
+            "Fraction of page height to physically redact at the TOP (running header). "
+            "E.g. 0.08 blanks the top 8%% and removes text there. Overrides config.CROP_HEADER_FRACTION. "
+            "Used for both extractors (redacted temp PDF; pip install pymupdf)."
         ),
     )
     parser.add_argument(
@@ -1067,22 +913,37 @@ def main():
         default=None,
         metavar="FRAC",
         help=(
-            "Fraction of page height to strip from the BOTTOM (running footer). "
-            "E.g. 0.07 removes the bottom 7%%. Overrides config.CROP_FOOTER_FRACTION. "
-            "Requires pymupdf (pip install pymupdf)."
+            "Fraction of page height to physically redact at the BOTTOM (running footer). "
+            "E.g. 0.07 blanks the bottom 7%% and removes text there. Overrides config.CROP_FOOTER_FRACTION. "
+            "Used for both extractors (redacted temp PDF; pip install pymupdf)."
         ),
     )
     args = parser.parse_args()
 
-    global ENABLE_DECODE_QUALITY_GATE
-    global CROP_TOP_FRACTION, CROP_BOTTOM_FRACTION
+    if args.extractor == "pytiblegenc" and not PYTIBLEGENC_AVAILABLE:
+        parser.error(
+            "pytiblegenc is not installed. pip install git+https://github.com/buda-base/py-tiblegenc.git"
+        )
+    if args.extractor == "pymupdf" and not PYMUPDF_AVAILABLE:
+        parser.error("PyMuPDF is not installed. pip install pymupdf")
 
-    if args.no_decode_quality_gate:
-        ENABLE_DECODE_QUALITY_GATE = False
+    global PDF_EXTRACTOR
+    PDF_EXTRACTOR = args.extractor
+
+    global ENABLE_FONT_CLASSIFICATION, ENABLE_NORMALIZATION
+    global CROP_TOP_FRACTION, CROP_BOTTOM_FRACTION
+    if args.no_font_tags:
+        ENABLE_FONT_CLASSIFICATION = False
+    if args.no_normalization:
+        ENABLE_NORMALIZATION = False
 
     if args.crop_top is not None:
+        if not 0.0 <= args.crop_top < 0.5:
+            parser.error("--crop-top must be between 0.0 and 0.49")
         CROP_TOP_FRACTION = args.crop_top
     if args.crop_bottom is not None:
+        if not 0.0 <= args.crop_bottom < 0.5:
+            parser.error("--crop-bottom must be between 0.0 and 0.49")
         CROP_BOTTOM_FRACTION = args.crop_bottom
 
     if args.single:
