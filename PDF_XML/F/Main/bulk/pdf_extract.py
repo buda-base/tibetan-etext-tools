@@ -209,13 +209,10 @@ def _is_phantom_space(char_obj: dict, prev_char_obj: dict | None) -> bool:
 # table that maps Tibetan vowel glyph slots to Latin Extended codepoints.
 # Verified by rasterising affected pages and comparing against extracted chars.
 #
-#   U+0140  ŀ  (l with middle dot)  →  U+0F7C  ོ  (Tibetan vowel sign O)
-#   U+0132  Ĳ  (IJ digraph)         →  U+0F7A  ེ  (Tibetan vowel sign E)
 #   U+0128  Ĩ  (I with tilde)       →  U+0F72  ི  (Tibetan vowel sign I)
 # ---------------------------------------------------------------------------
 _MONLAM_GLYPH_CORRECTIONS: dict[str, str] = {
-    "\u0140": "\u0F7C",  # ŀ → ོ
-    "\u0132": "\u0F7A",  # Ĳ → ེ
+
     "\u0128": "\u0F72",  # Ĩ → ི
 }
 
