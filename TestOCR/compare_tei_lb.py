@@ -12,18 +12,32 @@ ordered diff on the remainder (same as legacy inner logic).
 Legacy mode (``ALIGN_PAGES_BY_INDEX_ONLY = False``): similarity-based page
 alignment, then multiset + ordered line diff (can pair different page indices).
 
+**Position-stable correction dataset** (``WRITE_CORRECTION_DATASET``): for each
+differing line pair, Tibetan tokens are aligned with a Levenshtein backtrace on
+token sequences (same tokenization as legacy snippets). Only **substitutions**
+(both sides non-empty, tokens differ) are written, keyed by
+``(page_index, line_index, aligned_index)`` plus ``left_token_index`` (0-based
+index into ``tokenize_line_text(left)``). Use ``left_token_index`` for
+``replace_diff.py``; ``aligned_index`` is the Levenshtein alignment column.
+
 ``left_value`` / ``right_value`` use ``normalize_for_compare`` (``<hi>`` unwrapped).
-CSV cells use ``format_diff_snippets``: **one row per** token-level
+Legacy CSV cells use ``format_diff_snippets``: **one row per** token-level
 ``replace``/``delete``/``insert``, each with one neighbor token before/after when
-present (same line only). Columns ``line_left`` / ``line_right`` are 1-based
-indices of the ``<lb/>`` segment within its page block (from ``split_lb_units``).
-``page_left`` / ``page_right`` use 0-based page-block indices (one less than a
-naive count of split segments) so a leading ``<pb/>`` does not shift folio numbers.
+present (same line only). Columns ``line_left`` / ``line_right`` are 0-based
+indices of the ``<lb/>`` segment within its page block (from ``split_lb_units``),
+matching ``page_*``: a leading ``<lb/>`` on each page adds an extra first segment.
+``page_left`` / ``page_right`` use the same 0-based convention for page blocks
+and a leading ``<pb/>``.
+
+
+Usage:
+  python compare_tei_lb.py
 """
 
 from __future__ import annotations
 
 import csv
+import json
 import logging
 import re
 from collections import defaultdict, deque
@@ -35,9 +49,8 @@ from lxml.etree import strip_tags
 
 # --- set your inputs here ---
 PATH_XML_LEFT = Path(r"D:\Work\OpenPecha\conversion\IE3KG694\IE3KG694_output\archive\VE1ER1074\UT1ER1074_0001.xml")  # e.g. PyMuPDF output
-PATH_XML_RIGHT = Path(r"D:\Work\OpenPecha\conversion\IE3KG694\IE3KG694_output\archive\VE1ER1074\UT1ER1074_0004.xml")  # e.g. Tesseract output
-OUTPUT_CSV = Path(r"D:\Work\OpenPecha\conversion\IE3KG694\lb_diff_pairs.csv")
-# python compare_tei_lb.py
+PATH_XML_RIGHT = Path(r"D:\Work\OpenPecha\conversion\IE3KG694\IE3KG694_output\archive\VE1ER1074\UT1ER1074_0008.xml")  # e.g. Tesseract output
+OUTPUT_CSV = Path(r"D:\Work\OpenPecha\conversion\IE3KG694\IE3KG694_output\archive\VE1ER1074\lb_diff_pairs.csv")
 
 # If True, only compare text inside <body>...</body> when those tags exist.
 USE_BODY_ONLY = True
@@ -59,6 +72,17 @@ WARN_ON_LB_COUNT_MISMATCH_PER_PAGE = True
 
 # Hard cap per cell (characters); longer snippets get a middle ellipsis.
 DIFF_SNIPPET_MAX_CHARS = 200
+
+# Position-stable correction dataset (token alignment + aligned_index per line).
+OUTPUT_CORRECTION_CSV = OUTPUT_CSV.with_name(
+    OUTPUT_CSV.stem + "_correction_dataset.csv"
+)
+# If True, write legacy left_value/right_value snippet rows to OUTPUT_CSV.
+WRITE_LEGACY_LB_CSV = True
+# If True, write page_index, line_index, aligned_index, left_token, right_token.
+WRITE_CORRECTION_DATASET = True
+# If True, add a JSON array column left_context (debug only; not for matching).
+INCLUDE_LEFT_CONTEXT_IN_CORRECTION_CSV = False
 
 _PB_SPLIT = re.compile(r"<pb\s*/>", re.IGNORECASE)
 _LB_SPLIT = re.compile(r"<lb\s*/>", re.IGNORECASE)
@@ -219,14 +243,160 @@ def _page_cell(idx: int | None) -> str:
 
 
 def _line_cell(idx: int | None) -> str:
-    """1-based <lb/> line index within its page for CSV; empty if no line."""
+    """0-based ``<lb/>`` segment index within its page for CSV; empty if no line.
+
+    When each page starts with ``<lb/>``, ``split_lb_units`` has an extra first
+    segment (same idea as ``_page_cell``). We use ``idx`` not ``idx + 1`` so the
+    first real line of each page is not shifted to ``2``.
+    """
     if idx is None:
         return ""
-    return str(idx + 1)
+    return str(idx)
 
 
 def _token_spans(s: str) -> list[tuple[int, int]]:
     return [(m.start(), m.end()) for m in _TOKEN_SPAN.finditer(s)]
+
+
+def tokenize_line_text(segment: str) -> list[str]:
+    """
+    Tibetan “word” tokens for one ``<lb/>`` segment: normalized plain text, then
+    ``_TOKEN_SPAN`` runs (same tokenization as ``format_diff_snippets``).
+    """
+    text = normalize_for_compare(segment)
+    return [text[a:b] for a, b in _token_spans(text)]
+
+
+def _levenshtein_token_alignment_slots(
+    left_toks: list[str],
+    right_toks: list[str],
+    start_ai: int,
+) -> tuple[list[tuple[int, int | None, int | None, str | None, str | None]], int]:
+    """
+    Ordered alignment columns via Levenshtein backtrace on token sequences.
+
+    Each tuple is
+    ``(aligned_index, left_token_index_or_none, right_token_index_or_none,
+       left_token_or_none, right_token_or_none)``.
+    ``aligned_index`` increases by one per column (match / substitute / insert /
+    delete) in path order. Indices refer to positions in ``left_toks`` /
+    ``right_toks``.
+    """
+    n, m = len(left_toks), len(right_toks)
+    if n == 0 and m == 0:
+        return [], start_ai
+    # dp[i][j] = min cost to align left[:i] with right[:j]
+    inf = n + m + 5
+    dp = [[inf] * (m + 1) for _ in range(n + 1)]
+    for i in range(n + 1):
+        dp[i][0] = i
+    for j in range(m + 1):
+        dp[0][j] = j
+    for i in range(1, n + 1):
+        for j in range(1, m + 1):
+            best = inf
+            if i > 0 and j > 0:
+                sub = 0 if left_toks[i - 1] == right_toks[j - 1] else 1
+                best = min(best, dp[i - 1][j - 1] + sub)
+            if i > 0:
+                best = min(best, dp[i - 1][j] + 1)
+            if j > 0:
+                best = min(best, dp[i][j - 1] + 1)
+            dp[i][j] = best
+    # Backtrace from (n, m); collect ops in reverse.
+    ops: list[tuple[str, int | None, int | None]] = []
+    i, j = n, m
+    while i > 0 or j > 0:
+        if i > 0 and j > 0:
+            sub = 0 if left_toks[i - 1] == right_toks[j - 1] else 1
+            if dp[i][j] == dp[i - 1][j - 1] + sub:
+                ops.append(("diag", i - 1, j - 1))
+                i, j = i - 1, j - 1
+                continue
+        if i > 0 and dp[i][j] == dp[i - 1][j] + 1:
+            ops.append(("up", i - 1, None))
+            i -= 1
+            continue
+        if j > 0 and dp[i][j] == dp[i][j - 1] + 1:
+            ops.append(("left", None, j - 1))
+            j -= 1
+            continue
+        # Prefer diagonal on ties (stable path).
+        if i > 0 and j > 0:
+            ops.append(("diag", i - 1, j - 1))
+            i, j = i - 1, j - 1
+            continue
+        if i > 0:
+            ops.append(("up", i - 1, None))
+            i -= 1
+            continue
+        ops.append(("left", None, j - 1))
+        j -= 1
+    ops.reverse()
+    slots: list[tuple[int, int | None, int | None, str | None, str | None]] = []
+    ai = start_ai
+    for kind, li, rj in ops:
+        if kind == "diag":
+            assert li is not None and rj is not None
+            slots.append(
+                (ai, li, rj, left_toks[li], right_toks[rj])
+            )
+            ai += 1
+        elif kind == "up":
+            assert li is not None
+            slots.append((ai, li, None, left_toks[li], None))
+            ai += 1
+        else:
+            assert rj is not None
+            slots.append((ai, None, rj, None, right_toks[rj]))
+            ai += 1
+    return slots, ai
+
+
+def substitution_rows_for_line_segments(
+    left_segment: str,
+    right_segment: str,
+    *,
+    page_index: int,
+    line_index: int,
+    include_left_context: bool,
+) -> list[dict[str, int | str]]:
+    """
+    Sequence-align LEFT vs RIGHT tokens for one line pair; return one dict per
+    **substitution** (both sides non-empty and tokens differ).
+
+    ``aligned_index`` is the 0-based column index in the aligned sequence for this
+    line (counts equal, insert, delete, and substitute columns in order).
+    """
+    tl = tokenize_line_text(left_segment)
+    tr = tokenize_line_text(right_segment)
+    slots, _ = _levenshtein_token_alignment_slots(tl, tr, 0)
+    rows: list[dict[str, int | str]] = []
+    for aligned_index, _li, _rj, ltok, rtok in slots:
+        if ltok is None or rtok is None:
+            continue
+        if ltok == rtok:
+            continue
+        row: dict[str, int | str] = {
+            "page_index": page_index,
+            "line_index": line_index,
+            "aligned_index": aligned_index,
+            # Index into ``tokenize_line_text(left_segment)`` (left token column).
+            # Use this for deterministic replacement; ``aligned_index`` is the
+            # Levenshtein alignment column and may differ when inserts/deletes occur.
+            "left_token_index": int(_li),
+            "left_token": ltok,
+            "right_token": rtok,
+        }
+        if include_left_context and _li is not None:
+            i = _li
+            ctx = []
+            for d in (-2, -1, 0, 1, 2):
+                j = i + d
+                ctx.append(tl[j] if 0 <= j < len(tl) else "")
+            row["left_context"] = json.dumps(ctx, ensure_ascii=False)
+        rows.append(row)
+    return rows
 
 
 def _span_idx_for_pos(spans: list[tuple[int, int]], pos: int) -> int:
@@ -447,27 +617,25 @@ def compare_pages_by_index_then_diff_lb(
 def warn_lb_count_mismatches_per_page(
     pages_left: list[str],
     pages_right: list[str],
-    left_label: Path,
-    right_label: Path,
 ) -> None:
     """Emit a warning when raw ``<lb/>`` counts differ for the same page block index."""
     if not WARN_ON_LB_COUNT_MISMATCH_PER_PAGE:
         return
     n = min(len(pages_left), len(pages_right))
+    mismatch_pages = 0
     for i in range(n):
         c_l = count_lb_tags(pages_left[i])
         c_r = count_lb_tags(pages_right[i])
         if c_l != c_r:
+            mismatch_pages += 1
             logger.warning(
-                "<lb/> count mismatch on page block index %s (same as CSV "
-                "page_left / page_right): left %s has %d <lb/>, "
-                "right %s has %d <lb/>",
-                i,
-                left_label,
-                c_l,
-                right_label,
-                c_r,
+                f"<lb/> count mismatch on page block index {i}: left has {c_l} <lb/>, "
+                f"right {c_r} <lb/>"
             )
+    if mismatch_pages:
+        logger.warning(
+            f"Total page block(s) with <lb/> count mismatch: {mismatch_pages}"
+        )
 
 
 def _diff_lb_units_sequence(
@@ -687,19 +855,12 @@ def main() -> None:
     if n_pages_left != n_pages_right:
         delta = n_pages_left - n_pages_right
         logger.warning(
-            "Page block count mismatch (split on <pb/> in <body>): "
-            "left %s has %d blocks, right %s has %d blocks "
-            "(difference left - right: %+d)",
-            PATH_XML_LEFT,
-            n_pages_left,
-            PATH_XML_RIGHT,
-            n_pages_right,
-            delta,
+            f"Page block count mismatch (split on <pb/> in <body>): "
+            f"left has {n_pages_left} blocks, right has {n_pages_right} blocks "
+            f"(difference left - right: {delta:+d})"
         )
 
-    warn_lb_count_mismatches_per_page(
-        pages_left, pages_right, PATH_XML_LEFT, PATH_XML_RIGHT
-    )
+    warn_lb_count_mismatches_per_page(pages_left, pages_right)
 
     if ALIGN_PAGES_BY_INDEX_ONLY:
         if ALIGN_LB_BY_INDEX_ONLY:
@@ -743,28 +904,71 @@ def main() -> None:
         ratio_msg = f"similarity page-sequence ratio: {page_sm.ratio():.4f}"
 
     OUTPUT_CSV.parent.mkdir(parents=True, exist_ok=True)
-    with OUTPUT_CSV.open("w", encoding="utf-8", newline="") as f:
-        w = csv.writer(f)
-        w.writerow(
-            [
-                "left_value",
-                "right_value",
-                "page_left",
-                "line_left",
-                "page_right",
-                "line_right",
-            ]
-        )
-        written = 0
-        for left, right, pL, linL, pR, linR in rows:
-            for sl, sr in format_diff_snippets(left, right):
-                w.writerow([sl, sr, pL, linL, pR, linR])
-                written += 1
 
-    print(
-        f"Wrote {written} row(s) from {len(rows)} differing line pair(s) to "
-        f"{OUTPUT_CSV.resolve()} ({ratio_msg})"
-    )
+    def _parse_csv_int(s: str, default: int = -1) -> int:
+        if s is None or str(s).strip() == "":
+            return default
+        return int(str(s).strip())
+
+    written_legacy = 0
+    if WRITE_LEGACY_LB_CSV:
+        with OUTPUT_CSV.open("w", encoding="utf-8", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(
+                [
+                    "left_value",
+                    "right_value",
+                    "page_left",
+                    "line_left",
+                    "page_right",
+                    "line_right",
+                ]
+            )
+            for left, right, pL, linL, pR, linR in rows:
+                for sl, sr in format_diff_snippets(left, right):
+                    w.writerow([sl, sr, pL, linL, pR, linR])
+                    written_legacy += 1
+
+    written_correction = 0
+    if WRITE_CORRECTION_DATASET:
+        fieldnames = [
+            "page_index",
+            "line_index",
+            "aligned_index",
+            "left_token_index",
+            "left_token",
+            "right_token",
+        ]
+        if INCLUDE_LEFT_CONTEXT_IN_CORRECTION_CSV:
+            fieldnames.append("left_context")
+        with OUTPUT_CORRECTION_CSV.open("w", encoding="utf-8", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+            w.writeheader()
+            for left, right, pL, linL, _pR, _linR in rows:
+                pi = _parse_csv_int(pL, default=-1)
+                li = _parse_csv_int(linL, default=-1)
+                for row in substitution_rows_for_line_segments(
+                    left or "",
+                    right or "",
+                    page_index=pi,
+                    line_index=li,
+                    include_left_context=INCLUDE_LEFT_CONTEXT_IN_CORRECTION_CSV,
+                ):
+                    w.writerow(row)
+                    written_correction += 1
+
+    if WRITE_LEGACY_LB_CSV:
+        print(
+            f"Wrote {written_legacy} legacy row(s) from {len(rows)} differing "
+            f"line pair(s) to {OUTPUT_CSV.resolve()} ({ratio_msg})"
+        )
+    if WRITE_CORRECTION_DATASET:
+        print(
+            f"Wrote {written_correction} correction substitution row(s) "
+            f"(aligned_index + left_token_index) to {OUTPUT_CORRECTION_CSV.resolve()} ({ratio_msg})"
+        )
+    if not WRITE_LEGACY_LB_CSV and not WRITE_CORRECTION_DATASET:
+        print("No CSV output (both WRITE_LEGACY_LB_CSV and WRITE_CORRECTION_DATASET are False).")
 
 
 if __name__ == "__main__":
