@@ -180,44 +180,50 @@ def process_annotations(text: str) -> str:
     """
     result = text
     
-    # Process Derge milestones {D###} or {D###-#}
-    # These should become milestones, not choice elements
+    # Process Derge milestones {D###} or {D###a} or {D###-#}
+    # Handles numeric suffixes like {D7a}, {D539b}, {D1059a}, etc.
     result = re.sub(
-        r'\{(D\d+(?:-\d+)?)\}',
+        r'\{(D\d+[a-z]*(?:-\d+)?)\}',
         r'<milestone xml:id="\1" unit="section"/>',
         result
     )
     
-    # Process variant annotations {X,Y} (with comma, but NOT Derge markers)
-    # Must be careful not to match already processed milestones
+    # Handle (A,{B,C}) nested annotations: error correction whose correction is
+    # itself a variant. Collapse to <choice><orig>A</orig><reg>C</reg></choice>,
+    # discarding the intermediate B (the inner "orig" of the variant).
+    def replace_error_with_variant(match):
+        orig = match.group(1)
+        reg = match.group(3)
+        return f'<choice><orig>{orig}</orig><reg>{reg}</reg></choice>'
+
+    result = re.sub(
+        r'\(([^)]+),\{([^},]+),([^}]+)\}\)',
+        replace_error_with_variant,
+        result
+    )
+
+    # Process variant annotations {X,Y} (with comma, but NOT Derge markers).
+    # Do NOT call escape_xml on matched content: the text is Tibetan Unicode
+    # (no XML special chars).
     def replace_variant(match):
         orig = match.group(1)
         reg = match.group(2)
-        orig_escaped = escape_xml(orig)
-        reg_escaped = escape_xml(reg)
-        return f'<choice><orig>{orig_escaped}</orig><reg>{reg_escaped}</reg></choice>'
-    
+        return f'<choice><orig>{orig}</orig><reg>{reg}</reg></choice>'
+
     result = re.sub(
         r'\{([^}D][^},]*),([^}]+)\}',
         replace_variant,
         result
     )
-    
-    # Also handle {X,Y} where X starts with a Tibetan character (not D)
-    result = re.sub(
-        r'\{([^\x00-\x7F][^},]*),([^}]+)\}',
-        replace_variant,
-        result
-    )
-    
-    # Process error annotations (X,Y)
+
+    # Process error annotations (X,Y).
+    # Same reasoning: do not escape content that may already be XML from an
+    # inner {X,Y} substitution (e.g. source has "(མྱད་,{མྱེད་,མེད་})").
     def replace_error(match):
         orig = match.group(1)
         corr = match.group(2)
-        orig_escaped = escape_xml(orig)
-        corr_escaped = escape_xml(corr)
-        return f'<choice><orig>{orig_escaped}</orig><corr>{corr_escaped}</corr></choice>'
-    
+        return f'<choice><orig>{orig}</orig><corr>{corr}</corr></choice>'
+
     result = re.sub(
         r'\(([^)]+),([^)]+)\)',
         replace_error,
@@ -227,10 +233,10 @@ def process_annotations(text: str) -> str:
     # Process [X] error candidates - brackets containing Tibetan/non-ASCII text
     # These are inline error markers, NOT page markers (which are handled earlier)
     # Match [content] where content contains Tibetan Unicode (U+0F00-U+0FFF)
+    # Do NOT escape content: it may already contain XML from prior (X,Y) substitutions.
     def replace_unclear(match):
         content = match.group(1)
-        content_escaped = escape_xml(content)
-        return f'<unclear reason="illegible">{content_escaped}</unclear>'
+        return f'<unclear reason="illegible">{content}</unclear>'
     
     # Match brackets containing Tibetan characters (U+0F00-U+0FFF range)
     # This will NOT match page markers like [1a] which only have ASCII

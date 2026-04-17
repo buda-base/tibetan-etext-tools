@@ -35,7 +35,5 @@ def remove_non_tibetan(text: str) -> str:
     # Remove patterns like -1-, -2-, -123-, etc.
     tibetan_only = re.sub(r'-\d+-', '', tibetan_only)
     
-    # Remove ONLY: angle brackets < >, periods ., currency sign ¤, diaeresis ¨, and pound sign £
-    #tibetan_only = re.sub(r'[<>.¨£]', '', tibetan_only)
     
     return tibetan_only
