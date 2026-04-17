@@ -10,13 +10,13 @@ import argparse
 REMOVE IMAGES FROM DOC FILES AND CONVERT TO RTF
 
 Simple command (using default settings):
-python IE00KG02\doc_to_rtf\doc_to_rtf.py
+python \doc_to_rtf\doc_to_rtf.py
 With custom base directory for IE00KG02:
-python IE00KG02\doc_to_rtf\doc_to_rtf.py --base-dir "D:\monlam_dharmaduta\convert3\IE00KG02\sources"
+python \doc_to_rtf\doc_to_rtf.py --base-dir "D:\monlam_dharmaduta\convert3\IE00KG02\sources"
 If you want to process a specific volume:
-python IE00KG02\doc_to_rtf\doc_to_rtf.py --base-dir "D:\monlam_dharmaduta\convert3\IE00KG02\sources" --volume volume_001
+python \doc_to_rtf\doc_to_rtf.py --base-dir "D:\monlam_dharmaduta\convert3\IE00KG02\sources" --volume volume_001
 With custom checkpoint and log files:
-python IE00KG02\doc_to_rtf\doc_to_rtf.py --base-dir "D:\monlam_dharmaduta\convert3\IE00KG02\sources" --checkpoint checkpoint.txt --log conversion.log
+python \doc_to_rtf\doc_to_rtf.py --base-dir "D:\monlam_dharmaduta\convert3\IE00KG02\sources" --checkpoint checkpoint.txt --log conversion.log
 
 '''
 # Word Constants
