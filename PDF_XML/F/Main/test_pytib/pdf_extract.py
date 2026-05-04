@@ -1,38 +1,3 @@
-"""
-PDF text extraction for Monlam-font PDFs: PyMuPDF ``rawdict`` or ``pytiblegenc.pdf_to_txt``.
-
-Line breaks are layout-level (one ``\\n`` per extractor line); ``PAGE_BREAK_STR`` marks pages.
-
-Fixes applied (all in the PyMuPDF path):
-  1. Phantom space detection rule corrected  (space_x < prev_x + threshold, not < next_x)
-  2. WinAnsi vowel glyph mis-mappings fixed  (ŀ→ོ, Ĳ→ེ, Ĩ→ི)
-  3. Phantom space check threaded across span boundaries within a line
-  4. Epsilon tolerance for near-zero-advance phantom spaces from WinAnsi vowel spans
-  5. Duplicate text-layer deduplication for InDesign-generated PDFs (PyMuPDF path)
-  6. Duplicate line deduplication for pytiblegenc path — InDesign PDFs produced via
-     two different workflows both embed duplicate text layers, but with different
-     interleaving patterns that require a sliding-window approach:
-
-     a) PScript5/Acrobat Distiller (e.g. TI1047): every line is duplicated 2× at
-        identical y-coordinates → pdfminer emits consecutive pairs (A A B B …).
-
-     b) Adobe PDF Library / InDesign CS4 drop-shadow (e.g. TI1259): every line is
-        duplicated 4× at slightly different y-coordinates → pdfminer interleaves them
-        in y-order, producing an A A A B A B B C B C C D pattern. Consecutive dedup
-        fails here because duplicates are separated by other lines.
-
-     Both cases are handled by a sliding-window dedup: a line is suppressed if its
-     content appeared anywhere in the preceding _DEDUP_WINDOW_SIZE lines.
-
-  7. Legacy font name alias injection — PDFs from PageMaker / older InDesign embed
-     font names without spaces (e.g. "TCRCYoutso") while pytiblegenc's conversion
-     tables key on spaced names ("TCRC Youtso"). Without the alias the font is
-     unrecognised and raw legacy encoding bytes pass straight through to the XML.
-     The alias map is built dynamically from pytiblegenc's own loaded tables so it
-     stays in sync if the package is updated.
-     Affected font families: TCRC Youtso, TCRC Youtsoweb, TCRC Bod-Yig,
-     Tibetisch dBu-can, Tibetisch dBu-can Overstrike (and any future spaced names).
-"""
 
 from __future__ import annotations
 
@@ -79,6 +44,7 @@ logger = logging.getLogger(__name__)
 
 PAGE_BREAK_STR = "ZZZZ"
 _FONT_SIZE_FORMAT = "<fs:{}>"
+_FS_TAG_RE = re.compile(r"<fs:\d+>")
 
 # ---------------------------------------------------------------------------
 # Fix 7 — Legacy font name alias map
@@ -96,6 +62,120 @@ _FONT_SIZE_FORMAT = "<fs:{}>"
 # The map is built lazily at first use (avoids import-time cost) and cached.
 # ---------------------------------------------------------------------------
 _FONT_NAME_ALIASES: dict[str, str] | None = None
+
+
+# ---------------------------------------------------------------------------
+# Fix 8 — TibetanChogyal missing-cid patch
+#
+# PDFs typeset with TibetanChogyal use a custom font subset where 8 cids
+# (2–9) are assigned to glyph slots that pdfminer cannot decode via the
+# WinAnsiEncoding Differences array.  Each cid maps to a /gNN glyph name
+# (e.g. cid=2 → /g98) — a non-standard numeric name that neither pdfminer's
+# EncodingDB nor the Adobe Glyph List can resolve.  The result is that
+# pdfminer raises PDFUnicodeNotDefined for these cids, DuffedTextConverter
+# converts them to the string "(cid:N)", and convert_string() strips that
+# string → the glyph is silently dropped from the output.
+#
+# The correct Unicode for each cid was determined by:
+#   • cid=2,3,5  — user visual confirmation of glyph crops rendered at 250 dpi
+#   • cid=4      — exhaustive context analysis across all 21 occurrences
+#                  (always in పaNchen / crown / Sanskrit-ṇa contexts)
+#   • cid=6,7,9  — same-font outline-hash matching: each shares its outline
+#                  with a sibling cid that pdfminer decodes correctly
+#   • cid=8      — glyph index 208 is out-of-range for this 182-glyph subset;
+#                  maps to empty string (zero-width, renders nothing)
+#
+# Occurrence counts across the full 631-page body of TI904-01-001.pdf:
+#   cid=2 சྤྱ  916 ·  cid=3 ག  227 ·  cid=4 ཎ  21 ·  cid=5 དྭ  13
+#   cid=6 ད    2  ·  cid=7 ཀ    2  ·  cid=8 ''   4  ·  cid=9 ཿ   2
+#
+# Fix: before starting the pdfminer interpreter loop, walk every font resource
+# on every page and, for any TibetanChogyal font whose cid2unicode dict is
+# missing one of these cids, inject the correct Unicode string directly.
+# This happens at the PDFFont object level so no pytiblegenc code is touched.
+# ---------------------------------------------------------------------------
+
+# Maps cid → Tibetan Unicode string for the 8 undecoded TibetanChogyal slots.
+_CHOGYAL_CID_PATCH: dict[int, str] = {
+    2: "\u0F66\u0FA4\u0FB1",  # སྤྱ  sa + pa-ta subscript + ya-ta subscript
+    3: "\u0F42",              # ག    ga (alternate glyph slot, same shape as cid=35)
+    4: "\u0F4E",              # ཎ    retroflex na (Sanskrit ṇa; e.g. པཎ་ཆེན་ Panchen)
+    5: "\u0F51\u0FAD",        # དྭ   da + wa-zur subscript
+    6: "\u0F51",              # ད    da  (alternate glyph slot, same shape as cid=43)
+    7: "\u0F40",              # ཀ    ka  (alternate glyph slot, same shape as cid=33)
+    8: "",                    # ''   glyph index out-of-range → zero-width, emit nothing
+    9: "\u0F7F",              # ཿ    visarga (alternate glyph slot, same shape as cid=239)
+}
+
+# Base font name (after stripping the random subset prefix "XXXXXX+") that
+# this patch applies to.  The Skt variants have different encodings and do
+# not exhibit this problem.
+_CHOGYAL_BASE_NAME = "TibetanChogyal"
+
+
+def _install_chogyal_cid_patch() -> None:
+    """
+    Monkey-patch ``pytiblegenc.pdfminer_text_converter.convert_string`` so that
+    ``(cid:N)`` strings produced by pdfminer for undecoded TibetanChogyal glyphs
+    are replaced with the correct Tibetan Unicode before pytiblegenc discards them.
+
+    Background
+    ----------
+    When pdfminer cannot resolve a cid to a unicode character it calls
+    ``handle_undefined_char(font, cid)`` which returns the string ``"(cid:N)"``.
+    That string is passed to ``convert_string()``.  The very first thing
+    ``convert_string`` does is::
+
+        if s.startswith("(cid:"):
+            return ""
+
+    so the character is silently dropped — **before** ``error_chr_fun`` is ever
+    called.  The only reliable interception point is ``convert_string`` itself.
+
+    This function wraps the module-level ``convert_string`` reference that
+    ``DuffedTextConverter.convert_item`` imports, so the patch is transparent to
+    all other callers.  It is idempotent: calling it twice has no effect.
+    """
+    if not PYTIBLEGENC_AVAILABLE:
+        return
+
+    try:
+        import pytiblegenc.pdfminer_text_converter as _ptc
+        from pytiblegenc.char_converter import convert_string as _orig_cs
+
+        # Idempotency guard
+        if getattr(_ptc, "_chogyal_cid_patch_installed", False):
+            return
+
+        def _patched_convert_string(
+            s: str,
+            font_name: str,
+            stats: dict,
+            error_chr_fun=None,
+            glyph_lookup=None,
+        ) -> "str | None":
+            # Intercept (cid:N) for TibetanChogyal before the original strips it.
+            if s.startswith("(cid:") and s.endswith(")"):
+                clean_font = (
+                    font_name.split("+", 1)[-1] if "+" in font_name else font_name
+                )
+                if clean_font == _CHOGYAL_BASE_NAME:
+                    try:
+                        cid = int(s[5:-1])
+                    except ValueError:
+                        pass
+                    else:
+                        replacement = _CHOGYAL_CID_PATCH.get(cid)
+                        if replacement is not None:
+                            return replacement
+            return _orig_cs(s, font_name, stats, error_chr_fun, glyph_lookup)
+
+        _ptc.convert_string = _patched_convert_string
+        _ptc._chogyal_cid_patch_installed = True
+        logger.debug("TibetanChogyal cid patch installed into convert_string")
+
+    except Exception as exc:
+        logger.warning("Could not install TibetanChogyal cid patch: %s", exc)
 
 
 def _get_font_name_aliases() -> dict[str, str]:
@@ -201,6 +281,7 @@ def extract_pdf_pytiblegenc(
     *,
     crop_top: float = 0.0,
     crop_bottom: float = 0.0,
+    extraction_dedup: bool = True,
 ) -> str:
     """
     Extract via pytiblegenc using the low-level API (DuffedTextConverter directly).
@@ -265,6 +346,13 @@ def extract_pdf_pytiblegenc(
         }
         output_string = StringIO()
 
+        # Fix 8: TibetanChogyal missing-cid patch.
+        # pdfminer cannot decode cids 2–9 of TibetanChogyal fonts because those
+        # cid slots use non-standard /gNN glyph names.  pdfminer emits "(cid:N)"
+        # which convert_string() strips silently.  _install_chogyal_cid_patch()
+        # wraps convert_string() once so those strings are resolved first.
+        _install_chogyal_cid_patch()
+
         with open(str(target_pdf), "rb") as in_file:
             parser = PDFParser(in_file)
             doc = PDFDocument(parser)
@@ -294,7 +382,8 @@ def extract_pdf_pytiblegenc(
             logger.debug("Handled fonts: %s", stats["handled_fonts"])
 
         # Fix 6: sliding-window dedup for InDesign duplicate text layers
-        text = _deduplicate_pytiblegenc_output(text, PAGE_BREAK_STR)
+        if extraction_dedup:
+            text = _deduplicate_pytiblegenc_output(text, PAGE_BREAK_STR)
 
         return text
 
@@ -369,7 +458,106 @@ def _correct_monlam_glyph(c: str) -> str:
     return _MONLAM_GLYPH_CORRECTIONS.get(c, c)
 
 
-def _extract_line_text(line: dict) -> list[str]:
+def _fix_monlam_span_text(text: str) -> str:
+    """Apply WinAnsi vowel fixes to a span string when MuPDF has no per-char bbox data."""
+    if not text:
+        return text
+    return "".join(_correct_monlam_glyph(ch) for ch in text)
+
+
+# Leading marks that belong on the previous syllable when PDF layout splits a line.
+_RE_TIBETAN_ORPHAN_LEADING = re.compile(
+    r"^[\u0F71\u0F72\u0F73\u0F74\u0F75\u0F76\u0F77\u0F78\u0F79"
+    r"\u0F7A\u0F7B\u0F7C\u0F7D\u0F7E\u0F7F\u0F80\u0F81\u0F82\u0F83"
+    r"\u0F93-\u0FBC]+"
+)
+
+
+def _plain_without_fs(s: str) -> str:
+    return _FS_TAG_RE.sub("", s) if s else ""
+
+
+def _prev_line_allows_tibetan_orphan_merge(prev_line: str) -> bool:
+    """True when the previous layout line ends in Tibetan and should absorb leading marks."""
+    plain = _plain_without_fs(prev_line).rstrip()
+    if not plain:
+        return False
+    # Do not glue into Latin-only lines (e.g. English copyright block).
+    return bool(re.search(r"[\u0F00-\u0FFF]$", plain))
+
+
+def _split_leading_tibetan_orphan_fs_aware(line: str) -> tuple[str, str]:
+    """
+    If *line* begins with Tibetan combining/subjoined marks (optionally after
+    leading ``<fs:N>`` tags), return (prefix_to_append_to_previous_line, remainder).
+    Otherwise ("", line).
+    """
+    if not line:
+        return "", line
+    plain = _plain_without_fs(line)
+    m = _RE_TIBETAN_ORPHAN_LEADING.match(plain)
+    if not m:
+        return "", line
+    expected = m.group(0)
+    taken: list[str] = []
+    i = 0
+    pos = 0  # index into expected
+    while i < len(line) and pos < len(expected):
+        mt = re.match(r"<fs:\d+>", line[i:])
+        if mt:
+            if pos == 0:
+                taken.append(mt.group(0))
+            i += len(mt.group(0))
+            continue
+        ch = line[i]
+        if ch == expected[pos]:
+            taken.append(ch)
+            pos += 1
+            i += 1
+        else:
+            return "", line
+    if pos != len(expected):
+        return "", line
+    return "".join(taken), line[i:]
+
+
+def _merge_orphan_tibetan_line_breaks(text: str) -> str:
+    """
+    Join lines where the PDF split a Tibetan stack across two MuPDF newlines.
+
+    Operates on the raw extractor stream (``<fs:N>`` tags and ``\\n`` only;
+    page breaks use ``PAGE_BREAK_STR``).
+    """
+    if not text or not text.strip():
+        return text
+    sep = f"\n{PAGE_BREAK_STR}\n"
+    pages = text.split(sep)
+    out_pages: list[str] = []
+
+    for page in pages:
+        lines = page.split("\n")
+        if not lines:
+            out_pages.append(page)
+            continue
+        merged: list[str] = [lines[0]]
+        for j in range(1, len(lines)):
+            curr = lines[j]
+            prev = merged[-1]
+            if not _prev_line_allows_tibetan_orphan_merge(prev):
+                merged.append(curr)
+                continue
+            prefix, rest = _split_leading_tibetan_orphan_fs_aware(curr)
+            if not prefix:
+                merged.append(curr)
+                continue
+            # Join the rest of this layout line onto the same row (PDF split before the vowel).
+            merged[-1] = prev + prefix + rest
+        out_pages.append("\n".join(merged))
+
+    return sep.join(out_pages)
+
+
+def _extract_line_text(line: dict, *, drop_phantom_spaces: bool = True) -> list[str]:
     """
     Extract text fragments from a single MuPDF ``line`` dict.
 
@@ -378,8 +566,9 @@ def _extract_line_text(line: dict) -> list[str]:
 
     Two Monlam/Dedris font artefacts are corrected:
 
-    Fix 1+4 — **Phantom spaces**: glyph-advance gaps materialised as U+0020 are
-    dropped when ``space_x < prev_x + _PHANTOM_SPACE_ADVANCE_THRESHOLD``.
+    Fix 1+4 — **Phantom spaces** (optional via ``drop_phantom_spaces``): glyph-advance
+    gaps materialised as U+0020 are dropped when
+    ``space_x < prev_x + _PHANTOM_SPACE_ADVANCE_THRESHOLD``.
     ``span_prev_char_obj`` is threaded *across span boundaries* within the same
     visual line (Fix 3) so that cross-span phantoms are also caught.
 
@@ -400,7 +589,10 @@ def _extract_line_text(line: dict) -> list[str]:
         if char_objs:
             for char_obj in char_objs:
                 # Fix 1+3+4: drop phantom glyph-advance spaces
-                if _is_phantom_space(char_obj, span_prev_char_obj):
+                if (
+                    drop_phantom_spaces
+                    and _is_phantom_space(char_obj, span_prev_char_obj)
+                ):
                     # Do NOT update span_prev_char_obj — phantom is invisible
                     continue
                 # Fix 2: correct WinAnsi vowel mis-mappings
@@ -408,7 +600,7 @@ def _extract_line_text(line: dict) -> list[str]:
                 fragments.append(c)
                 span_prev_char_obj = char_obj
         else:
-            fragments.append(span.get("text") or "")
+            fragments.append(_fix_monlam_span_text(span.get("text") or ""))
             span_prev_char_obj = None  # no char-level position info available
 
     return fragments
@@ -427,7 +619,6 @@ def _extract_line_text(line: dict) -> list[str]:
 # _Y_MERGE_TOLERANCE step so sub-pixel y differences between copies don't
 # defeat the check.  text_key strips font-size tags before comparison.
 # ---------------------------------------------------------------------------
-_FS_TAG_RE = re.compile(r"<fs:\d+>")
 
 
 def _deduplicate_raw_lines(
@@ -459,7 +650,82 @@ def _deduplicate_raw_lines(
 
 # Tolerance in points for treating two MuPDF lines as the same visual row.
 # Tibetan glyphs with vowel marks can cause small Y shifts across spans.
-_Y_MERGE_TOLERANCE = 3.0
+_Y_MERGE_TOLERANCE = 4.0
+
+# Maximum x-offset between two same-text entries in a merged row that are still
+# considered InDesign shadow copies rather than genuine repeated words.
+# InDesign drop-shadow offsets are typically 1–3 pt; genuine word repetitions
+# in the same line are separated by at least one character-advance (≥ 8 pt).
+_SHADOW_X_THRESHOLD = 5.0
+
+# Unicode ranges for CJK Unified Ideographs, CJK Extension A/B, and common
+# CJK symbols/punctuation.  If a row contains any of these characters the
+# drop-shadow heuristic must be disabled: CJK table layouts genuinely repeat
+# the same character in adjacent cells (e.g. 書號 … 書名) and the threshold
+# logic would incorrectly suppress those real column entries.
+_CJK_RE = re.compile(
+    r"[\u2E80-\u2EFF"   # CJK Radicals Supplement
+    r"\u2F00-\u2FDF"    # Kangxi Radicals
+    r"\u3000-\u303F"    # CJK Symbols and Punctuation
+    r"\u3040-\u30FF"    # Hiragana + Katakana
+    r"\u3400-\u4DBF"    # CJK Extension A
+    r"\u4E00-\u9FFF"    # CJK Unified Ideographs
+    r"\uF900-\uFAFF"    # CJK Compatibility Ideographs
+    r"\uFE30-\uFE4F"    # CJK Compatibility Forms
+    r"\U00020000-\U0002A6DF]"  # CJK Extension B
+)
+
+
+def _row_contains_cjk(row: list[tuple[float, float, list[str]]]) -> bool:
+    """Return True if any fragment in *row* contains a CJK character."""
+    for _y, _x, frags in row:
+        text = _FS_TAG_RE.sub("", "".join(frags))
+        if _CJK_RE.search(text):
+            return True
+    return False
+
+
+def _dedup_within_row(
+    row: list[tuple[float, float, list[str]]],
+) -> list[tuple[float, float, list[str]]]:
+    """
+    Remove InDesign drop-shadow copies from a single merged visual row.
+
+    After y-merge, the same text element may appear multiple times at slightly
+    different x-positions (1–4 pt apart) due to InDesign shadow/glow effects
+    that render each glyph or phrase several times.  ``_deduplicate_raw_lines``
+    misses these because copies fall in different (y_bucket, x_bucket) bins when
+    the x-spread exceeds 0.1 pt.
+
+    Strategy (row must be pre-sorted left-to-right):
+      - Track the x0 of the first occurrence of each distinct text_key.
+      - Suppress any subsequent occurrence of the same text_key whose x0 is
+        within ``_SHADOW_X_THRESHOLD`` of the first occurrence.
+      - Genuine word repetitions (word-spaced ≥ 8–10 pt apart) are kept.
+
+    **CJK exception**: if the row contains any CJK character the heuristic is
+    disabled entirely and the row is returned unchanged.  CJK table layouts
+    legitimately repeat the same character in adjacent label/value cells; the
+    threshold-based suppression would incorrectly remove real content.
+    """
+    # Do not apply drop-shadow dedup to rows that contain CJK characters.
+    if _row_contains_cjk(row):
+        return row
+
+    first_x: dict[str, float] = {}
+    result: list[tuple[float, float, list[str]]] = []
+    for y, x, frags in row:
+        text_key = _FS_TAG_RE.sub("", "".join(frags))
+        if not text_key:
+            result.append((y, x, frags))
+            continue
+        if text_key in first_x:
+            if abs(x - first_x[text_key]) <= _SHADOW_X_THRESHOLD:
+                continue  # shadow copy — suppress
+        else:
+            first_x[text_key] = x
+        result.append((y, x, frags))
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -526,7 +792,10 @@ def _deduplicate_pytiblegenc_output(text: str, page_break_str: str) -> str:
 
         for line in lines:
             key = _FS_TAG_RE_TIBL.sub("", line).strip()
-            if key and key in recent:
+            # Never suppress lines that contain CJK characters: repeated CJK
+            # characters in adjacent table cells are genuine content, not
+            # InDesign shadow artefacts.
+            if key and key in recent and not _CJK_RE.search(key):
                 # This line appeared in the recent window — drop as duplicate.
                 continue
             result_lines.append(line)
@@ -545,6 +814,8 @@ def extract_pdf_pymupdf(
     *,
     crop_top: float = 0.0,
     crop_bottom: float = 0.0,
+    extraction_dedup: bool = True,
+    phantom_space_drop: bool = True,
 ) -> str:
     """
     Extract text using PyMuPDF ``rawdict``: one ``\\n`` per **visual** line.
@@ -554,8 +825,9 @@ def extract_pdf_pymupdf(
     are within ``_Y_MERGE_TOLERANCE`` points of each other, then sort left-
     to-right so the reading order is preserved.
 
-    All five Monlam/InDesign artefact fixes are applied here — see the
-    module-level docstring for a summary.
+    Monlam/InDesign artefact fixes are applied here — see the module-level docstring.
+    Pass ``extraction_dedup=False`` or ``phantom_space_drop=False`` to debug
+    suspected over-aggressive cleanup (duplicate layers / phantom spaces).
     """
     logger.info(f"    Extracting (PyMuPDF rawdict): {pdf_path.name}")
 
@@ -587,12 +859,14 @@ def extract_pdf_pymupdf(
                     bbox = line.get("bbox", [0, 0, 0, 0])
                     y_mid = (bbox[1] + bbox[3]) / 2.0
                     x0 = bbox[0]
-                    fragments = _extract_line_text(line)
+                    fragments = _extract_line_text(
+                        line, drop_phantom_spaces=phantom_space_drop
+                    )
                     if fragments:
                         raw_lines.append((y_mid, x0, fragments))
 
             # Fix 5: remove duplicate lines from overlapping PDF text layers.
-            if raw_lines:
+            if raw_lines and extraction_dedup:
                 raw_lines = _deduplicate_raw_lines(raw_lines, _Y_MERGE_TOLERANCE)
 
             # Sort by vertical position first, then left-to-right.
@@ -612,6 +886,9 @@ def extract_pdf_pymupdf(
             for row in merged_rows:
                 # Sort spans within the row left-to-right.
                 row.sort(key=lambda t: t[1])
+                # Fix 5b: remove shadow copies that survived pre-merge dedup.
+                if extraction_dedup:
+                    row = _dedup_within_row(row)
                 for _y, _x, frags in row:
                     parts.extend(frags)
                 parts.append("\n")
@@ -639,12 +916,23 @@ def extract_pdf_to_text(
     *,
     crop_top: float = 0.0,
     crop_bottom: float = 0.0,
+    extraction_dedup: bool = True,
+    phantom_space_drop: bool = True,
 ) -> str:
     """Dispatch to PyMuPDF or pytiblegenc."""
     if extractor == "pytiblegenc":
-        return extract_pdf_pytiblegenc(
-            pdf_path, crop_top=crop_top, crop_bottom=crop_bottom
+        text = extract_pdf_pytiblegenc(
+            pdf_path,
+            crop_top=crop_top,
+            crop_bottom=crop_bottom,
+            extraction_dedup=extraction_dedup,
         )
-    return extract_pdf_pymupdf(
-        pdf_path, crop_top=crop_top, crop_bottom=crop_bottom
-    )
+    else:
+        text = extract_pdf_pymupdf(
+            pdf_path,
+            crop_top=crop_top,
+            crop_bottom=crop_bottom,
+            extraction_dedup=extraction_dedup,
+            phantom_space_drop=phantom_space_drop,
+        )
+    return _merge_orphan_tibetan_line_breaks(text or "")

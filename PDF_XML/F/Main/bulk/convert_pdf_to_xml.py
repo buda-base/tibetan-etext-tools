@@ -620,9 +620,9 @@ def convert_pdf_to_tei(pdf_path: Path, ve_id: str, sequence: int) -> str:
     sha256 = calculate_sha256(source_path)
     # TEI src_path: document used for checksum (DOC if present, else PDF name under VE output tree)
     if source_path == pdf_path:
-        src_path = f"sources/{ve_id}/{pdf_path.name}"
+        src_path = f"{ve_id}/{pdf_path.name}"
     else:
-        src_path = f"sources/{ve_id}/{source_path.name}"
+        src_path = f"{ve_id}/{source_path.name}"
 
     tei_xml = generate_tei_xml(
         body_content=tei_body,

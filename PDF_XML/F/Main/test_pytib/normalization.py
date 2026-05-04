@@ -6,6 +6,19 @@ from enum import Enum
 # Wingdings / Wingdings2 ToUnicode often maps bullets and symbols to U+F020–U+F0FF (PUA).
 _WINGDINGS_MS_PUA = re.compile(r"[\uF020-\uF0FF]")
 
+# CJK character ranges — used to skip Tibetan-specific normalization on Chinese/Japanese/Korean text.
+_CJK_RE = re.compile(
+    r"[\u2E80-\u2EFF"   # CJK Radicals Supplement
+    r"\u2F00-\u2FDF"    # Kangxi Radicals
+    r"\u3000-\u303F"    # CJK Symbols and Punctuation
+    r"\u3040-\u30FF"    # Hiragana + Katakana
+    r"\u3400-\u4DBF"    # CJK Extension A
+    r"\u4E00-\u9FFF"    # CJK Unified Ideographs
+    r"\uF900-\uFAFF"    # CJK Compatibility Ideographs
+    r"\uFE30-\uFE4F"    # CJK Compatibility Forms
+    r"\U00020000-\U0002A6DF]"  # CJK Extension B
+)
+
 
 def remove_wingdings_private_use(text: str) -> str:
     """Remove legacy Microsoft Wingdings/Wingdings2 private-use symbols from extracted text."""
@@ -180,6 +193,12 @@ def normalize_unicode(
     # 6) Normalize spaces
     s = normalize_spaces(s, collapse_internal_spaces=collapse_internal_spaces)
 
+    # Steps 6b–9 are Tibetan-specific and must not be applied to lines that
+    # contain CJK characters (Chinese/Japanese/Korean).  Applying Tibetan
+    # glyph-artifact fixes and Unicode reordering to CJK text corrupts it.
+    if _CJK_RE.search(s):
+        return s
+
     # 6b) PDF cmap / legacy font mis-encodings (Latin letters standing in for Tibetan)
     s = fix_pdf_glyph_to_unicode_artifacts(s)
     # 6c) Restore visible gaps after shad / before Tibetan digits (dates, headings)
@@ -344,5 +363,3 @@ def normalize_invalid_start_string(s):
     if is_suffix(s[0]):
         return s[1:]
     return s
-
-

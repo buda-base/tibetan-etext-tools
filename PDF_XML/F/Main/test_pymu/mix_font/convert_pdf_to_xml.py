@@ -1,25 +1,35 @@
 #!/usr/bin/env python3
 """
-IE_ID: PDF in sources/ to TEI XML (Dedris via pytiblegenc)
+IE1KG25273: PDF under ``sources/`` → TEI XML.
 
-Input (default batch): PDFs only under **sources/<VE_ID>/** — volume ID is the **folder name**
+**Extractors** (``--extractor``):
 
-Optional: flat sources/*.pdf — use ``--assign-flat-toprocess`` to split those across
-IE_ID-VE* folders in toprocess; otherwise root PDFs are skipped (move into sources/<VE_ID>/).
+- **pymupdf** (default): ``page.get_text("rawdict")`` — one ``\\n`` per MuPDF
+  **line** (block → line → span); skips **Wingdings**; optional **header/footer
+  crop** (``--crop-top`` / ``--crop-bottom`` or config). Suited to
+  **MonlamUniOuChan** Unicode PDFs.
 
-toprocess is still checked only for optional matching .doc (IE_ID-<same VE as source>) for SHA256.
-Output: IE_ID_output/archive/{VE_ID}/UT*.xml and sources/{VE_ID}/ (PDF + optional DOC).
+- **pytiblegenc**: ``pytiblegenc.pdf_to_txt()`` with the same options as
+  IE3KG664 / Desktop SRC_CODE — line breaks follow that library’s layout.
+  Header/footer **crop** uses the same redacted temp PDF as **pymupdf**
+  (requires PyMuPDF to build it). Requires:
+  ``pip install git+https://github.com/buda-base/py-tiblegenc.git``
 
-Optional: matching .doc in toprocess/IE_ID-{ve_id}/ for SHA256; otherwise SHA256 from PDF.
+Later steps map each extractor newline to ``<lb/>`` (layout, not linguistics).
+
+Optional: matching ``.doc`` in ``toprocess/<IE_ID>-<VE_ID>/`` for SHA256; else
+checksum from the PDF.
 
 Usage:
-    python convert_pdf_to_xml.py                    # Convert all PDFs (assigned to VEs)
-    python convert_pdf_to_xml.py --ve VE_ID      # One VE only
-    python convert_pdf_to_xml.py --single file_name.pdf
-    python convert_pdf_to_xml.py --single VE_ID/*.pdf  # path under sources/
-    python convert_pdf_to_xml.py --assign-flat-toprocess   # also assign root *.pdf via toprocess
+    python convert_pdf_to_xml.py
+    python convert_pdf_to_xml.py --ve VE1ER999
+    python convert_pdf_to_xml.py --single foo.pdf
+    python convert_pdf_to_xml.py --single VE1ER999/TI596-01-001.pdf
+    python convert_pdf_to_xml.py --assign-flat-toprocess
     python convert_pdf_to_xml.py --no-font-tags
     python convert_pdf_to_xml.py --no-normalization
+    python convert_pdf_to_xml.py --crop-top 0.09 --crop-bottom 0.08
+    python convert_pdf_to_xml.py --extractor pytiblegenc
 """
 
 import sys
@@ -31,18 +41,6 @@ from pathlib import Path
 from typing import Optional
 from collections import Counter
 from natsort import natsorted
-import tempfile
-import os
-
-try:
-    import pymupdf as fitz         
-    PYMUPDF_AVAILABLE = True
-except ImportError:
-    try:
-        import fitz              
-        PYMUPDF_AVAILABLE = True
-    except ImportError:
-        PYMUPDF_AVAILABLE = False
 
 script_dir = Path(__file__).parent
 sys.path.insert(0, str(script_dir))
@@ -63,20 +61,17 @@ from config import (
     CROP_HEADER_FRACTION,
     CROP_FOOTER_FRACTION,
 )
-from normalization import normalize_unicode
-from tibetan_text_fixes import fix_hi_tag_spacing, fix_toc_leader_dots
-from dedris_converter import reset_stats, print_conversion_stats, write_stats_file
+from normalization import normalize_unicode, remove_wingdings_private_use
+#from tibetan_text_fixes import fix_hi_tag_spacing, fix_toc_leader_dots
 from tei_generator import post_process_body, generate_tei_xml, calculate_sha256
-
-try:
-    from pytiblegenc import pdf_to_txt
-    PYTIBLEGENC_AVAILABLE = True
-except ImportError:
-    PYTIBLEGENC_AVAILABLE = False
-    print(
-        "Error: pytiblegenc not installed. Run: pip install git+https://github.com/buda-base/py-tiblegenc.git"
-    )
-    sys.exit(1)
+from pdf_extract import (
+    PAGE_BREAK_STR,
+    PYMUPDF_AVAILABLE,
+    PYTIBLEGENC_AVAILABLE,
+    extract_pdf_to_text,
+    _FN_SENTINEL_START,
+    _FN_SENTINEL_END,
+)
 
 
 def setup_logging():
@@ -102,11 +97,11 @@ logger = setup_logging()
 ENABLE_FONT_CLASSIFICATION = True
 ENABLE_NORMALIZATION = True
 
+# "pymupdf" | "pytiblegenc" — set from CLI ``--extractor`` in ``main()``.
+PDF_EXTRACTOR: str = "pymupdf"
+
 CROP_TOP_FRACTION: float = CROP_HEADER_FRACTION   
 CROP_BOTTOM_FRACTION: float = CROP_FOOTER_FRACTION
-
-PAGE_BREAK_STR = "ZZZZ"
-FONT_SIZE_FORMAT = "<fs:{}>"
 
 # Tibetan tsheg (U+0F0B), vowel ུ (U+0F74), ASCII digits, fullwidth digits (U+FF10-U+FF19)
 _PAGE_ARTIFACT_CHARS = r"\u0F0B\u0F740-9\uFF10-\uFF19\s"
@@ -154,107 +149,6 @@ def strip_page_header_artifacts(text: str) -> str:
     text = re.sub(r'(<hi rend="head">)[IVXLCDM]+\s*\n<lb/>', r'\1', text)
     
     return text
-
-def create_cropped_pdf(pdf_path: Path, top_frac: float, bottom_frac: float) -> Optional[Path]:
-    """
-    Return a path to a temporary PDF with headers/footers cropped out.
-
-    Each page's MediaBox is shrunk by *top_frac* from the top and
-    *bottom_frac* from the bottom (both expressed as a fraction of the
-    original page height, e.g. 0.08 = 8 %).
-
-    """
-    if top_frac == 0.0 and bottom_frac == 0.0:
-        return None                      
-
-    if not PYMUPDF_AVAILABLE:
-        logger.warning(
-            "Page cropping requested but PyMuPDF is not installed. "
-            "Install with:  pip install pymupdf\n"
-            "Continuing WITHOUT cropping."
-        )
-        return None
-
-    try:
-        src_doc = fitz.open(str(pdf_path))
-        out_doc = fitz.open()               # blank output document
-
-        for page in src_doc:
-            rect = page.rect               # original page rectangle (pts)
-            page_h = rect.height
-
-            # Calculate crop margins in points
-            top_margin    = page_h * top_frac
-            bottom_margin = page_h * bottom_frac
-
-            # New content rectangle: shrink top and bottom
-            crop_rect = fitz.Rect(
-                rect.x0,
-                rect.y0 + top_margin,      # move top edge down
-                rect.x1,
-                rect.y1 - bottom_margin,   # move bottom edge up
-            )
-
-            # Copy the page and apply the new crop box
-            out_doc.insert_pdf(src_doc, from_page=page.number, to_page=page.number)
-            new_page = out_doc[-1]
-            new_page.set_cropbox(crop_rect)
-
-        # Write to a named temp file that survives until we delete it
-        tmp = tempfile.NamedTemporaryFile(
-            suffix=".pdf", delete=False, dir=tempfile.gettempdir()
-        )
-        tmp_path = Path(tmp.name)
-        tmp.close()
-
-        out_doc.save(str(tmp_path))
-        out_doc.close()
-        src_doc.close()
-
-        logger.info(
-            f"    Cropped PDF written to temp: {tmp_path.name} "
-            f"(top={top_frac*100:.1f}%, bottom={bottom_frac*100:.1f}%)"
-        )
-        return tmp_path
-
-    except Exception as e:
-        logger.warning(f"    Failed to crop {pdf_path.name}: {e}  — using original.")
-        return None
-
-def extract_pdf_to_text(pdf_path: Path) -> str:
-    """Extract text from a PDF file using pytiblegenc."""
-    logger.info(f"    Extracting: {pdf_path.name}")
-
-    tmp_pdf: Optional[Path] = None
-
-    try:
-        if CROP_TOP_FRACTION > 0.0 or CROP_BOTTOM_FRACTION > 0.0:
-            tmp_pdf = create_cropped_pdf(pdf_path, CROP_TOP_FRACTION, CROP_BOTTOM_FRACTION)
-
-        target_pdf = tmp_pdf if tmp_pdf else pdf_path
-
-        text = pdf_to_txt(
-            str(target_pdf),
-            page_break_str=f"\n{PAGE_BREAK_STR}\n",
-            track_font_size=True,
-            font_size_format=FONT_SIZE_FORMAT,
-            normalize=False,
-            simplify_font_sizes_option=False,
-        )
-        return text
-
-    except Exception as e:
-        logger.error(f"    ERROR extracting {pdf_path.name}: {e}")
-        import traceback
-        traceback.print_exc()
-        return ""
-    finally:
-        # Always remove the temporary cropped file
-        if tmp_pdf and tmp_pdf.exists():
-            try:
-                os.unlink(tmp_pdf)
-            except Exception:
-                pass
 
 
 def simplify_font_sizes(text: str) -> str:
@@ -457,14 +351,134 @@ def apply_font_markup(text: str, classifications: dict) -> str:
     return text
 
 
+def convert_footnote_sentinels_to_tei(text: str) -> str:
+    """
+    Convert ``ZZFN_START:<n>:<body>ZZFN_END`` sentinels into inline TEI
+    ``<note n="N" place="foot">body</note>`` elements, and replace
+    ``ZZFNM:<n>`` in-text marker placeholders with empty strings (the
+    footnote number is carried by the ``n=`` attribute on ``<note>``).
+
+    Placement rule (per BDRC spec §4.7):
+      - The ``<note>`` is inserted at the end of the LAST main-text line
+        before the ``<pb/>`` that closes the page.  This satisfies the spec
+        requirement that no opening or self-closing markup appears at the end
+        of a line (the ``<note/>`` is self-contained, so it can safely sit
+        between the last text and the newline).
+
+    ZZFNM markers are stripped: the footnote number in the main text is
+    removed and replaced by the inline ``<note>`` at end-of-page, exactly
+    as shown in the spec example:
+      ``<p>This is the main text<note n="1" place="foot">…</note>.</p>``
+
+    If no ``ZZFN_START`` sentinels exist, the text is returned unchanged.
+    """
+    import re as _re
+
+    # Fast exit if no footnotes in text
+    if _FN_SENTINEL_START not in text:
+        # Still strip any ZZFNM markers (shouldn't happen, but be safe)
+        text = _re.sub(r"ZZFNM:(\d+)", r"\1", text)
+        return text
+
+    # ── Step 1: Remove ZZFNM:<n> in-text markers ────────────────────────────
+    # The marker digit is carried by n= on <note>; the superscript digit
+    # itself is dropped from the main text stream.
+    text = _re.sub(r"ZZFNM:(\d+)", r"\1", text)
+
+    # ── Step 2: Convert ZZFN_START sentinels into <note> elements ───────────
+    # Sentinel format (one per line): ZZFN_START:<n>:<body text>ZZFN_END
+    _SENTINEL_RE = _re.compile(
+        r"ZZFN_START:(\d+):(.+?)ZZFN_END\n?", _re.DOTALL
+    )
+
+    def _collect_page_notes(sentinel_block: str) -> list[tuple[str, str]]:
+        """Return list of (number, escaped_body) pairs from a sentinel block."""
+        notes = []
+        for m in _SENTINEL_RE.finditer(sentinel_block):
+            n = m.group(1)
+            body = m.group(2).strip()
+            # Escape XML special characters in footnote body
+            body = body.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            notes.append((n, body))
+        return notes
+
+    # Split the text into page-chunks around page-break markers.
+    # After convert_markup_to_tei the page break is already <pb/>, but this
+    # function is called BEFORE that step, so page breaks are still PAGE_BREAK_STR.
+    from pdf_extract import PAGE_BREAK_STR as _PB
+
+    # Split on page-break boundaries; keep the delimiters.
+    page_chunks = _re.split(rf"({_re.escape(_PB)})", text)
+
+    result_parts: list[str] = []
+    for chunk in page_chunks:
+        if chunk == _PB:
+            result_parts.append(chunk)
+            continue
+
+        # Collect all footnote sentinels in this chunk
+        notes = _collect_page_notes(chunk)
+        if not notes:
+            result_parts.append(chunk)
+            continue
+
+        # Remove the sentinel lines from the chunk
+        clean_chunk = _SENTINEL_RE.sub("", chunk)
+
+        if not notes:
+            result_parts.append(clean_chunk)
+            continue
+
+        # Build the <note> elements string
+        note_tags = "".join(
+            f'<note n="{n}" place="foot">{body}</note>'
+            for n, body in notes
+        )
+
+        # Insert note tags at the end of the last non-empty line of this chunk.
+        # The spec says no opening markup at end of a line, but <note> is
+        # self-contained (has a closing tag), so it is safe to append inline.
+        lines = clean_chunk.rstrip("\n").split("\n")
+        # Find the last line that has actual text content (not just whitespace)
+        last_text_idx = None
+        for i in range(len(lines) - 1, -1, -1):
+            if lines[i].strip():
+                last_text_idx = i
+                break
+
+        if last_text_idx is not None:
+            lines[last_text_idx] = lines[last_text_idx] + note_tags
+            clean_chunk = "\n".join(lines)
+            # Restore trailing newline if the original had one
+            if chunk.rstrip("\n") != chunk:
+                clean_chunk += "\n"
+
+        result_parts.append(clean_chunk)
+
+    return "".join(result_parts)
+
+
 def convert_markup_to_tei(text: str) -> str:
-    """Convert markup to TEI format."""
+    """Convert markup to TEI format.
+    """
 
     def escape_content(text_part):
+        import re as _re
+        # Protect XML markup that must survive the & < > escaping pass.
+        # <note n="N" place="foot">…</note> elements were injected by
+        # convert_footnote_sentinels_to_tei() and must remain as XML tags.
         text_part = text_part.replace("<large>", "\x00LARGE\x00")
         text_part = text_part.replace("</large>", "\x00/LARGE\x00")
         text_part = text_part.replace("<small>", "\x00SMALL\x00")
         text_part = text_part.replace("</small>", "\x00/SMALL\x00")
+        # Protect <note> open tags (with attributes) and close tags
+        note_tags = {}
+        def _stash_tag(m):
+            key = f"\x00NOTE{len(note_tags)}\x00"
+            note_tags[key] = m.group(0)
+            return key
+        text_part = _re.sub(r'<note\b[^>]*>', _stash_tag, text_part)
+        text_part = _re.sub(r'</note>', _stash_tag, text_part)
 
         text_part = text_part.replace("&", "&amp;")
         text_part = text_part.replace("<", "&lt;")
@@ -474,6 +488,9 @@ def convert_markup_to_tei(text: str) -> str:
         text_part = text_part.replace("\x00/LARGE\x00", "</large>")
         text_part = text_part.replace("\x00SMALL\x00", "<small>")
         text_part = text_part.replace("\x00/SMALL\x00", "</small>")
+        # Restore <note> tags
+        for key, tag in note_tags.items():
+            text_part = text_part.replace(key, tag)
 
         return text_part
 
@@ -516,7 +533,8 @@ def convert_markup_to_tei(text: str) -> str:
 
     text = re.sub(r"(<lb/>[\s\n]*)+</hi>", r"</hi>", text)
     text = re.sub(r"<lb/>[\s\n]*<pb", r"<pb", text)
-    text = re.sub(r"(\n)<pb/>[\s]*</hi>", r"</hi>\1<pb/>", text)
+    # Inline hi must close before page breaks (<pb/></hi> often when small/head spans a page).
+    text = re.sub(r"<pb/>\s*</hi>", r"</hi>\n<pb/>", text)
     text = re.sub(r"\n(</hi>)", r"\1\n", text)
     text = re.sub(r'(<hi rend="[^"]+">)\n<lb/>', r"\n<lb/>\1", text)
     text = re.sub(r"<lb/> +", r"<lb/>", text)
@@ -558,7 +576,7 @@ def save_checkpoint(file_path: str):
 
 
 def get_ve_ids_from_toprocess():
-    """Collect VE IDs from toprocess folders"""
+    """Collect VE IDs from toprocess folders."""
     ve_ids = []
     if not TOPROCESS_DIR.exists():
         return ve_ids
@@ -675,7 +693,12 @@ def convert_pdf_to_tei(pdf_path: Path, ve_id: str, sequence: int) -> str:
         logger.warning(f"Source DOC file not found for {pdf_path.name}, using PDF for SHA256")
         source_path = pdf_path
 
-    raw_text = extract_pdf_to_text(pdf_path)
+    raw_text = extract_pdf_to_text(
+        pdf_path,
+        PDF_EXTRACTOR,
+        crop_top=CROP_TOP_FRACTION,
+        crop_bottom=CROP_BOTTOM_FRACTION,
+    )
     if not raw_text:
         raise ValueError(f"No text extracted from {pdf_path.name}")
 
@@ -685,12 +708,18 @@ def convert_pdf_to_tei(pdf_path: Path, ve_id: str, sequence: int) -> str:
         logger.info("    Applying normalization...")
         normalized_text = normalize_unicode(simplified_text)
     else:
-        normalized_text = simplified_text
+        # Still strip Wingdings PUA when full normalization is off (font artefact only).
+        normalized_text = remove_wingdings_private_use(simplified_text)
 
-    from tei_generator import fix_mixed_dedris_patterns
+    # ── Footnote sentinel → TEI conversion ──────────────────────────────────
+    # Convert ZZFN_START/ZZFNM sentinels (emitted by pdf_extract.py when
+    # FOOTNOTE_DETECTION=True) into inline <note n="N" place="foot"> elements.
+    # This runs after normalization so Tibetan text in footnote bodies is clean.
+    if _FN_SENTINEL_START in normalized_text:
+        logger.info("    Converting footnote sentinels to TEI <note> elements...")
+        normalized_text = convert_footnote_sentinels_to_tei(normalized_text)
 
-    normalized_text = fix_mixed_dedris_patterns(normalized_text)
-    normalized_text = fix_toc_leader_dots(normalized_text)
+    # normalized_text = fix_toc_leader_dots(normalized_text)
 
     if ENABLE_FONT_CLASSIFICATION:
         classifications = classify_font_sizes(normalized_text)
@@ -704,8 +733,8 @@ def convert_pdf_to_tei(pdf_path: Path, ve_id: str, sequence: int) -> str:
 
     tei_body = convert_markup_to_tei(marked_text)
 
-    if ENABLE_NORMALIZATION:
-        tei_body = fix_hi_tag_spacing(tei_body)
+    #if ENABLE_NORMALIZATION:
+    #    tei_body = fix_hi_tag_spacing(tei_body)
 
     tei_body = post_process_body(tei_body)
 
@@ -723,9 +752,9 @@ def convert_pdf_to_tei(pdf_path: Path, ve_id: str, sequence: int) -> str:
     sha256 = calculate_sha256(source_path)
     # TEI src_path: document used for checksum (DOC if present, else PDF name under VE output tree)
     if source_path == pdf_path:
-        src_path = f"sources/{ve_id}/{pdf_path.name}"
+        src_path = f"{ve_id}/{pdf_path.name}"
     else:
-        src_path = f"sources/{ve_id}/{source_path.name}"
+        src_path = f"{ve_id}/{source_path.name}"
 
     tei_xml = generate_tei_xml(
         body_content=tei_body,
@@ -770,7 +799,7 @@ def copy_sources_to_output(ve_id: str, pdf_files: list):
 
 def _resolve_ve_for_single(explicit_ve: Optional[str]) -> Optional[str]:
     """
-    For a PDF directly in sources/*.pdf (no subfolder): use --ve, or one IE-VE* in toprocess.
+    For a PDF directly in sources/*.pdf (no subfolder): use --ve, or one IE1KG25273-VE* in toprocess.
     toprocess is not used when the path is sources/<VE_ID>/file.pdf (volume from folder name).
     """
     if explicit_ve:
@@ -829,6 +858,7 @@ def convert_single_file(relative_path: str, ve_id: Optional[str], sequence: Opti
     ut_id = get_ut_id(ve_id, sequence)
 
     logger.info(f"Converting: {pdf_path.name}")
+    logger.info(f"  Extractor: {PDF_EXTRACTOR}")
     logger.info(f"  VE ID: {ve_id}")
     logger.info(f"  UT ID: {ut_id}")
 
@@ -863,6 +893,7 @@ def convert_all_files(
     """
     logger.info("=" * 60)
     logger.info(f"PDF to TEI XML Converter for {IE_ID}")
+    logger.info(f"Extractor: {PDF_EXTRACTOR}")
     if ve_filter:
         logger.info(f"Filtering: {ve_filter} only")
     logger.info(f"PDF Source: {SOURCES_DIR}")
@@ -892,7 +923,7 @@ def convert_all_files(
     if not pdf_by_ve or total_files == 0:
         logger.error(
             "No PDF files found under sources/<VE_ID>/*.pdf. Put PDFs inside a volume folder "
-            "(e.g. sources/VE1ER1060/) or use --assign-flat-toprocess with IE-VE* in toprocess."
+            "(e.g. sources/VE1ER999/) or use --assign-flat-toprocess with IE1KG25273-VE* in toprocess."
         )
         return
 
@@ -900,8 +931,6 @@ def convert_all_files(
         f"PDFs under {SOURCES_DIR}: {total_files} file(s) -> {len(pdf_by_ve)} volume(s): "
         f"{natsorted(pdf_by_ve.keys())}"
     )
-
-    reset_stats()
 
     checkpoints = load_checkpoints()
     logger.info(f"Existing checkpoint entries: {len(checkpoints)}")
@@ -961,21 +990,30 @@ def convert_all_files(
     logger.info(f"  Output: {OUTPUT_DIR}")
     logger.info("=" * 60)
 
-    print_conversion_stats()
-    write_stats_file(OUTPUT_DIR / "pdf_conversion_stats.txt")
-
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Convert sources/*.pdf and sources/<VE>/**/*.pdf to TEI XML (pytiblegenc)"
+        description=(
+            "IE1KG25273: Convert sources/*.pdf and sources/<VE>/**/*.pdf to TEI XML "
+            "(PyMuPDF rawdict or pytiblegenc pdf_to_txt)"
+        )
+    )
+    parser.add_argument(
+        "--extractor",
+        choices=["pymupdf", "pytiblegenc"],
+        default="pymupdf",
+        help=(
+            "PDF text extraction backend: pymupdf = MuPDF rawdict line breaks (default); "
+            "pytiblegenc = same pdf_to_txt options as IE3KG664 / Desktop SRC_CODE"
+        ),
     )
     parser.add_argument(
         "--single",
         "-s",
         metavar="PATH",
-        help="One PDF path under sources/ (e.g. file.pdf or VE_ID/file.pdf; --ve if ambiguous)",
+        help="One PDF path under sources/ (e.g. file.pdf or VE1ER999/TI596-01-001.pdf; --ve if ambiguous)",
     )
-    parser.add_argument("--ve", metavar="VE_ID", help="VE ID (e.g. VE3KG664) or filter batch to this VE")
+    parser.add_argument("--ve", metavar="VE_ID", help="VE ID (e.g. VE1ER999) or filter batch to this VE")
     parser.add_argument(
         "--sequence",
         type=int,
@@ -988,7 +1026,7 @@ def main():
     parser.add_argument(
         "--assign-flat-toprocess",
         action="store_true",
-        help="Also assign sources/*.pdf (root) across IE_ID-VE* folders in toprocess (default: ignore root PDFs)",
+        help="Also assign sources/*.pdf (root) across IE1KG25273-VE* folders in toprocess (default: ignore root PDFs)",
     )
     parser.add_argument(
         "--crop-top",
@@ -996,9 +1034,9 @@ def main():
         default=None,
         metavar="FRAC",
         help=(
-            "Fraction of page height to strip from the TOP (running header). "
-            "E.g. 0.08 removes the top 8%%. Overrides config.CROP_HEADER_FRACTION. "
-            "Requires pymupdf (pip install pymupdf)."
+            "Fraction of page height to physically redact at the TOP (running header). "
+            "E.g. 0.08 blanks the top 8%% and removes text there. Overrides config.CROP_HEADER_FRACTION. "
+            "Used for both extractors (redacted temp PDF; pip install pymupdf)."
         ),
     )
     parser.add_argument(
@@ -1007,18 +1045,38 @@ def main():
         default=None,
         metavar="FRAC",
         help=(
-            "Fraction of page height to strip from the BOTTOM (running footer). "
-            "E.g. 0.07 removes the bottom 7%%. Overrides config.CROP_FOOTER_FRACTION. "
-            "Requires pymupdf (pip install pymupdf)."
+            "Fraction of page height to physically redact at the BOTTOM (running footer). "
+            "E.g. 0.07 blanks the bottom 7%% and removes text there. Overrides config.CROP_FOOTER_FRACTION. "
+            "Used for both extractors (redacted temp PDF; pip install pymupdf)."
         ),
     )
     args = parser.parse_args()
 
+    if args.extractor == "pytiblegenc" and not PYTIBLEGENC_AVAILABLE:
+        parser.error(
+            "pytiblegenc is not installed. pip install git+https://github.com/buda-base/py-tiblegenc.git"
+        )
+    if args.extractor == "pymupdf" and not PYMUPDF_AVAILABLE:
+        parser.error("PyMuPDF is not installed. pip install pymupdf")
+
+    global PDF_EXTRACTOR
+    PDF_EXTRACTOR = args.extractor
+
     global ENABLE_FONT_CLASSIFICATION, ENABLE_NORMALIZATION
+    global CROP_TOP_FRACTION, CROP_BOTTOM_FRACTION
     if args.no_font_tags:
         ENABLE_FONT_CLASSIFICATION = False
     if args.no_normalization:
         ENABLE_NORMALIZATION = False
+
+    if args.crop_top is not None:
+        if not 0.0 <= args.crop_top < 0.5:
+            parser.error("--crop-top must be between 0.0 and 0.49")
+        CROP_TOP_FRACTION = args.crop_top
+    if args.crop_bottom is not None:
+        if not 0.0 <= args.crop_bottom < 0.5:
+            parser.error("--crop-bottom must be between 0.0 and 0.49")
+        CROP_BOTTOM_FRACTION = args.crop_bottom
 
     if args.single:
         convert_single_file(args.single, args.ve, args.sequence)

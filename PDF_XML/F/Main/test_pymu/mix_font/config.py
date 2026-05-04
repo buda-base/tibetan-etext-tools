@@ -2,13 +2,13 @@ from pathlib import Path
 from tokenize import triple_quoted
 from typing import Optional
 
-IE_ID = "IE8CZ130"
+IE_ID = "IE4CZ295452"
 
-BASE_DIR = Path(r"/Users/tenzinmonlam/Documents/dharmaduta/pdf_convert_5/4th_may/to_convert")
+BASE_DIR = Path(r"/Users/tenzinmonlam/Documents/dharmaduta/pdf_convert_5/pymupdf_resolve/issue")
 
-SOURCES_DIR = BASE_DIR / "IE8CZ130" / "sources"
-TOPROCESS_DIR = BASE_DIR / "IE8CZ130" / "toprocess"
-OUTPUT_DIR = BASE_DIR / "IE8CZ130_output"
+SOURCES_DIR = BASE_DIR / "IE4CZ295452" / "sources"
+TOPROCESS_DIR = BASE_DIR / "IE4CZ295452" / "toprocess"
+OUTPUT_DIR = BASE_DIR / "IE4CZ295452_output"
 ARCHIVE_DIR = OUTPUT_DIR / "archive"
 SOURCES_OUTPUT_DIR = OUTPUT_DIR / "sources"
 

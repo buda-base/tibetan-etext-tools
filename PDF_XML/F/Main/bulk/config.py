@@ -1,5 +1,6 @@
 import os
 from pathlib import Path
+from typing import Optional, Union
 
 # Default single-workset layout. Batch driver sets PDF_BULK_BASE_DIR and PDF_BULK_IE_ID.
 _DEFAULT_BASE = Path(r"/Users/tenzinmonlam/Documents/dharmaduta/pdf_convert_5/1-11")
@@ -28,10 +29,43 @@ else:
 
 PDF_TO_XML_LOG = LOG_DIR / "pdf_to_xml.log"
 PDF_TO_XML_CHECKPOINT = CHECKPOINT_DIR / "pdf_to_xml_checkpoint.txt"
-# ─── Header/footer redaction (physical) ───────────────────────────────
+
+# ─── Header/footer redaction (physical) ───────────────────────────────────
 # 0.0 = none. Typical: 0.07–0.12. Override with --crop-top / --crop-bottom.
 CROP_HEADER_FRACTION: float = 0.00   # e.g. 0.08  strips top 8 %
 CROP_FOOTER_FRACTION: float = 0.00   # e.g. 0.07  strips bottom 7 %
+
+# ─── Full font files for GSUB-based glyph correction ──────────────────────
+# Point FONT_DIR at the full (unsubsetted) Monlam font files so that
+# pdf_extract.py can invert the GSUB table and permanently fix mis-decoded
+# vowel signs (e.g. ŀ→ོ, Ĳ→ེ, Ĩ→ི).
+#
+# PDFs may embed multiple fonts (e.g. MonlamUniOuChan2 AND MonlamUniOuChan5).
+# Each is looked up by name at runtime, so all required fonts must be present.
+#
+# Accepted values:
+#   None                      — GSUB correction disabled (default)
+#   Path to a directory       — ALL .ttf/.otf files inside are used  ← recommended
+#   Path to a single .ttf     — only that one font is used
+#   List of paths             — mix of files and directories
+#
+# Recommended setup — put all fonts in one folder:
+#   fonts/
+#     monlam_uni_ouchan2.ttf   ← fixes MonlamUniOuChan2 glyphs
+#     monlam_uni_ouchan5.ttf   ← fixes MonlamUniOuChan5 glyphs
+#     (add more as needed)
+#   FONT_DIR = BASE_DIR / "fonts"
+#
+# Also works with a single file (useful during testing):
+#   FONT_DIR = Path("/Users/name/Downloads/tibetan-fonts/monlam_uni_ouchan2.ttf")
+#
+# File naming: underscores/hyphens are ignored when matching, so
+#   monlam_uni_ouchan2.ttf  matches PDF basefont  MonlamUniOuChan2  ✓
+FONT_DIR = Path("/Users/tenzinmonlam/Downloads/download_temp/tibetan-fonts/")
+# Example:
+# FONT_DIR = BASE_DIR / "fonts"
+# FONT_DIR = Path("/Users/tenzinmonlam/Downloads/download_temp/tibetan-fonts")
+
 
 def ensure_directories():
     for d in [

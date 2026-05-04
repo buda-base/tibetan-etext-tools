@@ -11,14 +11,13 @@ Fixes applied (all in the PyMuPDF path):
      Set FONT_DIR in config.py to enable GSUB inversion from the full .ttf file.
   3. Phantom space check threaded across span boundaries within a line
   4. Epsilon tolerance for near-zero-advance phantom spaces from WinAnsi vowel spans
-  5. Duplicate text-layer deduplication for InDesign-generated PDFs
-     Two sub-steps:
-     a) _deduplicate_raw_lines: removes copies that share (y_bucket, x_bucket, text key);
-        keys use NFC, ZW strip, whitespace / U+3000 collapse, and 3 pt X buckets (CJK).
-     b) _dedup_within_row: removes copies that survive (a) because their x-offsets
-        span multiple buckets but are still within _SHADOW_X_THRESHOLD points — seen
-        in InDesign drop-shadow PDFs (e.g. TI1258) where 4 renders of the same glyph
-        produce 4× character repetition in the merged visual row.
+  5. Duplicate text-layer deduplication for InDesign-generated PDFs (NFC + ZW strip
+     + whitespace / U+3000 normalisation for keys; looser X bucketing for CJK).
+     (b) _dedup_within_row removes shadow copies that survive (a) within a merged row.
+  6. TibetanMachine / Dedris legacy Type1 font decoding — applied per-span at extraction
+     time.  Fonts are detected by their Encoding /Differences glyph names (ASCII standard
+     names, not Tibetan Unicode names) and decoded via the TibetanMachineWeb table from
+     dedris_resolver.py.  Safe for mixed-language pages (English + Tibetan colophons).
 """
 
 from __future__ import annotations
@@ -64,10 +63,21 @@ try:
 except ImportError:
     GSUB_RESOLVER_AVAILABLE = False
 
+try:
+    from dedris_resolver import is_dedris_font, decode_tibetan_machine, should_decode_span
+    DEDRIS_RESOLVER_AVAILABLE = True
+except ImportError:
+    DEDRIS_RESOLVER_AVAILABLE = False
+
 logger = logging.getLogger(__name__)
 
 PAGE_BREAK_STR = "ZZZZ"
 _FONT_SIZE_FORMAT = "<fs:{}>"
+
+# Footnote sentinels (format per convert_pdf_to_xml.convert_footnote_sentinels_to_tei).
+# pdf_extract may emit these when footnote detection is enabled.
+_FN_SENTINEL_START = "ZZFN_START:"
+_FN_SENTINEL_END = "ZZFN_END"
 
 
 # ---------------------------------------------------------------------------
@@ -102,7 +112,7 @@ def _get_font_paths() -> list[Path]:
     Return a list of font file paths from config.
 
     ``FONT_DIR`` in config.py can be:
-      - A directory Path: all .ttf/.otf files inside it are candidates.
+      - A directory Path: all .ttf/.otf files under it (recursively) are candidates.
       - A single .ttf/.otf file Path: used directly.
       - A list of file/directory Paths: each entry is handled as above.
       - None: returns an empty list (GSUB correction disabled).
@@ -124,7 +134,11 @@ def _get_font_paths() -> list[Path]:
     for entry in entries:
         p = Path(entry)
         if p.is_dir():
-            paths.extend(f for f in p.iterdir() if f.suffix.lower() in (".ttf", ".otf"))
+            paths.extend(
+                f
+                for f in p.rglob("*")
+                if f.is_file() and f.suffix.lower() in (".ttf", ".otf")
+            )
         elif p.is_file() and p.suffix.lower() in (".ttf", ".otf"):
             paths.append(p)
         else:
@@ -272,20 +286,10 @@ def _build_cmap_corrections(
         )
         return {}
 
-    # ── Build glyph map from the full font (cmap + GSUB) ───────────────────
-    # Use the full font's OWN cmap (not the PDF subset CMap) so that:
-    #   Step 2.1: all ~193 Tibetan cmap entries are trusted reference glyphs
-    #   Step 2.3a: GSUB inversion adds alternate/ligature forms on top
-    #   Step 2.3b: fuzzy matching catches any remaining variants
-    # This gives the widest possible hash table to match against.
-    try:
-        full_font_cmap: dict[int, str] = {}
-        if "cmap" in full_font:
-            raw_cmap = full_font["cmap"].getBestCmap() or {}
-            full_font_cmap = {cp: chr(cp) for cp in raw_cmap.keys()}
-    except Exception:
-        full_font_cmap = {}
-    glyph_map = build_glyph_unicode_map(full_font, full_font_cmap)
+    # ── Build GSUB-derived map from the full font ────────────────────────────
+    # Pass an empty cmap_gid_to_unicode so build_glyph_unicode_map uses only
+    # the full font's own cmap + GSUB, not the (unrelated) PDF subset CMap.
+    glyph_map = build_glyph_unicode_map(full_font, {})
 
     # ── Build full-font hash table: outline_hash → unicode ──────────────────
     full_hash_table: dict[str, str] = {}
@@ -397,27 +401,11 @@ def _patch_font_cmaps(doc) -> None:
             if tou_xref in patched_tou_xrefs:
                 continue  # already patched this CMap
 
-            # Get font bytes (subset embedded in PDF).
-            # DescendantFonts may be an inline array [ N 0 R ] or an indirect
-            # reference (N 0 R) pointing to an array — handle both.
+            # Get font bytes (subset embedded in PDF)
             font_bytes = b""
-            desc_xref: Optional[int] = None
-
-            # Inline array: /DescendantFonts [ 350 0 R ]
-            inline_m = re.search(r"/DescendantFonts\s*\[\s*(\d+)", font_obj)
-            if inline_m:
-                desc_xref = int(inline_m.group(1))
-            else:
-                # Indirect reference: /DescendantFonts 51 0 R
-                indir_m = re.search(r"/DescendantFonts\s+(\d+)\s+0\s+R", font_obj)
-                if indir_m:
-                    arr_obj = doc.xref_object(int(indir_m.group(1)), compressed=False)
-                    arr_m = re.search(r"(\d+)\s+0\s+R", arr_obj)
-                    if arr_m:
-                        desc_xref = int(arr_m.group(1))
-
-            if desc_xref is not None:
-                desc_obj = doc.xref_object(desc_xref, compressed=False)
+            desc_m = re.search(r"/DescendantFonts\s*\[\s*(\d+)", font_obj)
+            if desc_m:
+                desc_obj = doc.xref_object(int(desc_m.group(1)), compressed=False)
                 fd_m = re.search(r"/FontDescriptor\s+(\d+)", desc_obj)
                 if fd_m:
                     fd_obj = doc.xref_object(int(fd_m.group(1)), compressed=False)
@@ -455,6 +443,89 @@ def _patch_font_cmaps(doc) -> None:
                     )
 
             patched_tou_xrefs.add(tou_xref)
+
+
+# ---------------------------------------------------------------------------
+# Fix 6 — Dedris / TibetanMachine legacy font decoding
+# ---------------------------------------------------------------------------
+
+def _build_dedris_font_set(doc) -> set[str]:
+    """
+    Scan every font in *doc* and return the set of **stripped basefont names**
+    (subset prefix removed, e.g. ``"TT1EA4o00"``) that belong to the
+    TibetanMachine / Dedris legacy font family.
+
+    PyMuPDF's span ``'font'`` field already contains the stripped name, so this
+    set can be used directly as a membership test in ``_extract_line_text``.
+
+    For detection, we assemble the full font context from three PDF objects:
+      - The font dict itself  (references to FontDescriptor + Encoding)
+      - The FontDescriptor    (contains /FontBBox and /CharSet)
+      - The Encoding object   (contains /WinAnsiEncoding or /Differences)
+    This is necessary because neither /CharSet nor /WinAnsiEncoding appear in
+    the top-level font dict; they live one level down in the sub-objects.
+    """
+    if not DEDRIS_RESOLVER_AVAILABLE:
+        return set()
+
+    dedris_names: set[str] = set()
+    seen_xrefs: set[int] = set()
+
+    for pn in range(len(doc)):
+        page = doc[pn]
+        for font_entry in page.get_fonts(full=True):
+            font_xref = font_entry[0]
+            if font_xref in seen_xrefs:
+                continue
+            seen_xrefs.add(font_xref)
+
+            enc = font_entry[5]
+            # Quick skip: Identity-H fonts are Monlam/Unicode, never Dedris
+            if enc == "Identity-H":
+                continue
+
+            try:
+                font_obj = doc.xref_object(font_xref, compressed=False)
+            except Exception:
+                continue
+
+            # Assemble full context: font obj + FontDescriptor + Encoding object.
+            # CharSet (for Latin-glyph filter) lives in FontDescriptor;
+            # WinAnsiEncoding lives in the referenced Encoding object.
+            context_parts = [font_obj]
+
+            fd_m = re.search(r"/FontDescriptor\s+(\d+)\s+0\s+R", font_obj)
+            if fd_m:
+                try:
+                    context_parts.append(doc.xref_object(int(fd_m.group(1)), compressed=False))
+                except Exception:
+                    pass
+
+            enc_m = re.search(r"/Encoding\s+(\d+)\s+0\s+R", font_obj)
+            if enc_m:
+                try:
+                    context_parts.append(doc.xref_object(int(enc_m.group(1)), compressed=False))
+                except Exception:
+                    pass
+
+            full_context = "\n".join(context_parts)
+
+            if is_dedris_font(full_context):
+                raw_basefont = font_entry[3]  # e.g. "TWPWAV+TT1EA4o00"
+                stripped = raw_basefont.split("+")[-1] if "+" in raw_basefont else raw_basefont
+                logger.debug(
+                    "_build_dedris_font_set: Dedris font xref=%d (%s → %s)",
+                    font_xref, raw_basefont, stripped,
+                )
+                dedris_names.add(stripped)
+
+    if dedris_names:
+        logger.info(
+            "_build_dedris_font_set: %d Dedris font name(s) detected: %s",
+            len(dedris_names),
+            ", ".join(sorted(dedris_names)),
+        )
+    return dedris_names
 
 
 # ---------------------------------------------------------------------------
@@ -590,7 +661,7 @@ def _is_phantom_space(char_obj: dict, prev_char_obj: dict | None) -> bool:
     return space_x < prev_x + _PHANTOM_SPACE_ADVANCE_THRESHOLD
 
 
-def _extract_line_text(line: dict) -> list[str]:
+def _extract_line_text(line: dict, dedris_fonts: set[str] | None = None) -> list[str]:
     """
     Extract text fragments from a single MuPDF ``line`` dict.
 
@@ -606,16 +677,40 @@ def _extract_line_text(line: dict) -> list[str]:
     Fix 2 is handled upstream by ``_patch_font_cmaps()``, which rewrites the
     document's ToUnicode CMap streams before extraction, so PyMuPDF already
     returns the correct Tibetan codepoints here.
+
+    Fix 6 — Dedris decoding: if a span's font name is in *dedris_fonts*, the
+    full span text is decoded via ``decode_tibetan_machine`` instead of being
+    emitted char-by-char.  This handles the multi-font-subset pattern used by
+    TibetanMachine PDFs where one Tibetan cluster is split across several tiny
+    Type1 font subsets.
     """
     fragments: list[str] = []
     span_prev_char_obj: dict | None = None
 
     for span in line.get("spans", []):
-        if _is_wingdings_font(span.get("font") or ""):
+        font_name = span.get("font") or ""
+        if _is_wingdings_font(font_name):
             continue
 
         fs = round(span.get("size", 12))
         fragments.append(_FONT_SIZE_FORMAT.format(fs))
+
+        # Fix 6: Dedris / TibetanMachine span-level decode.
+        # Build span text from individual char objects (span["text"] is None
+        # in PyMuPDF rawdict mode — only span["chars"][i]["c"] has the values).
+        if dedris_fonts and font_name in dedris_fonts:
+            char_objs = span.get("chars") or []
+            span_text = "".join(c.get("c", "") for c in char_objs)
+            if not span_text:
+                span_text = span.get("text") or ""  # fallback for non-rawdict
+            if span_text:
+                decoded = decode_tibetan_machine(span_text)
+                if should_decode_span(span_text, decoded):
+                    fragments.append(decoded)
+                else:
+                    fragments.append(span_text)
+            span_prev_char_obj = None
+            continue
 
         char_objs = span.get("chars") or []
         if char_objs:
@@ -680,31 +775,13 @@ def _deduplicate_raw_lines(
 
 _Y_MERGE_TOLERANCE = 3.0
 
-# Maximum x-offset between two same-text entries in a merged row that are still
-# considered InDesign shadow copies rather than genuine repeated words.
-# InDesign drop-shadow offsets are typically 1–3 pt; genuine word repetitions
-# in the same line are separated by at least one character-advance (≥ 8 pt).
 _SHADOW_X_THRESHOLD = 5.0
 
 
 def _dedup_within_row(
     row: list[tuple[float, float, list[str]]],
 ) -> list[tuple[float, float, list[str]]]:
-    """
-    Remove InDesign drop-shadow copies from a single merged visual row.
-
-    After y-merge, the same text element may appear multiple times at slightly
-    different x-positions (1–4 pt apart) due to InDesign shadow/glow effects
-    that render each glyph or phrase several times.  ``_deduplicate_raw_lines``
-    misses these because copies fall in different (y_bucket, x_bucket) bins when
-    the x-spread exceeds 0.1 pt.
-
-    Strategy (row must be pre-sorted left-to-right):
-      - Track the x0 of the first occurrence of each distinct text_key.
-      - Suppress any subsequent occurrence of the same text_key whose x0 is
-        within ``_SHADOW_X_THRESHOLD`` of the first occurrence.
-      - Genuine word repetitions (word-spaced ≥ 8–10 pt apart) are kept.
-    """
+    """Remove InDesign shadow copies from one merged visual row (see bulk/pdf_extract)."""
     first_x: dict[str, float] = {}
     result: list[tuple[float, float, list[str]]] = []
     for y, x, frags in row:
@@ -714,7 +791,7 @@ def _dedup_within_row(
             continue
         if text_key in first_x:
             if abs(x - first_x[text_key]) <= _SHADOW_X_THRESHOLD:
-                continue  # shadow copy — suppress
+                continue
         else:
             first_x[text_key] = x
         result.append((y, x, frags))
@@ -732,11 +809,16 @@ def extract_pdf_pymupdf(
 
     MuPDF often splits a single visual line into multiple ``line`` objects.
     We merge lines whose Y midpoints are within ``_Y_MERGE_TOLERANCE`` pts,
-    sort left-to-right, and apply all five artefact fixes.
+    sort left-to-right, and apply all six artefact fixes.
 
     Fix 2 (WinAnsi CMap correction) is applied once before the page loop by
     ``_patch_font_cmaps()``, which rewrites bad ToUnicode CMap entries in-memory
     so all subsequent page.get_text() calls decode characters correctly.
+
+    Fix 6 (Dedris / TibetanMachine decoding) is applied per-span: fonts belonging
+    to the TibetanMachine family are detected once via ``_build_dedris_font_set()``
+    and their span text is decoded via ``decode_tibetan_machine()`` at extraction
+    time, before any downstream normalisation.
     """
     logger.info(f"    Extracting (PyMuPDF rawdict): {pdf_path.name}")
 
@@ -756,6 +838,9 @@ def extract_pdf_pymupdf(
         # Fix 2: patch all bad ToUnicode CMap entries before any page extraction
         _patch_font_cmaps(doc)
 
+        # Fix 6: build Dedris font name set once for the whole document
+        dedris_fonts = _build_dedris_font_set(doc)
+
         parts: list[str] = []
 
         for page in doc:
@@ -770,7 +855,7 @@ def extract_pdf_pymupdf(
                     bbox = line.get("bbox", [0, 0, 0, 0])
                     y_mid = (bbox[1] + bbox[3]) / 2.0
                     x0 = bbox[0]
-                    fragments = _extract_line_text(line)
+                    fragments = _extract_line_text(line, dedris_fonts=dedris_fonts)
                     if fragments:
                         raw_lines.append((y_mid, x0, fragments))
 
@@ -791,7 +876,6 @@ def extract_pdf_pymupdf(
 
             for row in merged_rows:
                 row.sort(key=lambda t: t[1])
-                # Fix 5b: remove shadow copies that survived pre-merge dedup.
                 row = _dedup_within_row(row)
                 for _y, _x, frags in row:
                     parts.extend(frags)

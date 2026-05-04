@@ -15,6 +15,28 @@ from config import IE_ID
 
 logger = logging.getLogger(__name__)
 
+# Tibetan stack head (consonants / standalone letters) vs marks on the same cluster.
+_TIB_BASE = r"[\u0F40-\u0F6C]"
+_TIB_CLUSTER_TAIL = r"[\u0F71-\u0F84\u0F90-\u0FBC]"
+_HI_SPLIT_FIX_RE = re.compile(
+    rf"({_TIB_BASE})</hi>((?:{_TIB_CLUSTER_TAIL})+)(?!{_TIB_CLUSTER_TAIL})"
+)
+
+
+def repair_hi_tibetan_cluster_splits(body_content: str) -> str:
+    """
+    Move ``</hi>`` that was inserted between a Tibetan base letter and its
+    combining / subjoined tail (font-size boundary artefact from PyMuPDF).
+
+    Fixes e.g. ``<hi rend="small">…ཨ</hi>ོཾ`` → ``…ཨོཾ</hi>`` so ``ོཾ`` stays inside
+    the same ``<hi>`` span as ``ཨ``.
+    """
+    prev = None
+    while prev != body_content:
+        prev = body_content
+        body_content = _HI_SPLIT_FIX_RE.sub(r"\1\2</hi>", body_content)
+    return body_content
+
 
 def classify_font_sizes(converted_streams: list) -> dict:
     """
@@ -148,7 +170,14 @@ def build_tei_body(converted_streams: list, enable_font_classification: bool = T
 
 
 def post_process_body(body_content: str) -> str:
-    """Post-process TEI body content with line breaks and tag fixes."""
+    """Post-process TEI body content with line breaks and tag fixes.
+
+    Handles ``<hi rend="…">`` spans for font-size markup and
+    ``<note n="N" place="foot">…</note>`` footnote elements.
+    Footnote notes are self-contained inline elements placed at the end of
+    the last main-text line before ``<pb/>``, so they do not require the
+    same split-repair logic as ``<hi>`` spans.
+    """
     body_content = body_content.strip()
     body_content = re.sub(r"<pb/>\s*</hi>", r"</hi>\n<pb/>", body_content)
 
@@ -177,7 +206,10 @@ def post_process_body(body_content: str) -> str:
     # This happens when numbered lists like (1), (2) were typed in Dedris font
     # and the ) character got converted to Tibetan a-chung འ
     body_content = re.sub(r'\((\d+)འ', r'(\1)', body_content)
-    
+
+    # Font-size markup must not split Tibetan grapheme clusters (e.g. ཨ + ོཾ).
+    body_content = repair_hi_tibetan_cluster_splits(body_content)
+
     return body_content
 
 
@@ -216,7 +248,7 @@ def generate_tei_xml(
 </teiHeader>
 <text>
 <body xml:lang="bo">
-<p>
+<p xml:space="preserve">
 {body_content}
 </p>
 </body>
@@ -225,5 +257,3 @@ def generate_tei_xml(
 '''
     
     return tei_xml
-
-

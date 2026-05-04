@@ -11,7 +11,9 @@ Fixes applied (all in the PyMuPDF path):
      Set FONT_DIR in config.py to enable GSUB inversion from the full .ttf file.
   3. Phantom space check threaded across span boundaries within a line
   4. Epsilon tolerance for near-zero-advance phantom spaces from WinAnsi vowel spans
-  5. Duplicate text-layer deduplication for InDesign-generated PDFs
+  5. Duplicate text-layer deduplication for InDesign-generated PDFs (NFC + ZW strip
+     + whitespace / U+3000 normalisation for keys; looser X bucketing for CJK).
+     (b) _dedup_within_row removes shadow copies that survive (a) within a merged row.
 """
 
 from __future__ import annotations
@@ -22,6 +24,7 @@ import os
 import re
 import tempfile
 import traceback
+import unicodedata
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
@@ -61,6 +64,11 @@ logger = logging.getLogger(__name__)
 PAGE_BREAK_STR = "ZZZZ"
 _FONT_SIZE_FORMAT = "<fs:{}>"
 
+# Footnote sentinels (format per convert_pdf_to_xml.convert_footnote_sentinels_to_tei).
+# pdf_extract may emit these when footnote detection is enabled.
+_FN_SENTINEL_START = "ZZFN_START:"
+_FN_SENTINEL_END = "ZZFN_END"
+
 
 # ---------------------------------------------------------------------------
 # Fix 2 — GSUB-based CMap patching
@@ -94,7 +102,7 @@ def _get_font_paths() -> list[Path]:
     Return a list of font file paths from config.
 
     ``FONT_DIR`` in config.py can be:
-      - A directory Path: all .ttf/.otf files inside it are candidates.
+      - A directory Path: all .ttf/.otf files under it (recursively) are candidates.
       - A single .ttf/.otf file Path: used directly.
       - A list of file/directory Paths: each entry is handled as above.
       - None: returns an empty list (GSUB correction disabled).
@@ -116,7 +124,11 @@ def _get_font_paths() -> list[Path]:
     for entry in entries:
         p = Path(entry)
         if p.is_dir():
-            paths.extend(f for f in p.iterdir() if f.suffix.lower() in (".ttf", ".otf"))
+            paths.extend(
+                f
+                for f in p.rglob("*")
+                if f.is_file() and f.suffix.lower() in (".ttf", ".otf")
+            )
         elif p.is_file() and p.suffix.lower() in (".ttf", ".otf"):
             paths.append(p)
         else:
@@ -603,27 +615,254 @@ def _extract_line_text(line: dict) -> list[str]:
 # ---------------------------------------------------------------------------
 _FS_TAG_RE = re.compile(r"<fs:\d+>")
 
+# Strip for dedup key only (emitted text unchanged).  Aligns with normalization.py.
+_ZW_STRIP_FOR_DEDUP_KEY = dict.fromkeys(
+    map(ord, "\u200B\u200C\u200D\u2060\uFEFF\u034F\u180E")
+)
+
+# ── CJK detection ────────────────────────────────────────────────────────────
+# Unicode ranges that count as CJK / Chinese for dedup purposes.
+# Covers CJK Unified Ideographs (BMP + Extension B), CJK Compatibility Ideographs,
+# Bopomofo, Kangxi Radicals, CJK Radicals Supplement, CJK Symbols & Punctuation,
+# Halfwidth/Fullwidth Forms, and the common punctuation used in Chinese text.
+_CJK_RE = re.compile(
+    r"[\u2E80-\u2EFF"    # CJK Radicals Supplement
+    r"\u2F00-\u2FDF"     # Kangxi Radicals
+    r"\u3000-\u303F"     # CJK Symbols and Punctuation
+    r"\u3040-\u309F"     # Hiragana
+    r"\u30A0-\u30FF"     # Katakana
+    r"\u3100-\u312F"     # Bopomofo
+    r"\u3200-\u32FF"     # Enclosed CJK Letters and Months
+    r"\u3400-\u4DBF"     # CJK Unified Ideographs Extension A
+    r"\u4E00-\u9FFF"     # CJK Unified Ideographs (core block)
+    r"\uF900-\uFAFF"     # CJK Compatibility Ideographs
+    r"\uFE30-\uFE4F"     # CJK Compatibility Forms
+    r"\uFF00-\uFFEF"     # Halfwidth and Fullwidth Forms
+    r"\U00020000-\U0002A6DF"  # CJK Extension B
+    r"]"
+)
+
+# x-bucketing for Tibetan / Latin lines (tight — a few pt for shadow copies).
+_DEDUP_X_BUCKET_PT = 3.0
+# x-bucketing for CJK lines: InDesign exports CJK layers offset by 4–8 pt,
+# so we widen the bucket so both copies fall into the same bucket and the
+# second is discarded by the seen-set check.
+_DEDUP_X_BUCKET_CJK_PT = 10.0
+
+# Within a merged row, same-text fragments within this x-distance are shadows.
+_SHADOW_X_THRESHOLD = 5.0
+# Wider shadow threshold for CJK rows: InDesign CJK layers can be 4–8 pt apart.
+_SHADOW_X_THRESHOLD_CJK = 12.0
+
+
+def _has_cjk(text: str) -> bool:
+    """Return True if *text* contains at least one CJK / Chinese character."""
+    return bool(_CJK_RE.search(text))
+
+
+def _text_key_for_dedup(frags: list[str]) -> str:
+    """
+    Build a comparison string so two overlapping PDF text layers dedupe together.
+
+    Duplicate CJK/Latin colophon lines often differ across layers in: NFC vs NFD,
+    U+3000 ideographic space vs ASCII space, or zero-width characters from HTML
+    paste.  Tibetan-only lines behave as before when the grapheme string matches.
+
+    For CJK lines an additional compatibility normalisation step is applied:
+    fullwidth ASCII punctuation is mapped to its ASCII equivalent so that
+    "，" and "," (or "。" and ".") compare equal across layers.
+    """
+    raw = _FS_TAG_RE.sub("", "".join(frags))
+    raw = raw.translate(_ZW_STRIP_FOR_DEDUP_KEY)
+    raw = unicodedata.normalize("NFC", raw)
+    raw = raw.replace("\u3000", " ")   # ideographic space → ASCII space
+    # CJK compatibility: fullwidth Latin punctuation → ASCII (affects key only).
+    # U+FF01–U+FF5E is the fullwidth ASCII range; subtract 0xFEE0 to get ASCII.
+    raw = re.sub(
+        r"[\uFF01-\uFF5E]",
+        lambda m: chr(ord(m.group()) - 0xFEE0),
+        raw,
+    )
+    raw = re.sub(r"\s+", " ", raw).strip()
+    return raw
+
 
 def _deduplicate_raw_lines(
     raw_lines: list[tuple[float, float, list[str]]],
     y_tolerance: float,
 ) -> list[tuple[float, float, list[str]]]:
-    """Remove duplicate raw lines from InDesign overlapping text layers."""
+    """
+    Remove duplicate raw lines from InDesign overlapping text layers.
+
+    Two improvements over the original for CJK / Chinese text:
+
+    1. **Wider x-bucket for CJK lines** (``_DEDUP_X_BUCKET_CJK_PT = 10 pt``).
+       InDesign often exports CJK content in two text layers that share the same
+       y-coordinate but are horizontally offset by 4–8 pt — more than the 3 pt
+       Tibetan/Latin bucket.  By widening the bucket for lines that contain CJK
+       characters, both copies fall into the same (y, x, text) bucket and the
+       duplicate is discarded here before it ever reaches the y-merge step.
+
+    2. **Text-key deduplication independent of x-position** for CJK lines.
+       As a safety net, after the bucket check we also maintain a (y_bucket,
+       text_key) → first_x mapping for CJK lines.  Any subsequent CJK line at
+       the same y whose text key already appeared, regardless of x-distance, is
+       treated as a duplicate and dropped.  This catches the edge case where the
+       two layers' x-offsets straddle a bucket boundary even at 10 pt width.
+    """
     seen: set[tuple[float, float, str]] = set()
+    # (y_bucket, text_key) → first x0 seen; used only for CJK lines.
+    cjk_y_text_first_x: dict[tuple[float, str], float] = {}
+
     deduped: list[tuple[float, float, list[str]]] = []
+
     for y_mid, x0, frags in raw_lines:
         y_bucket = round(y_mid / y_tolerance) * y_tolerance
-        x_bucket = round(x0, 1)
-        text_key = _FS_TAG_RE.sub("", "".join(frags))
+        text_key = _text_key_for_dedup(frags)
+        is_cjk_line = _has_cjk(text_key)
+
+        # ── Bucket-based check (same logic as before, wider bucket for CJK) ──
+        xb = _DEDUP_X_BUCKET_CJK_PT if is_cjk_line else _DEDUP_X_BUCKET_PT
+        x_bucket = round(x0 / xb) * xb
         key = (y_bucket, x_bucket, text_key)
         if key in seen:
+            logger.debug(
+                "_deduplicate_raw_lines: dropped bucket-dup CJK line y=%.1f x=%.1f %r",
+                y_mid, x0, text_key[:40],
+            )
             continue
         seen.add(key)
+
+        # ── Extra CJK safety net: same y + same text → drop if x is close ───
+        if is_cjk_line and text_key:
+            yt_key = (y_bucket, text_key)
+            if yt_key in cjk_y_text_first_x:
+                first_x = cjk_y_text_first_x[yt_key]
+                if abs(x0 - first_x) <= _DEDUP_X_BUCKET_CJK_PT * 2:
+                    logger.debug(
+                        "_deduplicate_raw_lines: dropped y-text-dup CJK line y=%.1f "
+                        "x=%.1f (first_x=%.1f) %r",
+                        y_mid, x0, first_x, text_key[:40],
+                    )
+                    continue
+            else:
+                cjk_y_text_first_x[yt_key] = x0
+
         deduped.append((y_mid, x0, frags))
+
     return deduped
 
 
 _Y_MERGE_TOLERANCE = 3.0
+
+# Same-text fragments in one merged row, within this x-distance of the first copy,
+# are treated as InDesign shadow/glow duplicates (not intentional word repetition).
+_SHADOW_X_THRESHOLD = 5.0
+
+
+def _dedup_within_row(
+    row: list[tuple[float, float, list[str]]],
+) -> list[tuple[float, float, list[str]]]:
+    """
+    Remove InDesign drop-shadow copies from a single merged visual row.
+
+    After y-merge, the same text may appear several times at slightly different x
+    (1–4 pt for Tibetan/Latin, 4–8 pt for CJK).
+
+    ``_deduplicate_raw_lines`` may still miss CJK copies when their x-offsets
+    straddle a bucket boundary, so we apply a wider shadow threshold
+    (``_SHADOW_X_THRESHOLD_CJK``) for rows that contain CJK characters.
+    """
+    first_x: dict[str, float] = {}
+    result: list[tuple[float, float, list[str]]] = []
+    for y, x, frags in row:
+        text_key = _text_key_for_dedup(frags)
+        if not text_key:
+            result.append((y, x, frags))
+            continue
+        threshold = (
+            _SHADOW_X_THRESHOLD_CJK if _has_cjk(text_key) else _SHADOW_X_THRESHOLD
+        )
+        if text_key in first_x:
+            if abs(x - first_x[text_key]) <= threshold:
+                logger.debug(
+                    "_dedup_within_row: dropped shadow CJK frag x=%.1f (first_x=%.1f) %r",
+                    x, first_x[text_key], text_key[:40],
+                )
+                continue
+        else:
+            first_x[text_key] = x
+        result.append((y, x, frags))
+    return result
+
+
+def _dedup_output_lines(parts: list[str]) -> list[str]:
+    """
+    Final-pass deduplication on the assembled output line list for a page.
+
+    This catches any Chinese / CJK duplicate lines that survived both
+    ``_deduplicate_raw_lines`` and ``_dedup_within_row`` — for example when
+    two PDF text layers are far enough apart in x that they ended up in
+    *different* merged rows, producing two identical consecutive output lines.
+
+    Algorithm
+    ---------
+    Split *parts* on ``"\\n"`` delimiters.  For each non-empty line whose
+    text key is purely CJK (or mostly CJK), check whether the same key
+    already appeared within the current page window.  If so, suppress the
+    duplicate line (including the preceding ``"\\n"`` part).
+
+    Only runs when CJK content is actually present on the page (fast-path
+    exit otherwise).
+
+    The page boundary sentinel (``PAGE_BREAK_STR``) resets the seen-set so
+    that legitimately repeated lines on different pages are preserved.
+    """
+    # Fast path: skip entirely if no CJK on this page.
+    combined = "".join(parts)
+    if not _has_cjk(combined):
+        return parts
+
+    # Reconstruct output as a list of logical lines (each ends with "\n").
+    # parts alternates between text fragments and "\n" separators.
+    # We join into one string and re-split so the logic is line-oriented.
+    text = combined
+    lines = text.split("\n")
+    seen_cjk: set[str] = set()
+    result_lines: list[str] = []
+
+    for line in lines:
+        # Page boundary resets dedup window.
+        if PAGE_BREAK_STR in line:
+            seen_cjk.clear()
+            result_lines.append(line)
+            continue
+
+        # Strip font-size tags for the key only.
+        stripped = _FS_TAG_RE.sub("", line).strip()
+        if not stripped:
+            result_lines.append(line)
+            continue
+
+        # Only apply this extra pass to lines that are ≥ 50 % CJK characters
+        # so we don't accidentally suppress Tibetan lines that happen to have
+        # one CJK character (e.g. a lone Chinese digit in a colophon).
+        cjk_chars = len(_CJK_RE.findall(stripped))
+        if cjk_chars == 0 or cjk_chars / len(stripped) < 0.5:
+            result_lines.append(line)
+            continue
+
+        key = _text_key_for_dedup([line])
+        if key in seen_cjk:
+            logger.debug(
+                "_dedup_output_lines: suppressed duplicate CJK line %r", key[:60]
+            )
+            continue
+
+        seen_cjk.add(key)
+        result_lines.append(line)
+
+    return ["\n".join(result_lines)]
 
 
 def extract_pdf_pymupdf(
@@ -694,11 +933,18 @@ def extract_pdf_pymupdf(
                         continue
                 merged_rows.append([(y_mid, x0, frags)])
 
+            page_parts: list[str] = []
             for row in merged_rows:
                 row.sort(key=lambda t: t[1])
+                row = _dedup_within_row(row)
                 for _y, _x, frags in row:
-                    parts.extend(frags)
-                parts.append("\n")
+                    page_parts.extend(frags)
+                page_parts.append("\n")
+
+            # Fix 5c: final-pass dedup for CJK lines that survived the two
+            # earlier layers (e.g. InDesign layers in different merged rows).
+            page_parts = _dedup_output_lines(page_parts)
+            parts.extend(page_parts)
 
             parts.append(f"\n{PAGE_BREAK_STR}\n")
 

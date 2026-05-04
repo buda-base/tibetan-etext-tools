@@ -39,6 +39,24 @@ _UNICODE_SPACES = [
 ]
 _SPACE_TO_ASCII = {ord(ch): " " for ch in _UNICODE_SPACES}
 
+# Consecutive duplicate Tibetan vowel signs (PDF / layered extract artefacts).
+# U+0F71–U+0F7D: dependent vowels (gigu, naro, ེ, ོ, …); U+0F80–U+0F81: vocalic marks.
+# Subjoined consonants (U+0F8D–) are excluded so stacks like ྲྲ stay intact.
+_COLLAPSE_DUP_TIB_VOWEL_MARK_RE = re.compile(r"([\u0f71-\u0f7d\u0f80-\u0f81])\1+")
+
+
+def collapse_duplicate_tibetan_vowel_marks(text: str) -> str:
+    """
+    Collapse runs of two or more identical Tibetan vowel signs to one character.
+
+    Overlapping InDesign text layers or mark+cluster cmap pairs often emit the
+    same mark twice or thrice (e.g. གཞིི, དཔེེེ, མཚོོན).  Only *consecutive*
+    identical codepoints in the ranges above are merged.
+    """
+    if not text:
+        return text
+    return _COLLAPSE_DUP_TIB_VOWEL_MARK_RE.sub(r"\1", text)
+
 
 def fix_pdf_glyph_to_unicode_artifacts(text: str) -> str:
     """
@@ -47,10 +65,23 @@ def fix_pdf_glyph_to_unicode_artifacts(text: str) -> str:
     Observed in IE3KG647 et al.:
       - U+0140 (ŀ) used for Tibetan vowel sign o (U+0F7C)
       - U+0132 (Ĳ) used inside ཚིག / ཚེས / ཚིགས / མཛེས / …
+
+    Additional artifacts from WinAnsiEncoding MonlamUniOuChan2 font and
+    MuPDF GID-as-Unicode fallback (Identity-H, no matching ToUnicode entry):
+      - U+013D (Ľ) produced by GID 0x013D → MuPDF uses GID as codepoint;
+        glyph is tib.Naro.Anusvara (ོ + ཾ ligature on ཨ → OM context).
+        Always appears as ཨĽ → correct to ཨོཾ (OM = ༀ in NFD form).
+      - U+2020 (†) and U+2021 (‡) from WinAnsi byte 0x86/0x87 on the dot-leader
+        glyph (uni0086); visually a period in Monlam font.
     """
     if not text:
         return text
     s = text
+    # Ľ (U+013D): MuPDF GID-as-Unicode fallback for tib.Naro.Anusvara ligature.
+    # Always follows ཨ to form OM (ཨོཾ). Map to ོཾ so preceding ཨ completes it.
+    s = s.replace("Ľ", "\u0f7c\u0f7e")
+    # † / ‡ (U+2020 / U+2021): WinAnsi CP byte 0x86/0x87 → Monlam dot-leader glyph.
+    s = s.replace("\u2020", ".").replace("\u2021", ".")
     # ŀ: fix syllables that must stay མཚན (mtshan) before global ŀ → ོ
     s = s.replace("མཚŀན", "མཚན")
     s = s.replace("ŀ", "\u0f7c")
@@ -152,6 +183,7 @@ def normalize_unicode(
       7. Remove stray Latin 'm' (Monlam extract artefacts).
       8. Remove Wingdings/Wingdings2 PUA symbols (U+F020–U+F0FF).
       9. Apply Tibetan Unicode normalization.
+      10. Collapse consecutive duplicate Tibetan vowel marks (PDF layer artefacts).
 
     Keeps ZWJ/ZWNJ (joiners) intact.
     """
@@ -183,13 +215,15 @@ def normalize_unicode(
     # 6b) PDF cmap / legacy font mis-encodings (Latin letters standing in for Tibetan)
     s = fix_pdf_glyph_to_unicode_artifacts(s)
     # 6c) Restore visible gaps after shad / before Tibetan digits (dates, headings)
-    s = normalize_tibetan_boundary_spaces(s)
+    # s = normalize_tibetan_boundary_spaces(s)
 
     # 8) Wingdings/Wingdings2 bullets and dingbats (PUA safety net)
     s = remove_wingdings_private_use(s)
 
     # 9) Tibetan Unicode normalization
     s = normalize_unicode_tib(s)
+    # 10) Duplicate gigu / naro / ེ / ོ from overlapping PDF text layers
+    s = collapse_duplicate_tibetan_vowel_marks(s)
     # no graphical distinction between 0f0b and 0f0c
     s = s.replace("\u0f0c", "\u0f0b")
     # double shad is just two shad
@@ -344,5 +378,3 @@ def normalize_invalid_start_string(s):
     if is_suffix(s[0]):
         return s[1:]
     return s
-
-

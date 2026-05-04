@@ -24,10 +24,6 @@ Usage:
     python convert_pdf_to_xml.py
     python convert_pdf_to_xml.py --ve VE1ER999
     python convert_pdf_to_xml.py --single foo.pdf
-    python convert_pdf_to_xml.py --single VE1ER999/TI596-01-001.pdf
-    python convert_pdf_to_xml.py --assign-flat-toprocess
-    python convert_pdf_to_xml.py --no-font-tags
-    python convert_pdf_to_xml.py --no-normalization
     python convert_pdf_to_xml.py --crop-top 0.09 --crop-bottom 0.08
     python convert_pdf_to_xml.py --extractor pytiblegenc
 """
@@ -69,6 +65,8 @@ from pdf_extract import (
     PYMUPDF_AVAILABLE,
     PYTIBLEGENC_AVAILABLE,
     extract_pdf_to_text,
+    _FN_SENTINEL_START,
+    _FN_SENTINEL_END,
 )
 
 
@@ -147,6 +145,139 @@ def strip_page_header_artifacts(text: str) -> str:
     text = re.sub(r'(<hi rend="head">)[IVXLCDM]+\s*\n<lb/>', r'\1', text)
     
     return text
+
+
+# ---------------------------------------------------------------------------
+# CJK intra-line deduplication
+# ---------------------------------------------------------------------------
+# InDesign PDFs with Chinese/CJK content often embed 2–3 stacked text layers
+# at the same y-coordinate.  When those layers share a starting x (within a
+# few points) MuPDF merges all their spans into a single line dict, and
+# _extract_line_text concatenates them left-to-right.  The result is a line
+# whose CJK text contains 2–3 overlapping copies of the true content, e.g.:
+#
+#   '宗 派: 藏傳格魯藏傳格魯巴 藏傳格魯'  →  '宗 派: 藏傳格魯巴'
+#   '作 者: 色拉傑格西色拉傑格西 洛桑群培色拉傑格西洛桑群培'
+#       →  '作 者: 色拉傑格西 洛桑群培'
+#
+# The fix is a greedy character-level scan: maintain a running 'emitted CJK'
+# string and skip any CJK character (or run) whose leading ngram is already
+# present in the emitted buffer.  Non-CJK text (Latin, digits, punctuation,
+# Tibetan) is always passed through unchanged so the Tibetan body text is
+# never affected.
+
+_CJK_INTRALINE_RE = re.compile(
+    r"[\u4E00-\u9FFF"          # CJK Unified Ideographs
+    r"\u3400-\u4DBF"           # CJK Extension A
+    r"\uF900-\uFAFF"           # CJK Compatibility Ideographs
+    r"\u3000-\u303F"           # CJK Symbols and Punctuation
+    r"\uFF00-\uFFEF"           # Halfwidth/Fullwidth Forms
+    r"]"
+)
+_CJK_INTRALINE_SEG_RE = re.compile(
+    r"[\u4E00-\u9FFF\u3400-\u4DBF\uF900-\uFAFF\u3000-\u303F\uFF00-\uFFEF]+"
+    r"|[^\u4E00-\u9FFF\u3400-\u4DBF\uF900-\uFAFF\u3000-\u303F\uFF00-\uFFEF]+"
+)
+_CJK_INTRALINE_MIN_REPEAT = 3   # minimum ngram length to trigger dedup
+
+
+def deduplicate_cjk_intraline(text: str) -> str:
+    """
+    Remove internal CJK repetitions from a single assembled line.
+
+    The function is a no-op for:
+      - Lines with no CJK characters.
+      - Lines whose CJK content contains no repeated ngrams (fast path).
+      - Non-CJK text within a mixed line (always passed through verbatim).
+
+    Algorithm
+    ---------
+    1. Split *text* into alternating CJK / non-CJK segments.
+    2. Collect all CJK characters and check for any repeated ngram of length
+       ``_CJK_INTRALINE_MIN_REPEAT`` (≥3).  If none found → return early.
+    3. For each CJK segment, walk character by character:
+       - **Primary check (trigram):** if the next 3 chars already appear in
+         ``emitted``, find how far the run extends and skip all of it.
+       - **Secondary check (bigram):** if the next 2 chars already appear in
+         ``emitted`` (and ``emitted`` has some substance), extend the skip
+         logic to single-char stragglers that precede a known dup block.
+    4. Non-CJK segments are appended verbatim.
+    5. Strip trailing whitespace left by any skipped trailing dup span.
+    """
+    segments = [
+        (bool(_CJK_INTRALINE_RE.match(m.group()[0])), m.group())
+        for m in _CJK_INTRALINE_SEG_RE.finditer(text)
+    ]
+    cjk_parts = [s for is_cjk, s in segments if is_cjk]
+    if not cjk_parts:
+        return text
+
+    all_cjk = "".join(cjk_parts)
+    if len(all_cjk) < _CJK_INTRALINE_MIN_REPEAT * 2:
+        return text
+
+    # Fast check: any repeated ngram anywhere?
+    has_repeat = False
+    for n in range(_CJK_INTRALINE_MIN_REPEAT, len(all_cjk) // 2 + 1):
+        for start in range(len(all_cjk) - n):
+            if all_cjk.find(all_cjk[start : start + n], start + 1) >= 0:
+                has_repeat = True
+                break
+        if has_repeat:
+            break
+    if not has_repeat:
+        return text
+
+    emitted = ""
+    result_segs: list[str] = []
+    for is_cjk, seg in segments:
+        if not is_cjk:
+            result_segs.append(seg)
+            continue
+        out = ""
+        i = 0
+        while i < len(seg):
+            # Primary check: trigram already in emitted → skip the dup run.
+            look = seg[i : i + _CJK_INTRALINE_MIN_REPEAT]
+            if len(look) == _CJK_INTRALINE_MIN_REPEAT and look in emitted:
+                j = i
+                while j < len(seg) and seg[i : j + 1] in emitted:
+                    j += 1
+                i = j
+                continue
+            # Secondary check: bigram already in emitted → try single-char skip.
+            look2 = seg[i : i + 2]
+            if len(look2) == 2 and look2 in emitted and len(emitted) >= _CJK_INTRALINE_MIN_REPEAT:
+                if seg[i] in emitted:
+                    j = i
+                    while j < len(seg) and seg[i : j + 1] in emitted:
+                        j += 1
+                    if j > i:
+                        i = j
+                        continue
+            out += seg[i]
+            emitted += seg[i]
+            i += 1
+        result_segs.append(out)
+
+    return "".join(result_segs).rstrip()
+
+
+def apply_cjk_intraline_dedup(text: str) -> str:
+    """
+    Apply ``deduplicate_cjk_intraline`` to every line in *text*.
+
+    Lines are separated by ``\\n``.  Only lines containing CJK characters are
+    processed; all others are returned unchanged.  The PAGE_BREAK_STR sentinel
+    and font-size tags (``<fs:N>``) are preserved verbatim.
+    """
+    lines = text.split("\n")
+    result = []
+    for line in lines:
+        if _CJK_INTRALINE_RE.search(line):
+            line = deduplicate_cjk_intraline(line)
+        result.append(line)
+    return "\n".join(result)
 
 
 def simplify_font_sizes(text: str) -> str:
@@ -349,15 +480,134 @@ def apply_font_markup(text: str, classifications: dict) -> str:
     return text
 
 
+def convert_footnote_sentinels_to_tei(text: str) -> str:
+    """
+    Convert ``ZZFN_START:<n>:<body>ZZFN_END`` sentinels into inline TEI
+    ``<note n="N" place="foot">body</note>`` elements, and replace
+    ``ZZFNM:<n>`` in-text marker placeholders with empty strings (the
+    footnote number is carried by the ``n=`` attribute on ``<note>``).
+
+    Placement rule (per BDRC spec §4.7):
+      - The ``<note>`` is inserted at the end of the LAST main-text line
+        before the ``<pb/>`` that closes the page.  This satisfies the spec
+        requirement that no opening or self-closing markup appears at the end
+        of a line (the ``<note/>`` is self-contained, so it can safely sit
+        between the last text and the newline).
+
+    ZZFNM markers are stripped: the footnote number in the main text is
+    removed and replaced by the inline ``<note>`` at end-of-page, exactly
+    as shown in the spec example:
+      ``<p>This is the main text<note n="1" place="foot">…</note>.</p>``
+
+    If no ``ZZFN_START`` sentinels exist, the text is returned unchanged.
+    """
+    import re as _re
+
+    # Fast exit if no footnotes in text
+    if _FN_SENTINEL_START not in text:
+        # Still strip any ZZFNM markers (shouldn't happen, but be safe)
+        text = _re.sub(r"ZZFNM:(\d+)", r"\1", text)
+        return text
+
+    # ── Step 1: Remove ZZFNM:<n> in-text markers ────────────────────────────
+    # The marker digit is carried by n= on <note>; the superscript digit
+    # itself is dropped from the main text stream.
+    text = _re.sub(r"ZZFNM:(\d+)", r"\1", text)
+
+    # ── Step 2: Convert ZZFN_START sentinels into <note> elements ───────────
+    # Sentinel format (one per line): ZZFN_START:<n>:<body text>ZZFN_END
+    _SENTINEL_RE = _re.compile(
+        r"ZZFN_START:(\d+):(.+?)ZZFN_END\n?", _re.DOTALL
+    )
+
+    def _collect_page_notes(sentinel_block: str) -> list[tuple[str, str]]:
+        """Return list of (number, escaped_body) pairs from a sentinel block."""
+        notes = []
+        for m in _SENTINEL_RE.finditer(sentinel_block):
+            n = m.group(1)
+            body = m.group(2).strip()
+            # Escape XML special characters in footnote body
+            body = body.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            notes.append((n, body))
+        return notes
+
+    # Split the text into page-chunks around page-break markers.
+    # After convert_markup_to_tei the page break is already <pb/>, but this
+    # function is called BEFORE that step, so page breaks are still PAGE_BREAK_STR.
+    from pdf_extract import PAGE_BREAK_STR as _PB
+
+    # Split on page-break boundaries; keep the delimiters.
+    page_chunks = _re.split(rf"({_re.escape(_PB)})", text)
+
+    result_parts: list[str] = []
+    for chunk in page_chunks:
+        if chunk == _PB:
+            result_parts.append(chunk)
+            continue
+
+        # Collect all footnote sentinels in this chunk
+        notes = _collect_page_notes(chunk)
+        if not notes:
+            result_parts.append(chunk)
+            continue
+
+        # Remove the sentinel lines from the chunk
+        clean_chunk = _SENTINEL_RE.sub("", chunk)
+
+        if not notes:
+            result_parts.append(clean_chunk)
+            continue
+
+        # Build the <note> elements string
+        note_tags = "".join(
+            f'<note n="{n}" place="foot">{body}</note>'
+            for n, body in notes
+        )
+
+        # Insert note tags at the end of the last non-empty line of this chunk.
+        # The spec says no opening markup at end of a line, but <note> is
+        # self-contained (has a closing tag), so it is safe to append inline.
+        lines = clean_chunk.rstrip("\n").split("\n")
+        # Find the last line that has actual text content (not just whitespace)
+        last_text_idx = None
+        for i in range(len(lines) - 1, -1, -1):
+            if lines[i].strip():
+                last_text_idx = i
+                break
+
+        if last_text_idx is not None:
+            lines[last_text_idx] = lines[last_text_idx] + note_tags
+            clean_chunk = "\n".join(lines)
+            # Restore trailing newline if the original had one
+            if chunk.rstrip("\n") != chunk:
+                clean_chunk += "\n"
+
+        result_parts.append(clean_chunk)
+
+    return "".join(result_parts)
+
+
 def convert_markup_to_tei(text: str) -> str:
     """Convert markup to TEI format.
     """
 
     def escape_content(text_part):
+        import re as _re
+        # Protect XML markup that must survive the & < > escaping pass.
+        # <note n="N" place="foot">…</note> elements were injected by
+        # convert_footnote_sentinels_to_tei() and must remain as XML tags.
         text_part = text_part.replace("<large>", "\x00LARGE\x00")
         text_part = text_part.replace("</large>", "\x00/LARGE\x00")
         text_part = text_part.replace("<small>", "\x00SMALL\x00")
         text_part = text_part.replace("</small>", "\x00/SMALL\x00")
+        # Protect <note> open tags (with attributes) and close tags
+        note_tags = {}
+        def _stash_tag(m):
+            key = f"\x00NOTE{len(note_tags)}\x00"
+            note_tags[key] = m.group(0)
+            return key
+        text_part = _re.sub(r'<note\b[^>]*>', _stash_tag, text_part)
+        text_part = _re.sub(r'</note>', _stash_tag, text_part)
 
         text_part = text_part.replace("&", "&amp;")
         text_part = text_part.replace("<", "&lt;")
@@ -367,6 +617,9 @@ def convert_markup_to_tei(text: str) -> str:
         text_part = text_part.replace("\x00/LARGE\x00", "</large>")
         text_part = text_part.replace("\x00SMALL\x00", "<small>")
         text_part = text_part.replace("\x00/SMALL\x00", "</small>")
+        # Restore <note> tags
+        for key, tag in note_tags.items():
+            text_part = text_part.replace(key, tag)
 
         return text_part
 
@@ -578,6 +831,12 @@ def convert_pdf_to_tei(pdf_path: Path, ve_id: str, sequence: int) -> str:
     if not raw_text:
         raise ValueError(f"No text extracted from {pdf_path.name}")
 
+    # ── CJK intra-line dedup ─────────────────────────────────────────────────
+    # InDesign PDFs stack 2-3 CJK text layers at the same y; MuPDF merges their
+    # spans into one line and concatenates them.  Remove the duplicate CJK runs
+    # before any other processing so downstream steps see clean text.
+    raw_text = apply_cjk_intraline_dedup(raw_text)
+
     simplified_text = simplify_font_sizes(raw_text)
 
     if ENABLE_NORMALIZATION:
@@ -586,6 +845,14 @@ def convert_pdf_to_tei(pdf_path: Path, ve_id: str, sequence: int) -> str:
     else:
         # Still strip Wingdings PUA when full normalization is off (font artefact only).
         normalized_text = remove_wingdings_private_use(simplified_text)
+
+    # ── Footnote sentinel → TEI conversion ──────────────────────────────────
+    # Convert ZZFN_START/ZZFNM sentinels (emitted by pdf_extract.py when
+    # FOOTNOTE_DETECTION=True) into inline <note n="N" place="foot"> elements.
+    # This runs after normalization so Tibetan text in footnote bodies is clean.
+    if _FN_SENTINEL_START in normalized_text:
+        logger.info("    Converting footnote sentinels to TEI <note> elements...")
+        normalized_text = convert_footnote_sentinels_to_tei(normalized_text)
 
     # normalized_text = fix_toc_leader_dots(normalized_text)
 
@@ -620,9 +887,9 @@ def convert_pdf_to_tei(pdf_path: Path, ve_id: str, sequence: int) -> str:
     sha256 = calculate_sha256(source_path)
     # TEI src_path: document used for checksum (DOC if present, else PDF name under VE output tree)
     if source_path == pdf_path:
-        src_path = f"sources/{ve_id}/{pdf_path.name}"
+        src_path = f"{ve_id}/{pdf_path.name}"
     else:
-        src_path = f"sources/{ve_id}/{source_path.name}"
+        src_path = f"{ve_id}/{source_path.name}"
 
     tei_xml = generate_tei_xml(
         body_content=tei_body,

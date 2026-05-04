@@ -30,6 +30,11 @@ Usage:
     python convert_pdf_to_xml.py --no-normalization
     python convert_pdf_to_xml.py --crop-top 0.09 --crop-bottom 0.08
     python convert_pdf_to_xml.py --extractor pytiblegenc
+
+    Debug missing / corrupted text (compare stages, relax extractors):
+
+    python convert_pdf_to_xml.py --single VE1ER1172/TI904-01-001.pdf --dump-extraction ./debug_out
+    python convert_pdf_to_xml.py --single ... --no-extraction-dedup --no-phantom-space
 """
 
 import sys
@@ -100,6 +105,13 @@ PDF_EXTRACTOR: str = "pymupdf"
 
 CROP_TOP_FRACTION: float = CROP_HEADER_FRACTION   
 CROP_BOTTOM_FRACTION: float = CROP_FOOTER_FRACTION
+
+# Extraction tuning (CLI: --no-extraction-dedup, --no-phantom-space)
+EXTRACTION_DEDUP: bool = True
+EXTRACTION_PHANTOM_SPACE_DROP: bool = True
+
+# If set, convert_pdf_to_tei writes per-PDF debug text files under this directory.
+EXTRACTION_DUMP_DIR: Optional[Path] = None
 
 # Tibetan tsheg (U+0F0B), vowel ུ (U+0F74), ASCII digits, fullwidth digits (U+FF10-U+FF19)
 _PAGE_ARTIFACT_CHARS = r"\u0F0B\u0F740-9\uFF10-\uFF19\s"
@@ -564,6 +576,7 @@ def find_source_doc_file(pdf_path: Path, ve_id: str) -> Path:
 
 def convert_pdf_to_tei(pdf_path: Path, ve_id: str, sequence: int) -> str:
     """Convert a single PDF file to TEI XML."""
+    stem = pdf_path.stem
     source_path = find_source_doc_file(pdf_path, ve_id)
     if not source_path:
         logger.warning(f"Source DOC file not found for {pdf_path.name}, using PDF for SHA256")
@@ -574,9 +587,20 @@ def convert_pdf_to_tei(pdf_path: Path, ve_id: str, sequence: int) -> str:
         PDF_EXTRACTOR,
         crop_top=CROP_TOP_FRACTION,
         crop_bottom=CROP_BOTTOM_FRACTION,
+        extraction_dedup=EXTRACTION_DEDUP,
+        phantom_space_drop=EXTRACTION_PHANTOM_SPACE_DROP,
     )
     if not raw_text:
         raise ValueError(f"No text extracted from {pdf_path.name}")
+
+    dump_dir = EXTRACTION_DUMP_DIR
+    if dump_dir is not None:
+        dump_dir = dump_dir.expanduser().resolve()
+        dump_dir.mkdir(parents=True, exist_ok=True)
+        (dump_dir / f"{stem}_01_raw_extract.txt").write_text(
+            raw_text, encoding="utf-8"
+        )
+        logger.info(f"    Wrote extraction dump: {dump_dir / (stem + '_01_raw_extract.txt')}")
 
     simplified_text = simplify_font_sizes(raw_text)
 
@@ -599,12 +623,30 @@ def convert_pdf_to_tei(pdf_path: Path, ve_id: str, sequence: int) -> str:
     else:
         marked_text = re.sub(r"<fs:\d+>", "", normalized_text)
 
+    if dump_dir is not None:
+        (dump_dir / f"{stem}_02_after_normalize.txt").write_text(
+            normalized_text, encoding="utf-8"
+        )
+        (dump_dir / f"{stem}_03_pre_tei_markup.txt").write_text(
+            marked_text, encoding="utf-8"
+        )
+        logger.info(
+            f"    Wrote normalization dumps: {stem}_02_after_normalize.txt, "
+            f"{stem}_03_pre_tei_markup.txt"
+        )
+
     tei_body = convert_markup_to_tei(marked_text)
 
     #if ENABLE_NORMALIZATION:
     #    tei_body = fix_hi_tag_spacing(tei_body)
 
     tei_body = post_process_body(tei_body)
+
+    if dump_dir is not None:
+        (dump_dir / f"{stem}_04_tei_body_postprocess.txt").write_text(
+            tei_body, encoding="utf-8"
+        )
+        logger.info(f"    Wrote TEI body dump: {stem}_04_tei_body_postprocess.txt")
 
     lines = tei_body.split("\n")
     filtered_lines = []
@@ -892,6 +934,33 @@ def main():
     parser.add_argument("--no-font-tags", action="store_true", help="Disable font classification")
     parser.add_argument("--no-normalization", action="store_true", help="Disable Unicode normalization")
     parser.add_argument(
+        "--no-extraction-dedup",
+        action="store_true",
+        help=(
+            "Disable InDesign duplicate-layer dedup in the extractor "
+            "(PyMuPDF: raw-line + within-row shadow; pytiblegenc: sliding-window line dedup). "
+            "Use when suspected duplicate suppression removes real repeated lines."
+        ),
+    )
+    parser.add_argument(
+        "--no-phantom-space",
+        action="store_true",
+        help=(
+            "PyMuPDF only: do not drop phantom U+0020 spaces (Monlam vowel-gap artefact). "
+            "Use when suspected mis-classification removes real narrow spaces."
+        ),
+    )
+    parser.add_argument(
+        "--dump-extraction",
+        metavar="DIR",
+        help=(
+            "Write per-PDF debug text files under DIR: "
+            "<stem>_01_raw_extract.txt (after extract), "
+            "_02_after_normalize.txt, _03_pre_tei_markup.txt, "
+            "_04_tei_body_postprocess.txt (after TEI body post-process, before empty-line filter)."
+        ),
+    )
+    parser.add_argument(
         "--assign-flat-toprocess",
         action="store_true",
         help="Also assign sources/*.pdf (root) across IE1KG25273-VE* folders in toprocess (default: ignore root PDFs)",
@@ -932,10 +1001,17 @@ def main():
 
     global ENABLE_FONT_CLASSIFICATION, ENABLE_NORMALIZATION
     global CROP_TOP_FRACTION, CROP_BOTTOM_FRACTION
+    global EXTRACTION_DEDUP, EXTRACTION_PHANTOM_SPACE_DROP, EXTRACTION_DUMP_DIR
     if args.no_font_tags:
         ENABLE_FONT_CLASSIFICATION = False
     if args.no_normalization:
         ENABLE_NORMALIZATION = False
+    if args.no_extraction_dedup:
+        EXTRACTION_DEDUP = False
+    if args.no_phantom_space:
+        EXTRACTION_PHANTOM_SPACE_DROP = False
+    if args.dump_extraction:
+        EXTRACTION_DUMP_DIR = Path(args.dump_extraction)
 
     if args.crop_top is not None:
         if not 0.0 <= args.crop_top < 0.5:

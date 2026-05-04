@@ -2,13 +2,13 @@ from pathlib import Path
 from tokenize import triple_quoted
 from typing import Optional
 
-IE_ID = "IE8CZ130"
+IE_ID = "IE3KG697"
 
-BASE_DIR = Path(r"/Users/tenzinmonlam/Documents/dharmaduta/pdf_convert_5/4th_may/to_convert")
+BASE_DIR = Path(r"/Users/tenzinmonlam/Documents/dharmaduta/pdf_convert_5/pymupdf_resolve/pecha")
 
-SOURCES_DIR = BASE_DIR / "IE8CZ130" / "sources"
-TOPROCESS_DIR = BASE_DIR / "IE8CZ130" / "toprocess"
-OUTPUT_DIR = BASE_DIR / "IE8CZ130_output"
+SOURCES_DIR = BASE_DIR / "IE3KG697" / "sources"
+TOPROCESS_DIR = BASE_DIR / "IE3KG697" / "toprocess"
+OUTPUT_DIR = BASE_DIR / "IE3KG697_output"
 ARCHIVE_DIR = OUTPUT_DIR / "archive"
 SOURCES_OUTPUT_DIR = OUTPUT_DIR / "sources"
 
@@ -17,10 +17,33 @@ CHECKPOINT_DIR = BASE_DIR / "checkpoints"
 
 PDF_TO_XML_LOG = LOG_DIR / "pdf_to_xml.log"
 PDF_TO_XML_CHECKPOINT = CHECKPOINT_DIR / "pdf_to_xml_checkpoint.txt"
-# ─── Header/footer redaction (physical) ───────────────────────────────
-# 0.0 = none. Typical: 0.07–0.12. Override with --crop-top / --crop-bottom.
-CROP_HEADER_FRACTION: float = 0.00   # e.g. 0.08  strips top 8 %
-CROP_FOOTER_FRACTION: float = 0.00   # e.g. 0.07  strips bottom 7 %
+# ─── Margin redaction — preserve rect (physical, all four sides) ──────────
+#
+# None  → auto-detect from the PDF (recommended default).
+#         margin_detector.py samples the PDF, finds the repeating body column,
+#         and returns a fraction rect automatically.
+#
+# Tuple → manual override as (x0, y0, x1, y1) fractions of page dimensions
+#         (0.0–1.0), matching the buddhist.tools/pdf-cropper output exactly.
+#
+#         Workflow:
+#           1. Open https://buddhist.tools/pdf-cropper
+#           2. Upload a representative page from your PDF.
+#           3. Draw a rectangle around the area you want to KEEP.
+#           4. Copy the 4 coordinates shown in the top-right corner.
+#           5. Paste them here, e.g.:
+#              PRESERVE_RECT = (0.12, 0.19, 0.88, 0.78)
+#
+#         Meaning of values (all fractions 0.0–1.0):
+#           x0 = left edge of keep-rect  (fraction of page width)
+#           y0 = top edge of keep-rect   (fraction of page height)
+#           x1 = right edge of keep-rect (fraction of page width)
+#           y1 = bottom edge of keep-rect(fraction of page height)
+#
+#         Everything outside that rectangle is physically redacted before
+#         text extraction (header, footer, side columns all at once).
+#
+PRESERVE_RECT: Optional[tuple[float, float, float, float]] = None
 
 def ensure_directories():
     for d in [

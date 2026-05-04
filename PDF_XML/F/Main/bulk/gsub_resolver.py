@@ -127,32 +127,22 @@ def _compute_fuzzy_hash(ttfont, glyph_name: str, resolution: int = _FUZZY_RESOLU
     if not coords:
         return sha256(f"EMPTY:{glyph_name}".encode()).hexdigest()
 
-    # Normalise per contour: scale by unitsPerEm, then translate each contour
-    # independently so its own min corner = (0, 0).
-    #
-    # Why per-contour rather than global:
-    #   Multi-contour glyphs (e.g. vowel sign + anusvara dot) are sometimes
-    #   embedded in PDF subsets with one contour shifted by a constant offset
-    #   relative to the full font version.  A global translation leaves the
-    #   relative inter-contour offset unchanged, breaking the hash match.
-    #   Per-contour normalisation makes each contour's shape position-independent.
-    scaled = [(x / upem, y / upem) for x, y in coords]
-    contour_ends = set(end_pts)
+    # Normalise: scale by unitsPerEm, translate so min corner = (0, 0)
+    norm = [(x / upem, y / upem) for x, y in coords]
+    min_x = min(p[0] for p in norm)
+    min_y = min(p[1] for p in norm)
+    norm = [(x - min_x, y - min_y) for x, y in norm]
 
-    # Split into contours, normalise each, then re-encode
+    # Encode with reduced precision
+    contour_ends = set(end_pts)
     parts: list[str] = []
-    start = 0
-    for end_idx in sorted(contour_ends):
-        contour = scaled[start : end_idx + 1]
-        cx_min = min(p[0] for p in contour)
-        cy_min = min(p[1] for p in contour)
-        for j, (x, y) in enumerate(contour):
-            rx = round((x - cx_min) * resolution) / resolution
-            ry = round((y - cy_min) * resolution) / resolution
-            on_curve = flags[start + j] & 1
-            parts.append(f"{rx:.4f},{ry:.4f},{on_curve}")
-        parts.append("|")
-        start = end_idx + 1
+    for i, (x, y) in enumerate(norm):
+        rx = round(x * resolution) / resolution
+        ry = round(y * resolution) / resolution
+        on_curve = flags[i] & 1
+        parts.append(f"{rx:.4f},{ry:.4f},{on_curve}")
+        if i in contour_ends:
+            parts.append("|")
 
     return sha256(";".join(parts).encode()).hexdigest()
 
@@ -258,13 +248,9 @@ def invert_gsub(ttfont) -> Dict[str, Set[Tuple[int, ...]]]:
             # ── Type 4: Ligature substitution ────────────────────────────────
             elif lookup_type == 4 and hasattr(sub, "ligatures"):
                 for first_glyph, lig_set in sub.ligatures.items():
-                    # fontTools returns lig_set as a plain list of Ligature
-                    # objects — the original hasattr(lig_set, "Ligature") guard
-                    # always failed, silently skipping every Type 4 ligature.
-                    ligs = lig_set if isinstance(lig_set, list) else (
-                        lig_set.Ligature if hasattr(lig_set, "Ligature") else []
-                    )
-                    for lig in ligs:
+                    if not hasattr(lig_set, "Ligature"):
+                        continue
+                    for lig in lig_set.Ligature:
                         seq_glyphs = [first_glyph] + list(lig.Component)
                         seq = _glyphs_to_seq(seq_glyphs)
                         if seq:
@@ -370,9 +356,13 @@ def build_glyph_unicode_map(
     Build a complete glyph_name → unicode_string mapping for a Unicode Tibetan
     font by combining:
 
-      1. The ToUnicode CMap (trusted Tibetan entries only)
-      2. GSUB inversion (requires full font with cmap + GSUB tables)
-      3. Fuzzy shape matching (resolution-6 outline hash against trusted entries)
+      Step 2.1  The PDF's ToUnicode CMap (trusted Tibetan entries only)
+      Step 2.2  The font's own cmap table (works if subset retains it;
+                most PDF subsets strip it, but when present gives direct coverage)
+      Step 2.3a GSUB inversion (requires full font with cmap + GSUB tables)
+      Step 2.3b Fuzzy shape matching (resolution-6 outline hash against trusted entries)
+
+    Steps run in order; each only adds glyphs not already resolved by a prior step.
 
     Parameters
     ----------
@@ -401,6 +391,31 @@ def build_glyph_unicode_map(
         if gid < len(glyph_order):
             result[glyph_order[gid]] = uni
     logger.debug("Step 2.1: %d Tibetan CMap entries accepted", len(trusted))
+
+    # ── Step 2.2: Embedded font cmap ────────────────────────────────────────
+    # Read the cmap table directly from the font object (full or subset).
+    # Most PDF subset fonts have their cmap stripped, so this yields nothing.
+    # When present it maps glyph_name → Unicode without needing GSUB at all,
+    # covering any GIDs whose ToUnicode CMap entry was absent or wrong.
+    if "cmap" in ttfont:
+        try:
+            font_cmap = ttfont["cmap"].getBestCmap() or {}
+            resolved_via_font_cmap = 0
+            for cp, glyph_name in font_cmap.items():
+                if glyph_name in result:
+                    continue  # already resolved by Step 2.1
+                uni = chr(cp)
+                if _is_tibetan(uni):
+                    result[glyph_name] = uni
+                    resolved_via_font_cmap += 1
+            logger.debug(
+                "Step 2.2 (font cmap): %d additional glyphs resolved",
+                resolved_via_font_cmap,
+            )
+        except Exception as exc:
+            logger.debug("Step 2.2 (font cmap): failed — %s", exc)
+    else:
+        logger.debug("Step 2.2 (font cmap): skipped — no cmap table in font (subset)")
 
     # ── Step 2.3a: GSUB inversion (requires full font) ──────────────────────
     gsub_map = invert_gsub(ttfont)  # empty {} for stripped subset fonts
