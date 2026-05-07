@@ -909,7 +909,6 @@ def extract_pdf_pymupdf(
             except OSError:
                 pass
 
-
 def extract_pdf_to_text(
     pdf_path: Path,
     extractor: str,
@@ -919,20 +918,214 @@ def extract_pdf_to_text(
     extraction_dedup: bool = True,
     phantom_space_drop: bool = True,
 ) -> str:
-    """Dispatch to PyMuPDF or pytiblegenc."""
-    if extractor == "pytiblegenc":
-        text = extract_pdf_pytiblegenc(
-            pdf_path,
-            crop_top=crop_top,
-            crop_bottom=crop_bottom,
-            extraction_dedup=extraction_dedup,
-        )
-    else:
-        text = extract_pdf_pymupdf(
-            pdf_path,
-            crop_top=crop_top,
-            crop_bottom=crop_bottom,
-            extraction_dedup=extraction_dedup,
-            phantom_space_drop=phantom_space_drop,
-        )
+    """Dispatch to PyMuPDF, pytiblegenc, or Hybrid."""
+    # We override the extractor argument here to force the Hybrid Approach.
+    # You can configure argparse in convert_pdf_to_xml.py to accept 'hybrid' directly.
+    
+    text = extract_pdf_hybrid(
+        pdf_path,
+        crop_top=crop_top,
+        crop_bottom=crop_bottom,
+        extraction_dedup=extraction_dedup,
+        phantom_space_drop=phantom_space_drop,
+    )
+    
     return _merge_orphan_tibetan_line_breaks(text or "")
+def _extract_line_text_hybrid(
+    line: dict,
+    font_normalization: dict,
+    glyph_lookup: dict,
+    stats: dict,
+    *,
+    drop_phantom_spaces: bool = True
+) -> list[str]:
+    """
+    Extracts text from a MuPDF line, but decodes legacy characters using pytiblegenc.
+    """
+    from pytiblegenc.char_converter import convert_string
+
+    fragments: list[str] = []
+    span_prev_char_obj: dict | None = None
+
+    for span in line.get("spans", []):
+        raw_font_name = span.get("font", "")
+        if _is_wingdings_font(raw_font_name):
+            continue
+
+        fs = round(span.get("size", 12))
+        fragments.append(_FONT_SIZE_FORMAT.format(fs))
+
+        # 1. Clean the font name (remove PDF subset prefixes like 'ABCDEF+')
+        clean_font = raw_font_name.split("+", 1)[-1] if "+" in raw_font_name else raw_font_name
+
+        # 2. Resolve to canonical pytiblegenc font name using normalization map or aliases
+        canonical_fonts = font_normalization.get(clean_font) or font_normalization.get(raw_font_name)
+        if canonical_fonts:
+            # Use the first matched canonical font from the hash DB
+            target_font = list(canonical_fonts)[0] 
+        else:
+            # Fallback to alias map
+            aliases = _get_font_name_aliases()
+            target_font = aliases.get(clean_font, clean_font)
+
+        char_objs = span.get("chars") or []
+        if char_objs:
+            for char_obj in char_objs:
+                # Fix 1+3+4: drop phantom glyph-advance spaces
+                if drop_phantom_spaces and _is_phantom_space(char_obj, span_prev_char_obj):
+                    continue
+
+                c = char_obj.get("c", "")
+                
+                # HYBRID DECODING: Pass PyMuPDF's char through pytiblegenc
+                decoded_c = convert_string(
+                    c, 
+                    target_font, 
+                    stats, 
+                    error_chr_fun=None, 
+                    glyph_lookup=glyph_lookup
+                )
+
+                # Fallback: If pytiblegenc returns None (unhandled font), use original char + Monlam fixes
+                if decoded_c is None:
+                    decoded_c = _correct_monlam_glyph(c)
+
+                fragments.append(decoded_c)
+                span_prev_char_obj = char_obj
+        else:
+            # If no char-level data, process the whole text string
+            text = span.get("text", "")
+            decoded_text = ""
+            for ch in text:
+                dec = convert_string(ch, target_font, stats, error_chr_fun=None, glyph_lookup=glyph_lookup)
+                if dec is None:
+                    dec = _correct_monlam_glyph(ch)
+                decoded_text += dec
+            fragments.append(decoded_text)
+            span_prev_char_obj = None
+
+    return fragments
+
+
+def extract_pdf_hybrid(
+    pdf_path: Path,
+    *,
+    crop_top: float = 0.0,
+    crop_bottom: float = 0.0,
+    extraction_dedup: bool = True,
+    phantom_space_drop: bool = True,
+) -> str:
+    """
+    Extracts text using PyMuPDF's layout sorting, but pytiblegenc's font decoding.
+    """
+    logger.info(f"    Extracting (Hybrid Mode): {pdf_path.name}")
+
+    if not PYMUPDF_AVAILABLE or not PYTIBLEGENC_AVAILABLE:
+        logger.error("Both PyMuPDF and pytiblegenc are required for the hybrid extractor.")
+        return ""
+
+    tmp_pdf: Optional[Path] = None
+
+    try:
+        # 1. Handle Redaction / Cropping
+        if crop_top > 0.0 or crop_bottom > 0.0:
+            tmp_pdf = create_cropped_pdf(pdf_path, crop_top, crop_bottom)
+
+        target_pdf = tmp_pdf if tmp_pdf else pdf_path
+
+        # 2. Setup pytiblegenc Font Normalization & Glyph Lookup
+        font_normalization: dict = {}
+        glyph_lookup = None
+        try:
+            glyph_db_path = get_glyph_db_path()
+            glyph_index = build_font_hash_index_from_csv(str(glyph_db_path))
+            with open(str(target_pdf), "rb") as _f:
+                _parser = PDFParser(_f)
+                _doc_tmp = PDFDocument(_parser)
+                font_normalization = identify_pdf_fonts_from_db(_doc_tmp, glyph_index) or {}
+            glyph_lookup = build_glyph_lookup_tables(str(glyph_db_path))
+        except Exception as exc:
+            logger.warning("Could not load font normalization or glyph lookup: %s", exc)
+
+        # Inject legacy aliases (Fix 7)
+        for alias, canonical in _get_font_name_aliases().items():
+            if alias not in font_normalization:
+                font_normalization[alias] = {canonical}
+
+        stats: dict = {"unhandled_fonts": {}, "handled_fonts": {}, "unknown_characters": {}, "error_characters": 0, "diffs_with_utfc": {}}
+
+        # 3. PyMuPDF Extraction Loop
+        doc = fitz.open(str(target_pdf))
+        parts: list[str] = []
+
+        for page in doc:
+            page_dict = page.get_text("rawdict")
+            raw_lines: list[tuple[float, float, list[str]]] = [] 
+
+            for block in page_dict.get("blocks", []):
+                if block.get("type", 1) != 0:
+                    continue
+                for line in block.get("lines", []):
+                    bbox = line.get("bbox", [0, 0, 0, 0])
+                    y_mid = (bbox[1] + bbox[3]) / 2.0
+                    x0 = bbox[0]
+                    
+                    # Send line to our new hybrid decoder
+                    fragments = _extract_line_text_hybrid(
+                        line, 
+                        font_normalization, 
+                        glyph_lookup, 
+                        stats, 
+                        drop_phantom_spaces=phantom_space_drop
+                    )
+                    
+                    if fragments:
+                        raw_lines.append((y_mid, x0, fragments))
+
+            # 4. Apply PyMuPDF Deduplication & Coordinate Sorting
+            if raw_lines and extraction_dedup:
+                raw_lines = _deduplicate_raw_lines(raw_lines, _Y_MERGE_TOLERANCE)
+
+            # Sort top-to-bottom, then left-to-right
+            raw_lines.sort(key=lambda t: (t[0], t[1]))
+
+            # Merge lines that share the same Y midpoint
+            merged_rows: list[list[tuple[float, float, list[str]]]] = []
+            for y_mid, x0, frags in raw_lines:
+                if merged_rows:
+                    avg_y = sum(e[0] for e in merged_rows[-1]) / len(merged_rows[-1])
+                    if abs(y_mid - avg_y) <= _Y_MERGE_TOLERANCE:
+                        merged_rows[-1].append((y_mid, x0, frags))
+                        continue
+                merged_rows.append([(y_mid, x0, frags)])
+
+            # Emit text
+            for row in merged_rows:
+                row.sort(key=lambda t: t[1])
+                if extraction_dedup:
+                    row = _dedup_within_row(row)
+                for _y, _x, frags in row:
+                    parts.extend(frags)
+                parts.append("\n")
+
+            parts.append(f"\n{PAGE_BREAK_STR}\n")
+
+        doc.close()
+        
+        # Log unhandled fonts to help you debug missed legacy fonts
+        if stats["unhandled_fonts"]:
+            logger.warning("Hybrid Mode - Unhandled fonts (no conversion table): %s", stats["unhandled_fonts"])
+            
+        return "".join(parts)
+
+    except Exception as e:
+        logger.error(f"    ERROR extracting {pdf_path.name}: {e}")
+        import traceback
+        traceback.print_exc()
+        return ""
+    finally:
+        if tmp_pdf is not None and tmp_pdf.exists():
+            try:
+                os.unlink(tmp_pdf)
+            except OSError:
+                pass

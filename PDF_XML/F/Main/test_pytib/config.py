@@ -1,12 +1,13 @@
 from pathlib import Path
 
-IE_ID = "IE8CZ102"
+IE_ID = "IE4CZ369298"
 
-BASE_DIR = Path(r"/Users/tenzinmonlam/Documents/dharmaduta/pdf_convert_5/4th_may/to_convert")
+BASE_DIR = Path(r"/Users/tenzinmonlam/Documents/dharmaduta/pdf_convert_5/4th_may/issues")
+#BASE_DIR = Path(r"/Users/tenzinmonlam/Documents/dharmaduta/pdf_convert_5")
 
-SOURCES_DIR = BASE_DIR / "IE8CZ102" / "sources"
-TOPROCESS_DIR = BASE_DIR / "IE8CZ102" / "toprocess"
-OUTPUT_DIR = BASE_DIR / "IE8CZ102_output"
+SOURCES_DIR = BASE_DIR / "IE4CZ369298" / "sources"
+TOPROCESS_DIR = BASE_DIR / "IE4CZ369298" / "toprocess"
+OUTPUT_DIR = BASE_DIR / "IE4CZ369298_output"
 ARCHIVE_DIR = OUTPUT_DIR / "archive"
 SOURCES_OUTPUT_DIR = OUTPUT_DIR / "sources"
 
