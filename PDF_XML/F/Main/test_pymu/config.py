@@ -1,13 +1,13 @@
 from pathlib import Path
 from typing import Optional
 
-IE_ID = "IE8LS76787"
+IE_ID = "IE8LS77056"
 
-BASE_DIR = Path(r"/Users/tenzinmonlam/Documents/dharmaduta/pdf_convert_5")
-
-SOURCES_DIR = BASE_DIR / "IE8LS76787" / "sources"
-TOPROCESS_DIR = BASE_DIR / "IE8LS76787" / "toprocess"
-OUTPUT_DIR = BASE_DIR / "IE8LS76787_output"
+BASE_DIR = Path(r"/Users/tenzinmonlam/Documents/dharmaduta/6th_batch_conversion/archive_fitered_pdfs/process")
+# Input PDFs: BASE_DIR / IE_ID / to_convert / VE_ID / *.pdf
+SOURCES_DIR = BASE_DIR / IE_ID / "to_convert" #sources or to_convert
+TOPROCESS_DIR = BASE_DIR / IE_ID / "toprocess"
+OUTPUT_DIR = BASE_DIR / f"{IE_ID}_output"
 ARCHIVE_DIR = OUTPUT_DIR / "archive"
 SOURCES_OUTPUT_DIR = OUTPUT_DIR / "sources"
 
@@ -19,9 +19,8 @@ PDF_TO_XML_CHECKPOINT = CHECKPOINT_DIR / "pdf_to_xml_checkpoint.txt"
 
 # ─── Header/footer redaction (physical) ───────────────────────────────────────
 # 0.0 = none. Typical: 0.07–0.12. Override with --crop-top / --crop-bottom.
-CROP_HEADER_FRACTION: float = 0.00
-CROP_FOOTER_FRACTION: float = 0.00
-
+CROP_HEADER_FRACTION: float = 0.10
+CROP_FOOTER_FRACTION: float = 0.12
 
 def ensure_directories():
     for d in [OUTPUT_DIR, ARCHIVE_DIR, SOURCES_OUTPUT_DIR, LOG_DIR, CHECKPOINT_DIR]:
@@ -60,7 +59,8 @@ def get_max_archive_sequence(ve_id: str) -> int:
 #   Path to a directory   — all .ttf/.otf files inside are used
 #   Path to a .ttf file   — that file is used directly
 #   List of paths         — mix of files and directories
-FONT_DIR = Path("/Users/tenzinmonlam/tibetan-fonts")
+FONT_DIR = None
+#Path("/Users/tenzinmonlam/tibetan-fonts")
 
 # ─── Footnote detection (PyMuPDF extractor only) ──────────────────────────────
 FOOTNOTE_DETECTION: bool = True

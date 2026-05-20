@@ -14,6 +14,88 @@ def remove_wingdings_private_use(text: str) -> str:
     return _WINGDINGS_MS_PUA.sub("", text)
 
 
+# ── Consonant-cluster duplicate removal ─────────────────────────────────────────
+#
+# InDesign archival PDFs sometimes emit each syllable's consonant stack twice in a
+# single text run.  The two copies are adjacent (no tsheg/shad between them) and
+# differ only in whether vowel signs are present on the first copy:
+#
+#   Pattern A — vowel only on second copy (shadow has bare consonants):
+#       གྱགྱི   →  གྱི     རྒྱརྒྱལ  →  རྒྱལ
+#
+#   Pattern B — vowel present on BOTH copies (identical units):
+#       ཆུཆུབ  →  ཆུབ    ཙཱཙཱ    →  ཙཱ
+
+_UNIT_RE = re.compile(
+    r'[\u0f40-\u0f6c]'                                   # Tibetan base consonant
+    r'[\u0f8d-\u0fbc]*'                                   # subjoined consonants (0+)
+    r'[\u0f71-\u0f84\u0f86\u0f87\u0f7e\u0f7f]*'         # vowel signs + marks (0+)
+)
+_NON_UNIT_RE = re.compile(
+    r'[^\u0f40-\u0f6c\u0f8d-\u0fbc\u0f71-\u0f84\u0f86\u0f87\u0f7e\u0f7f]+'
+)
+_VOWEL_MARK_RE = re.compile(r'[\u0f71-\u0f84\u0f86\u0f87\u0f7e\u0f7f]')
+
+
+def _has_tibetan_vowel_mark(unit: str) -> bool:
+    """True if *unit* contains at least one Tibetan vowel / dependent vowel mark."""
+    return bool(_VOWEL_MARK_RE.search(unit))
+
+
+def _consonant_skeleton(unit: str) -> str:
+    """Return *unit* with all vowel signs stripped, leaving only base + subjoineds."""
+    return _VOWEL_MARK_RE.sub("", unit)
+
+
+def collapse_duplicate_consonant_clusters(text: str) -> str:
+# Remove InDesign shadow stacks: bare consonant copy + vowelled copy (Pattern A),
+    if not text:
+        return text
+
+    tokens: list[tuple[str, bool]] = []
+    pos = 0
+    n = len(text)
+    while pos < n:
+        m = _UNIT_RE.match(text, pos)
+        if m:
+            tokens.append((m.group(), True))
+            pos = m.end()
+            continue
+        m = _NON_UNIT_RE.match(text, pos)
+        if m:
+            tokens.append((m.group(), False))
+            pos = m.end()
+            continue
+        tokens.append((text[pos], False))
+        pos += 1
+
+    result: list[str] = []
+    i = 0
+    while i < len(tokens):
+        tok, is_unit = tokens[i]
+        if is_unit and i + 1 < len(tokens) and tokens[i + 1][1]:
+            nxt = tokens[i + 1][0]
+            if _consonant_skeleton(tok) == _consonant_skeleton(nxt):
+                pattern_a = (
+                    not _has_tibetan_vowel_mark(tok)
+                    and _has_tibetan_vowel_mark(nxt)
+                )
+                pattern_b = (
+                    tok == nxt
+                    and (
+                        _has_tibetan_vowel_mark(tok)
+                        or len(tok) > 1
+                    )
+                )
+                if pattern_a or pattern_b:
+                    i += 1  # skip shadow copy; next iteration keeps the real copy
+                    continue
+        result.append(tok)
+        i += 1
+
+    return "".join(result)
+
+
 # -------------------------------------------------------------------------
 # Precompiled patterns & translation tables
 
@@ -39,40 +121,55 @@ _UNICODE_SPACES = [
 ]
 _SPACE_TO_ASCII = {ord(ch): " " for ch in _UNICODE_SPACES}
 
-# Consecutive duplicate Tibetan vowel signs (PDF / layered extract artefacts).
-# U+0F71–U+0F7D: dependent vowels (gigu, naro, ེ, ོ, …); U+0F80–U+0F81: vocalic marks.
-# Subjoined consonants (U+0F8D–) are excluded so stacks like ྲྲ stay intact.
-_COLLAPSE_DUP_TIB_VOWEL_MARK_RE = re.compile(r"([\u0f71-\u0f7d\u0f80-\u0f81])\1+")
+# Consecutive duplicate Tibetan combining marks (vowels, subjoined, etc.) from
+# layered PDF extraction.  Broader than vowel-only; see normalize_unicode step 10.
+_COLLAPSE_DUP_TIB_MARKS_RE = re.compile(
+    r"([\u0f71-\u0f87\u0f8d-\u0fbc\u0f35\u0f37\u0f39])\1+"
+)
+
+# InDesign section running headers: UTF-16-BE code units in angle brackets.
+# <FEFF0053006500630031003A> = BOM + "Sec1:" ; 0032003A = "Sec2:"
+_INDESIGN_SECTION_MARKER_RE = re.compile(
+    r"<FEFF005300650063003[12]003A>"
+    r"(?:[IVXLCDMivxlcdm]+|\d+)?"
+)
+_FS_ONLY_ROMAN_HEADER_RE = re.compile(
+    r"(?:^|\n)<fs:\d+>\s*[IVXLCDMivxlcdm]+\s*(?=\n)"
+)
+_ROMAN_LINE_BEFORE_PAGE_BREAK_RE = re.compile(
+    r"(?:^|\n)\s*[IVXLCDMivxlcdm]{1,6}\s*(?=\n+\s*ZZZZ:)"
+)
 
 
-def collapse_duplicate_tibetan_vowel_marks(text: str) -> str:
+def collapse_duplicate_tibetan_marks(text: str) -> str:
     """
-    Collapse runs of two or more identical Tibetan vowel signs to one character.
-
-    Overlapping InDesign text layers or mark+cluster cmap pairs often emit the
-    same mark twice or thrice (e.g. གཞིི, དཔེེེ, མཚོོན).  Only *consecutive*
-    identical codepoints in the ranges above are merged.
+    Universally collapse consecutive identical Tibetan combining marks caused by overlapping text layers in PDFs.
     """
     if not text:
         return text
-    return _COLLAPSE_DUP_TIB_VOWEL_MARK_RE.sub(r"\1", text)
+    return _COLLAPSE_DUP_TIB_MARKS_RE.sub(r"\1", text)
+
+
+def remove_indesign_section_markers(text: str) -> str:
+    """
+    Remove InDesign section running headers encoded as UTF-16-BE hex in angle brackets,
+    e.g. ``<FEFF0053006500630031003A>III`` (BOM + "Sec1:" + roman numeral).
+    """
+    if not text:
+        return text
+    s = _INDESIGN_SECTION_MARKER_RE.sub("", text)
+    s = _FS_ONLY_ROMAN_HEADER_RE.sub("\n", s)
+    s = _ROMAN_LINE_BEFORE_PAGE_BREAK_RE.sub("\n", s)
+    s = re.sub(r"\n{3,}", "\n\n", s)
+    return s
 
 
 def fix_pdf_glyph_to_unicode_artifacts(text: str) -> str:
     """
     Repair common Monlam / legacy PDF ToUnicode mistakes (Latin PUA fallbacks).
-
     Observed in IE3KG647 et al.:
       - U+0140 (ŀ) used for Tibetan vowel sign o (U+0F7C)
       - U+0132 (Ĳ) used inside ཚིག / ཚེས / ཚིགས / མཛེས / …
-
-    Additional artifacts from WinAnsiEncoding MonlamUniOuChan2 font and
-    MuPDF GID-as-Unicode fallback (Identity-H, no matching ToUnicode entry):
-      - U+013D (Ľ) produced by GID 0x013D → MuPDF uses GID as codepoint;
-        glyph is tib.Naro.Anusvara (ོ + ཾ ligature on ཨ → OM context).
-        Always appears as ཨĽ → correct to ཨོཾ (OM = ༀ in NFD form).
-      - U+2020 (†) and U+2021 (‡) from WinAnsi byte 0x86/0x87 on the dot-leader
-        glyph (uni0086); visually a period in Monlam font.
     """
     if not text:
         return text
@@ -127,17 +224,11 @@ def normalize_spaces(
 ) -> str:
     """
     Normalize spaces in text.
-
     Steps:
       1. Collapse multiple newlines to one.
       2. Remove spaces next to newlines.
       3. Collapse multiple spaces to one.
       4. Apply Tibetan-specific space normalization rules.
-
-    Tibetan-specific rules:
-      - Remove space after tsheg (U+0F0B, U+0F0C, U+0FD2) if followed by
-        initial letter (U+0F40-U+0F6C) or shad (U+0F0D-U+0F11)
-      - Remove space between final letter (U+0F40-U+0FBC) and tsheg
     """
     if not text:
         return ""
@@ -147,9 +238,13 @@ def normalize_spaces(
     # 1) Collapse multiple newlines
     s = re.sub(r"\n{2,}", "\n", s)
 
-    # 2) Remove spaces next to newlines
-    s = re.sub(r"[ ]+\n", "\n", s)
-    s = re.sub(r"\n[ ]+", "\n", s)
+    # 2) Remove spaces next to newlines, but preserve a single space that
+    # may be the only separator between a line-ending shad/letter and the
+    # content beginning the next line (edge case: keep at most one space).
+    s = re.sub(r"[ ]{2,}\n", "\n", s)   # collapse multiple trailing spaces → nothing
+    s = re.sub(r"[ ]\n", "\n", s)        # drop the single trailing space
+    s = re.sub(r"\n[ ]{2,}", "\n", s)    # collapse multiple leading spaces → nothing
+    # Do NOT strip single leading space after \n — it may be a word separator
 
     # 3) Collapse space runs
     if collapse_internal_spaces:
@@ -157,10 +252,17 @@ def normalize_spaces(
 
     # 4) Tibetan-specific space normalization
     if tibetan_specific:
-        # Remove space after tsheg if followed by initial letter or shad
-        s = re.sub(r"([\u0f0b\u0f0c\u0fd2]) +([\u0f40-\u0f6c\u0f0d-\u0f11])", r"\1\2", s)
-        # Remove space between final letter and tsheg
-        s = re.sub(r"([\u0f40-\u0fbc]) +([\u0f0b\u0f0c\u0fd2])", r"\1\2", s)
+        # Remove space between a Tibetan consonant/stack and its following tsheg or
+        # shad — both are punctuation that belong to the preceding syllable.
+        # U+0F0B/0F0C/0FD2 = tsheg variants; U+0F0D–U+0F11 = shad variants.
+        s = re.sub(r"([\u0f40-\u0fbc]) +([\u0f0b\u0f0c\u0fd2\u0f0d-\u0f11])", r"\1\2", s)
+        # Remove space after tsheg ONLY when it is immediately followed by another
+        # tsheg/shad — that is pure punctuation noise. Do NOT strip the space after
+        # tsheg when it precedes a consonant or digit: that space is a legitimate
+        # inter-syllable or inter-word separator in printed Tibetan.
+        s = re.sub(r"([\u0f0b\u0f0c\u0fd2]) +([\u0f0b\u0f0c\u0fd2\u0f0d-\u0f11])", r"\1\2", s)
+        # NOTE: spaces after shad (U+0F0D–U+0F11) before a consonant are kept;
+        # they are sentence/paragraph separators and must be preserved in the XML.
 
     return s
 
@@ -175,15 +277,16 @@ def normalize_unicode(
 
     Steps:
       1. Normalize to NFC.
-      2. Convert all line breaks to '\n'.
+      2. Convert all line breaks to '\\n'.
       3. Remove zero-width / invisible characters (incl. all BOMs).
       4. Map Unicode spaces and tabs to plain ASCII space.
       5. Optionally remove control characters (except newline).
       6. Normalize spaces (including Tibetan-specific rules).
-      7. Remove stray Latin 'm' (Monlam extract artefacts).
+      6b. Fix PDF cmap / legacy font mis-encodings (Latin PUA → Tibetan).
       8. Remove Wingdings/Wingdings2 PUA symbols (U+F020–U+F0FF).
-      9. Apply Tibetan Unicode normalization.
-      10. Collapse consecutive duplicate Tibetan vowel marks (PDF layer artefacts).
+      9. Apply Tibetan Unicode normalization (decomposition, reorder).
+      9b. Collapse intra-line consonant-cluster duplicates (InDesign shadow text).
+      10. Safety-net: collapse consecutive duplicate Tibetan combining marks.
 
     Keeps ZWJ/ZWNJ (joiners) intact.
     """
@@ -214,24 +317,25 @@ def normalize_unicode(
 
     # 6b) PDF cmap / legacy font mis-encodings (Latin letters standing in for Tibetan)
     s = fix_pdf_glyph_to_unicode_artifacts(s)
-    # 6c) Restore visible gaps after shad / before Tibetan digits (dates, headings)
-    # s = normalize_tibetan_boundary_spaces(s)
+
+    # 6c) InDesign section running headers (UTF-16-BE hex + roman/arabic page labels)
+    s = remove_indesign_section_markers(s)
 
     # 8) Wingdings/Wingdings2 bullets and dingbats (PUA safety net)
     s = remove_wingdings_private_use(s)
 
     # 9) Tibetan Unicode normalization
     s = normalize_unicode_tib(s)
-    # 10) Duplicate gigu / naro / ེ / ོ from overlapping PDF text layers
-    s = collapse_duplicate_tibetan_vowel_marks(s)
+    # 9b) Intra-line consonant-cluster duplicates from InDesign shadow text layers.
+    s = collapse_duplicate_consonant_clusters(s)
+    # 10) Safety-net: collapse consecutive identical Tibetan combining marks.
+    s = collapse_duplicate_tibetan_marks(s)
     # no graphical distinction between 0f0b and 0f0c
     s = s.replace("\u0f0c", "\u0f0b")
     # double shad is just two shad
     s = s.replace("\u0f0e", "\u0f0d\u0f0d")
 
     return s
-
-
 
 
 class Cats(Enum):
@@ -251,8 +355,7 @@ CATEGORIES = (
     + [Cats.Other] * 22  # 0F02-0F17
     + [Cats.BottomVowel] * 2  # 0F18-0F19
     + [Cats.Other] * 6  # 0F1A-0F1F
-    + [Cats.Base]
-    * 20  # 0F20-0F33, numbers can be followed by 0f18, 0f19 or exceptionally by vowels
+    + [Cats.Base] * 20  # 0F20-0F33: digits + occasional vowels
     + [Cats.Other]  # 0F34
     + [Cats.BottomMark]  # 0F35
     + [Cats.Other]  # 0F36
@@ -358,16 +461,12 @@ def normalize_unicode_tib(s, form="nfd"):
     return s
 
 
-def is_vowel(char):
-    if re.search(r"[\u0f71-\u0f84]", char):
-        return True
-    return False
+def is_vowel(char: str) -> bool:
+    return bool(re.search(r"[\u0f71-\u0f84]", char))
 
 
-def is_suffix(char):
-    if re.search(r"[\u0f90-\u0fbc]", char):
-        return True
-    return False
+def is_suffix(char: str) -> bool:
+    return bool(re.search(r"[\u0f90-\u0fbc]", char))
 
 
 def normalize_invalid_start_string(s):

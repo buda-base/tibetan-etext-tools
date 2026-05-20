@@ -59,24 +59,28 @@ def post_process_body(body_content: str) -> str:
     Handles ``<hi rend="…">`` spans for font-size markup and
     ``<note n="N" place="foot">…</note>`` footnote elements.
     """
+    # Match both bare <pb/> and attributed <pb n="…"/> in all patterns.
+    _PB = r"<pb(?:\s[^/]*)*/>"
+
     body_content = body_content.strip()
-    body_content = re.sub(r"<pb/>\s*</hi>", r"</hi>\n<pb/>", body_content)
+    # Inline <hi> must close before any page break.
+    body_content = re.sub(r"(" + _PB + r")\s*</hi>", r"</hi>\n\1", body_content)
 
     body_content = body_content.replace("\n", "\n<lb/>")
     body_content = re.sub(r" *<lb/> *", "\n<lb/>", body_content)
-    body_content = re.sub(r"<lb/>\s*<pb/>", "<pb/>", body_content)
-    body_content = re.sub(r"(<pb/>\s*){2,}", "<pb/>\n", body_content)
+    body_content = re.sub(r"<lb/>\s*(" + _PB + r")", r"\1", body_content)
+    body_content = re.sub(r"(" + _PB + r"\s*){2,}", "<pb/>\n", body_content)
     body_content = body_content.strip()
 
     # Fold stray </hi> that ends up on its own <lb/> line onto the prior line.
     body_content = re.sub(r"(<lb/>[^\n]+)\n+<lb/></hi>", r"\1</hi>", body_content)
     # Remove spurious <lb/> between </hi> and <pb/>.
-    body_content = re.sub(r"(</hi>)\s*\n\s*<lb/>\s*\n*\s*(<pb/>)", r"\1\n\2", body_content)
+    body_content = re.sub(r"(</hi>)\s*\n\s*<lb/>\s*\n*\s*(" + _PB + r")", r"\1\n\2", body_content)
 
     body_content = re.sub(r'<hi rend="[^"]+">[\s]*(?:<lb/>[\s]*)*</hi>', "", body_content)
     body_content = re.sub(r'(<hi rend="[^"]+">)\s*\n<lb/>', r"\n<lb/>\1", body_content)
     body_content = re.sub(r"\n<lb/></hi>", r"</hi>\n<lb/>", body_content)
-    body_content = re.sub(r"(<pb/>)\s*\n\s*<lb/>\s*\n\s*<lb/>", r"\1\n<lb/>", body_content)
+    body_content = re.sub(r"(" + _PB + r")\s*\n\s*<lb/>\s*\n\s*<lb/>", r"\1\n<lb/>", body_content)
     body_content = re.sub(r"\n\n+", "\n", body_content)
     body_content = re.sub(r'<hi rend="[^"]+">[\s]*</hi>', "", body_content)
     body_content = body_content.strip()

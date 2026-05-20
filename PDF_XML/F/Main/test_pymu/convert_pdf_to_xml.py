@@ -53,6 +53,7 @@ from normalization import normalize_unicode, remove_wingdings_private_use
 from tei_generator import post_process_body, generate_tei_xml, calculate_sha256
 from pdf_extract import (
     PAGE_BREAK_STR,
+    PAGE_BREAK_PREFIX_RE,
     PYMUPDF_AVAILABLE,
     PYTIBLEGENC_AVAILABLE,
     extract_pdf_to_text,
@@ -87,22 +88,35 @@ PDF_EXTRACTOR: str = "pymupdf"
 CROP_TOP_FRACTION: float = CROP_HEADER_FRACTION
 CROP_BOTTOM_FRACTION: float = CROP_FOOTER_FRACTION
 
-# Characters that may appear in PDF footer/header artifacts
-_PAGE_ARTIFACT_CHARS = r"\u0F0B\u0F740-9\uFF10-\uFF19\s"
+# When set from CLI ``--preserve-box``, takes priority over CROP_TOP/BOTTOM_FRACTION.
+# Format: [x0_frac, y0_frac, x1_frac, y1_frac] — normalised [0.0, 1.0] coordinates.
+PRESERVE_BOX: Optional[list] = None
+
+# Characters that may appear in PDF footer/header artifacts.
+# NOTE: do NOT include \s here — it overlaps with the surrounding \s* and \n?
+# quantifiers in strip_page_number_artifacts, causing catastrophic backtracking
+# on large documents. Horizontal whitespace (space/tab) is listed explicitly.
+_PAGE_ARTIFACT_CHARS = r"\u0F0B\u0F0C\u0F0D0-9\uFF10-\uFF19 \t"
 
 
 # ─── Artifact stripping ────────────────────────────────────────────────────────
+
+# Matches both bare <pb/> and attributed <pb n="..."/> so artifact-stripping
+# regexes work regardless of whether a page label is present.
+_PB_PAT   = r"<pb(?:\s[^/]*)*/>"       # non-capturing, for use inside patterns
+_PB_CAP   = r"(<pb(?:\s[^/]*)*/?>)"    # capturing group version
+
 
 def strip_page_number_artifacts(text: str) -> str:
     """Remove PDF footer artifacts (page numbers, tsheg runs) before page breaks."""
     pattern = (
         r"((?:<lb/>\s*[" + _PAGE_ARTIFACT_CHARS + r"]*\n?)+)"
-        r"(\s*<lb/>\s*<pb/>)"
+        r"(\s*<lb/>\s*" + _PB_PAT + r")"
     )
     text = re.sub(pattern, r"\2", text)
     pattern2 = (
         r"((?:<lb/>\s*[" + _PAGE_ARTIFACT_CHARS + r"]*\n?)+)"
-        r"(\s*<pb/>)"
+        r"(\s*" + _PB_PAT + r")"
     )
     text = re.sub(pattern2, r"\2", text)
     text = re.sub(r"<lb/>\s*\d+\s*(?=</[^>]+>)", "", text)
@@ -111,19 +125,38 @@ def strip_page_number_artifacts(text: str) -> str:
 
 def strip_page_header_artifacts(text: str) -> str:
     """Remove PDF header artifacts (page numbers, Roman numerals) after page breaks."""
-    text = re.sub(r"(<pb/>\s*)\n<lb/>[IVXLCDM]+\s*\n", r"\1\n", text)
-    text = re.sub(r"(<pb/>\s*)\n<lb/>\d+\s*\n", r"\1\n", text)
+    # InDesign section running headers (UTF-16-BE hex), after XML escaping.
     text = re.sub(
-        r'(<pb/>\s*)\n<lb/><hi rend="small">\d+\s*\n<lb/>[^\n]*</hi>\s*\n',
+        _PB_CAP
+        + r"\n<lb/>&lt;FEFF005300650063003[12]003A&gt;"
+        r"(?:[IVXLCDMivxlcdm]+|\d+)\s*\n",
+        r"\1\n",
+        text,
+    )
+    # Section roman numerals on the line immediately before a page break.
+    # Each line gets its own <lb/>, so the pattern is often <lb/>II\n<lb/><pb/>.
+    text = re.sub(
+        r"<lb/>\s*[IVXLCDMivxlcdm]{1,6}\s*\n(?:<lb/>\s*)?(?=<pb)",
+        r"",
+        text,
+    )
+    # Numbers appearing inline on the same line as <pb/> (no <lb/> prefix)
+    text = re.sub(_PB_CAP + r"\s*\d+\s*\n", r"\1\n", text)
+    # Roman numerals (upper or lower case) on own line, with optional trailing close tag
+    text = re.sub(_PB_CAP + r"\n<lb/>[IVXLCDMivxlcdm]+(?:</[^>]*>)?\s*\n", r"\1\n", text)
+    # Arabic digits on own line, with optional trailing close tag (e.g. </hi>)
+    text = re.sub(_PB_CAP + r"\n<lb/>\d+(?:</[^>]*>)?\s*\n", r"\1\n", text)
+    text = re.sub(
+        _PB_CAP + r'\n<lb/><hi rend="small">\d+\s*\n<lb/>[^\n]*</hi>\s*\n',
         r"\1\n",
         text,
     )
     text = re.sub(
-        r'(<pb/>\s*)\n<lb/><hi rend="head">[IVXLCDM]+\s*\n',
+        _PB_CAP + r'\n<lb/><hi rend="head">[IVXLCDMivxlcdm]+\s*\n',
         r'\1\n<lb/><hi rend="head">',
         text,
     )
-    text = re.sub(r'(<hi rend="head">)[IVXLCDM]+\s*\n<lb/>', r"\1", text)
+    text = re.sub(r'(<hi rend="head">)[IVXLCDMivxlcdm]+\s*\n<lb/>', r"\1", text)
     return text
 
 
@@ -257,7 +290,25 @@ def simplify_font_sizes(text: str) -> str:
         has_separator = "་" in content or "།" in content or content.endswith("༽")
         if not has_separator and merged:
             prev_fs, prev_content = merged[-1]
-            merged[-1] = (prev_fs, prev_content + content)
+            # Only concatenate without separator when the boundary is naturally
+            # joined: prev ends with tsheg/shad, or content starts with tsheg/shad,
+            # or either side is purely whitespace/structural.
+            prev_ends_joined = (
+                prev_content.endswith("་")
+                or prev_content.endswith("།")
+                or prev_content.endswith("༽")
+                or not prev_content.strip()
+            )
+            content_starts_joined = (
+                content.startswith("་")
+                or content.startswith("།")
+                or content.startswith(" ")
+            )
+            if prev_ends_joined or content_starts_joined:
+                merged[-1] = (prev_fs, prev_content + content)
+            else:
+                # No natural join: insert a space so words are not fused
+                merged[-1] = (prev_fs, prev_content + " " + content)
         elif not has_separator and not merged and not content.strip():
             merged.append((None, content))
         else:
@@ -419,38 +470,35 @@ def convert_footnote_sentinels_to_tei(text: str) -> str:
             notes.append((m.group(1), body))
         return notes
 
-    page_chunks = re.split(rf"({re.escape(PAGE_BREAK_STR)})", text)
+    page_chunks = PAGE_BREAK_PREFIX_RE.split(f"\n{text}\n")
+    page_chunks[0]  = page_chunks[0].lstrip("\n")
+    page_chunks[-1] = page_chunks[-1].rstrip("\n")
+    separators = PAGE_BREAK_PREFIX_RE.findall(f"\n{text}\n")
     result_parts: list[str] = []
 
-    for chunk in page_chunks:
-        if chunk == PAGE_BREAK_STR:
-            result_parts.append(chunk)
-            continue
-
+    for i, chunk in enumerate(page_chunks):
         notes = _collect_page_notes(chunk)
         clean_chunk = _SENTINEL_RE.sub("", chunk)
 
-        if not notes:
-            result_parts.append(clean_chunk)
-            continue
-
-        note_tags = "".join(
-            f'<note n="{n}" place="foot">{body}</note>'
-            for n, body in notes
-        )
-
-        lines = clean_chunk.rstrip("\n").split("\n")
-        last_text_idx = next(
-            (i for i in range(len(lines) - 1, -1, -1) if lines[i].strip()),
-            None,
-        )
-        if last_text_idx is not None:
-            lines[last_text_idx] += note_tags
-            clean_chunk = "\n".join(lines)
-            if chunk.rstrip("\n") != chunk:
-                clean_chunk += "\n"
+        if notes:
+            note_tags = "".join(
+                f'<note n="{n}" place="foot">{body}</note>'
+                for n, body in notes
+            )
+            lines = clean_chunk.rstrip("\n").split("\n")
+            last_text_idx = next(
+                (j for j in range(len(lines) - 1, -1, -1) if lines[j].strip()),
+                None,
+            )
+            if last_text_idx is not None:
+                lines[last_text_idx] += note_tags
+                clean_chunk = "\n".join(lines)
+                if chunk.rstrip("\n") != chunk:
+                    clean_chunk += "\n"
 
         result_parts.append(clean_chunk)
+        if i < len(separators):
+            result_parts.append(separators[i])
 
     return "".join(result_parts)
 
@@ -488,14 +536,33 @@ def convert_markup_to_tei(text: str) -> str:
             text_part = text_part.replace(key, tag)
         return text_part
 
+    # ── Step 1: extract page-break tokens BEFORE escape_content ──────────────
+    # apply_font_markup may emit </small> or </large> on the same line as the
+    # ZZZZ:<label> token when a font span closes at a page boundary (e.g.
+    # "ZZZZ:b</small>").  We capture the label with [A-Za-z0-9.\-]* (valid PDF
+    # PageLabel chars only) so trailing markup is separated out and re-emitted
+    # on its own line.  \x01PB:label\x02 delimiters survive escape_content's
+    # XML-escaping of < and >.
+    _PB_TOKEN_RE = re.compile(rf"{PAGE_BREAK_STR}:([A-Za-z0-9.\-]*)([^\n]*)")
+
+    def _replace_pb(m: re.Match) -> str:
+        label    = m.group(1)           # clean label: "b", "V", "1", ""
+        trailing = m.group(2).strip()   # leftover: "</small>", "</large>", …
+        placeholder = f"\x01PB:{label}\x02"
+        return f"{placeholder}\n{trailing}" if trailing else placeholder
+
+    text = _PB_TOKEN_RE.sub(_replace_pb, text)
+
+    # ── Step 2: XML-escape, with markup tags protected ───────────────────────
     text = escape_content(text)
 
-    if text.startswith(f"\n{PAGE_BREAK_STR}\n"):
-        text = text[len(PAGE_BREAK_STR) + 2:]
-    elif text.startswith(f"{PAGE_BREAK_STR}\n"):
-        text = text[len(PAGE_BREAK_STR) + 1:]
+    # Drop leading page-break placeholder (before first real content).
+    if text.startswith("\n\x01PB:"):
+        text = text[text.index("\n", 1) + 1:]
+    elif text.startswith("\x01PB:"):
+        text = text[text.index("\n") + 1:]
 
-    text = re.sub(PAGE_BREAK_STR, "<<<PB>>>", text)
+    # ── Step 3: prepend initial <pb/> and inject <lb/> line breaks ───────────
     text = "<pb/>\n" + text
 
     lines = text.split("\n")
@@ -507,7 +574,15 @@ def convert_markup_to_tei(text: str) -> str:
         result.append(line)
     text = "".join(result)
 
-    text = re.sub(r"<<<PB>>>", "<pb/>", text)
+    # ── Step 4: materialise page-break placeholders as TEI <pb> elements ─────
+    # ⚠️  MUST happen BEFORE strip_page_number_artifacts / strip_page_header_artifacts
+    # so those regexes find actual <pb/> tags, not \x01PB:\x02 placeholders.
+    def _emit_pb(m: re.Match) -> str:
+        label = m.group(1)
+        return f'<pb n="{label}"/>' if label else "<pb/>"
+
+    text = re.sub(r"\x01PB:([A-Za-z0-9.\-]*)\x02", _emit_pb, text)
+
     text = strip_page_number_artifacts(text)
     text = strip_page_header_artifacts(text)
 
@@ -522,10 +597,11 @@ def convert_markup_to_tei(text: str) -> str:
 
     text = re.sub(r"(<lb/>[\s\n]*)+</hi>", r"</hi>", text)
     text = re.sub(r"<lb/>[\s\n]*<pb", r"<pb", text)
-    text = re.sub(r"<pb/>\s*</hi>", r"</hi>\n<pb/>", text)
+    # Inline <hi> must close before any page break (bare or attributed).
+    text = re.sub(r"(<pb(?:\s[^/]*)*/?>)\s*</hi>", r"</hi>\n\1", text)
     text = re.sub(r"\n(</hi>)", r"\1\n", text)
     text = re.sub(r'(<hi rend="[^"]+">)\n<lb/>', r"\n<lb/>\1", text)
-    text = re.sub(r"<lb/> +", r"<lb/>", text)
+    text = re.sub(r"<lb/> {2,}", r"<lb/> ", text)  # collapse multiple spaces → one
     text = re.sub(r"\n\n+", r"\n", text)
     text = re.sub(r"  +", r" ", text)
 
@@ -677,6 +753,7 @@ def convert_pdf_to_tei(pdf_path: Path, ve_id: str, sequence: int) -> str:
         PDF_EXTRACTOR,
         crop_top=CROP_TOP_FRACTION,
         crop_bottom=CROP_BOTTOM_FRACTION,
+        preserve_box=PRESERVE_BOX,
     )
     if not raw_text:
         raise ValueError(f"No text extracted from {pdf_path.name}")
@@ -962,6 +1039,18 @@ def main():
         "--crop-bottom", type=float, default=None, metavar="FRAC",
         help="Fraction of page height to redact at the bottom (0.0–0.49). Overrides config.",
     )
+    parser.add_argument(
+        "--preserve-box",
+        type=float, nargs=4, default=None,
+        metavar=("X0", "Y0", "X1", "Y1"),
+        help=(
+            "Normalised bounding box [0.0–1.0] of the region to KEEP on every page "
+            "(everything outside is redacted). "
+            "Format: X0 Y0 X1 Y1. "
+            "Example: --preserve-box 0.11 0.09 0.89 0.82. "
+            "Takes priority over --crop-top / --crop-bottom when provided."
+        ),
+    )
     args = parser.parse_args()
 
     if args.extractor == "pytiblegenc" and not PYTIBLEGENC_AVAILABLE:
@@ -973,7 +1062,7 @@ def main():
         parser.error("PyMuPDF is not installed. pip install pymupdf")
 
     global PDF_EXTRACTOR, ENABLE_FONT_CLASSIFICATION, ENABLE_NORMALIZATION
-    global CROP_TOP_FRACTION, CROP_BOTTOM_FRACTION
+    global CROP_TOP_FRACTION, CROP_BOTTOM_FRACTION, PRESERVE_BOX
 
     PDF_EXTRACTOR = args.extractor
     if args.no_font_tags:
@@ -988,6 +1077,17 @@ def main():
         if not 0.0 <= args.crop_bottom < 0.5:
             parser.error("--crop-bottom must be between 0.0 and 0.49")
         CROP_BOTTOM_FRACTION = args.crop_bottom
+    if args.preserve_box is not None:
+        px0, py0, px1, py1 = args.preserve_box
+        for flag, val in (("X0", px0), ("Y0", py0), ("X1", px1), ("Y1", py1)):
+            if not 0.0 <= val <= 1.0:
+                parser.error(f"--preserve-box {flag} must be in [0.0, 1.0], got {val}")
+        if px0 >= px1 or py0 >= py1:
+            parser.error(
+                f"--preserve-box requires X0 < X1 and Y0 < Y1, "
+                f"got {px0} {py0} {px1} {py1}"
+            )
+        PRESERVE_BOX = args.preserve_box
 
     if args.single:
         convert_single_file(args.single, args.ve, args.sequence)
