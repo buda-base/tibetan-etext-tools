@@ -1,21 +1,10 @@
 #!/usr/bin/env python3
 """
-IE1KG25273: PDF under ``sources/`` → TEI XML.
+PDF under ``<IE_ID>/to_convert/<VE_ID>/`` → TEI XML (see ``config.SOURCES_DIR``).
 
-**Extractors** (``--extractor``):
-
-- **pymupdf** (default): ``page.get_text("rawdict")`` — one ``\\n`` per MuPDF
-  **line** (block → line → span); skips **Wingdings**; optional **header/footer
-  crop** (``--crop-top`` / ``--crop-bottom`` or config). Suited to
-  **MonlamUniOuChan** Unicode PDFs.
-
-- **pytiblegenc**: ``pytiblegenc.pdf_to_txt()`` with the same options as
-  IE3KG664 / Desktop SRC_CODE — line breaks follow that library’s layout.
-  Header/footer **crop** uses the same redacted temp PDF as **pymupdf**
-  (requires PyMuPDF to build it). Requires:
-  ``pip install git+https://github.com/buda-base/py-tiblegenc.git``
-
-Later steps map each extractor newline to ``<lb/>`` (layout, not linguistics).
+Text is extracted using the hybrid PyMuPDF + pytiblegenc pipeline.  Each
+newline maps to a ``<lb/>`` in the final TEI output (layout breaks, not
+linguistic structure).
 
 Optional: matching ``.doc`` in ``toprocess/<IE_ID>-<VE_ID>/`` for SHA256; else
 checksum from the PDF.
@@ -29,9 +18,8 @@ Usage:
     python convert_pdf_to_xml.py --no-font-tags
     python convert_pdf_to_xml.py --no-normalization
     python convert_pdf_to_xml.py --crop-top 0.09 --crop-bottom 0.08
-    python convert_pdf_to_xml.py --extractor pytiblegenc
 
-    Debug missing / corrupted text (compare stages, relax extractors):
+    Debug missing / corrupted text:
 
     python convert_pdf_to_xml.py --single VE1ER1172/TI904-01-001.pdf --dump-extraction ./debug_out
     python convert_pdf_to_xml.py --single ... --no-extraction-dedup --no-phantom-space
@@ -72,8 +60,8 @@ from tei_generator import post_process_body, generate_tei_xml, calculate_sha256
 from pdf_extract import (
     PAGE_BREAK_STR,
     PYMUPDF_AVAILABLE,
-    PYTIBLEGENC_AVAILABLE,
     extract_pdf_to_text,
+    get_pdf_page_labels,
 )
 
 
@@ -100,8 +88,6 @@ logger = setup_logging()
 ENABLE_FONT_CLASSIFICATION = True
 ENABLE_NORMALIZATION = True
 
-# "pymupdf" | "pytiblegenc" — set from CLI ``--extractor`` in ``main()``.
-PDF_EXTRACTOR: str = "pymupdf"
 
 CROP_TOP_FRACTION: float = CROP_HEADER_FRACTION   
 CROP_BOTTOM_FRACTION: float = CROP_FOOTER_FRACTION
@@ -112,6 +98,9 @@ EXTRACTION_PHANTOM_SPACE_DROP: bool = True
 
 # If set, convert_pdf_to_tei writes per-PDF debug text files under this directory.
 EXTRACTION_DUMP_DIR: Optional[Path] = None
+
+# Coordinate-based preserve box [x0_frac, y0_frac, x1_frac, y1_frac] (CLI: --preserve-box).
+PRESERVE_BOX: Optional[list] = None
 
 # Tibetan tsheg (U+0F0B), vowel ུ (U+0F74), ASCII digits, fullwidth digits (U+FF10-U+FF19)
 _PAGE_ARTIFACT_CHARS = r"\u0F0B\u0F740-9\uFF10-\uFF19\s"
@@ -361,6 +350,38 @@ def apply_font_markup(text: str, classifications: dict) -> str:
     return text
 
 
+def inject_page_labels(tei_body: str, page_labels: dict) -> str:
+    """
+    Replace each ``<pb/>`` in *tei_body* with ``<pb n="LABEL"/>`` using the
+    page-label map returned by :func:`pdf_extract.get_pdf_page_labels`.
+
+    ``page_labels`` maps **0-based page index** → label string.  The first
+    ``<pb/>`` in the TEI body corresponds to page index 0, the second to
+    page index 1, and so on.
+
+    Pages whose index is absent from *page_labels* keep the bare ``<pb/>``
+    form (no ``n=`` attribute).  When *page_labels* is empty the body is
+    returned unchanged.
+    """
+    if not page_labels:
+        return tei_body
+
+    pb_index = 0
+
+    def _replace(m):
+        nonlocal pb_index
+        label = page_labels.get(pb_index)
+        pb_index += 1
+        if label:
+            # Escape XML attribute value characters just in case the label
+            # contains an ampersand or quote (extremely rare but possible).
+            safe = label.replace("&", "&amp;").replace('"', "&quot;")
+            return f'<pb n="{safe}"/>'
+        return "<pb/>"
+
+    return re.sub(r"<pb/>", _replace, tei_body)
+
+
 def convert_markup_to_tei(text: str) -> str:
     """Convert markup to TEI format.
     """
@@ -502,13 +523,13 @@ def build_pdf_by_ve(
     ve_ids_for_flat: Optional[list] = None,
 ) -> dict:
     """
-    Map each volume (VE) ID to PDF paths under SOURCES_DIR.
+    Map each volume (VE) ID to PDF paths under SOURCES_DIR (``<IE_ID>/to_convert``).
 
-    - **Subfolders** ``sources/<VE_ID>/`` (any depth): volume ID = immediate subfolder name.
+    - **Subfolders** ``to_convert/<VE_ID>/`` (any depth): volume ID = immediate subfolder name.
       **toprocess is not used** for discovery or filtering.
-    - **Flat** ``sources/*.pdf``: only processed if ``assign_flat_via_toprocess`` is True and
+    - **Flat** ``to_convert/*.pdf``: only processed if ``assign_flat_via_toprocess`` is True and
       ``ve_ids_for_flat`` is non-empty; otherwise skipped with a short log (put PDFs under
-      ``sources/<VE_ID>/`` instead).
+      ``to_convert/<VE_ID>/`` instead).
     """
     pdf_by_ve: dict = {}
     if not SOURCES_DIR.exists():
@@ -526,26 +547,26 @@ def build_pdf_by_ve(
         folder_ve = item.name
         pdf_by_ve[folder_ve] = pdfs_in_folder
         logger.info(
-            f"  Volume from sources folder '{folder_ve}': {len(pdfs_in_folder)} PDF(s) "
-            f"(under sources/{folder_ve}/)"
+            f"  Volume from to_convert folder '{folder_ve}': {len(pdfs_in_folder)} PDF(s) "
+            f"(under to_convert/{folder_ve}/)"
         )
 
     if flat_pdfs:
         if not assign_flat_via_toprocess:
             logger.warning(
-                f"Skipping {len(flat_pdfs)} PDF(s) at sources/*.pdf (batch uses volume folders "
-                f"only; toprocess ignored). Move to sources/<VE_ID>/ or run with --assign-flat-toprocess."
+                f"Skipping {len(flat_pdfs)} PDF(s) at to_convert/*.pdf (batch uses volume folders "
+                f"only; toprocess ignored). Move to to_convert/<VE_ID>/ or run with --assign-flat-toprocess."
             )
         elif not ve_ids_for_flat:
             logger.error(
-                f"Skipping {len(flat_pdfs)} PDF(s) at sources/*.pdf: --assign-flat-toprocess set but "
+                f"Skipping {len(flat_pdfs)} PDF(s) at to_convert/*.pdf: --assign-flat-toprocess set but "
                 f"no {IE_ID}-VE* folders under toprocess/."
             )
         else:
             ve_without_folder = [v for v in ve_ids_for_flat if v not in pdf_by_ve]
             targets = ve_without_folder if ve_without_folder else ve_ids_for_flat
             if not targets:
-                logger.error("Flat PDFs in sources/ but no VE targets from toprocess.")
+                logger.error("Flat PDFs in to_convert/ but no VE targets from toprocess.")
             else:
                 assigned = assign_pdf_to_ve(targets, flat_pdfs)
                 for ve, files in assigned.items():
@@ -584,9 +605,9 @@ def convert_pdf_to_tei(pdf_path: Path, ve_id: str, sequence: int) -> str:
 
     raw_text = extract_pdf_to_text(
         pdf_path,
-        PDF_EXTRACTOR,
         crop_top=CROP_TOP_FRACTION,
         crop_bottom=CROP_BOTTOM_FRACTION,
+        preserve_box=PRESERVE_BOX,
         extraction_dedup=EXTRACTION_DEDUP,
         phantom_space_drop=EXTRACTION_PHANTOM_SPACE_DROP,
     )
@@ -642,6 +663,15 @@ def convert_pdf_to_tei(pdf_path: Path, ve_id: str, sequence: int) -> str:
 
     tei_body = post_process_body(tei_body)
 
+    # Inject <pb n="..."/> labels from the PDF's PageLabels dictionary.
+    page_labels = get_pdf_page_labels(pdf_path)
+    if page_labels:
+        logger.info(f"    Page labels found: {len(page_labels)} labelled page(s) "
+                    f"(e.g. first={next(iter(page_labels.values()))})")
+        tei_body = inject_page_labels(tei_body, page_labels)
+    else:
+        logger.debug("    No custom PageLabels in PDF; <pb/> elements have no n= attribute.")
+
     if dump_dir is not None:
         (dump_dir / f"{stem}_04_tei_body_postprocess.txt").write_text(
             tei_body, encoding="utf-8"
@@ -660,11 +690,11 @@ def convert_pdf_to_tei(pdf_path: Path, ve_id: str, sequence: int) -> str:
 
     ut_id = get_ut_id(ve_id, sequence)
     sha256 = calculate_sha256(source_path)
-    # TEI src_path: document used for checksum (DOC if present, else PDF name under VE output tree)
+    # TEI src_path: checksum from DOC in toprocess if present, else PDF under to_convert
     if source_path == pdf_path:
-        src_path = f"sources/{ve_id}/{pdf_path.name}"
+        src_path = f"{ve_id}/{pdf_path.name}"
     else:
-        src_path = f"sources/{ve_id}/{source_path.name}"
+        src_path = f"{IE_ID}-{ve_id}/{source_path.name}"
 
     tei_xml = generate_tei_xml(
         body_content=tei_body,
@@ -709,8 +739,8 @@ def copy_sources_to_output(ve_id: str, pdf_files: list):
 
 def _resolve_ve_for_single(explicit_ve: Optional[str]) -> Optional[str]:
     """
-    For a PDF directly in sources/*.pdf (no subfolder): use --ve, or one IE1KG25273-VE* in toprocess.
-    toprocess is not used when the path is sources/<VE_ID>/file.pdf (volume from folder name).
+    For a PDF directly in to_convert/*.pdf (no subfolder): use --ve, or one <IE_ID>-VE* in toprocess.
+    toprocess is not used when the path is to_convert/<VE_ID>/file.pdf (volume from folder name).
     """
     if explicit_ve:
         return explicit_ve
@@ -719,30 +749,30 @@ def _resolve_ve_for_single(explicit_ve: Optional[str]) -> Optional[str]:
         return ve_ids[0]
     if not ve_ids:
         logger.error(
-            "PDF is at sources/*.pdf (root). Use --ve VE_ID, or move to sources/<VE_ID>/file.pdf "
+            "PDF is at to_convert/*.pdf (root). Use --ve VE_ID, or move to to_convert/<VE_ID>/file.pdf "
             "(volume ID = folder name; toprocess not required)."
         )
         return None
     logger.error(
-        "PDF is at sources/*.pdf (root) and toprocess has multiple VEs. Specify --ve VE_ID, "
-        "or use sources/<VE_ID>/file.pdf."
+        "PDF is at to_convert/*.pdf (root) and toprocess has multiple VEs. Specify --ve VE_ID, "
+        "or use to_convert/<VE_ID>/file.pdf."
     )
     return None
 
 
 def convert_single_file(relative_path: str, ve_id: Optional[str], sequence: Optional[int]):
-    """Convert a single PDF under SOURCES_DIR to TEI XML (flat or e.g. VE_ID/file.pdf)."""
+    """Convert a single PDF under SOURCES_DIR (to_convert) to TEI XML (flat or e.g. VE_ID/file.pdf)."""
     pdf_path = (SOURCES_DIR / relative_path).resolve()
     src_root = SOURCES_DIR.resolve()
 
     try:
         rel = pdf_path.relative_to(src_root)
     except ValueError:
-        logger.error(f"Path must be under sources/: {relative_path}")
+        logger.error(f"Path must be under to_convert/: {relative_path}")
         return
 
     if not pdf_path.exists() or not pdf_path.is_file():
-        logger.error(f"PDF file not found under sources/: {relative_path}")
+        logger.error(f"PDF file not found under to_convert/: {relative_path}")
         return
     if pdf_path.suffix.lower() != ".pdf":
         logger.error(f"Not a PDF file: {relative_path}")
@@ -753,7 +783,7 @@ def convert_single_file(relative_path: str, ve_id: Optional[str], sequence: Opti
     if ve_id:
         final_ve = ve_id
     elif inferred_ve:
-        # Volume ID from sources/<VE_ID>/... — toprocess is not consulted (may list a different VE).
+        # Volume ID from to_convert/<VE_ID>/... — toprocess is not consulted (may list a different VE).
         final_ve = inferred_ve
     else:
         final_ve = _resolve_ve_for_single(None)
@@ -768,7 +798,6 @@ def convert_single_file(relative_path: str, ve_id: Optional[str], sequence: Opti
     ut_id = get_ut_id(ve_id, sequence)
 
     logger.info(f"Converting: {pdf_path.name}")
-    logger.info(f"  Extractor: {PDF_EXTRACTOR}")
     logger.info(f"  VE ID: {ve_id}")
     logger.info(f"  UT ID: {ut_id}")
 
@@ -798,12 +827,11 @@ def convert_all_files(
     assign_flat_via_toprocess: bool = False,
 ):
     """
-    Convert all PDFs under sources/<VE_ID>/ (volume = folder name; toprocess not used for that).
-    Optional: --assign-flat-toprocess to also split sources/*.pdf using toprocess VEs.
+    Convert all PDFs under to_convert/<VE_ID>/ (volume = folder name; toprocess not used for that).
+    Optional: --assign-flat-toprocess to also split to_convert/*.pdf using toprocess VEs.
     """
     logger.info("=" * 60)
     logger.info(f"PDF to TEI XML Converter for {IE_ID}")
-    logger.info(f"Extractor: {PDF_EXTRACTOR}")
     if ve_filter:
         logger.info(f"Filtering: {ve_filter} only")
     logger.info(f"PDF Source: {SOURCES_DIR}")
@@ -817,11 +845,11 @@ def convert_all_files(
         ve_ids_top = get_ve_ids_from_toprocess()
         ve_ids_for_flat = [v for v in ve_ids_top if not ve_filter or v == ve_filter]
         logger.info(
-            f"Also assigning flat sources/*.pdf via toprocess VEs: {ve_ids_for_flat or '(none)'}"
+            f"Also assigning flat to_convert/*.pdf via toprocess VEs: {ve_ids_for_flat or '(none)'}"
         )
     else:
         logger.info(
-            "Batch: volume IDs from sources/<folder>/ only — toprocess ignored for assignment."
+            "Batch: volume IDs from to_convert/<folder>/ only — toprocess ignored for assignment."
         )
 
     pdf_by_ve = build_pdf_by_ve(
@@ -832,8 +860,8 @@ def convert_all_files(
     total_files = sum(len(files) for files in pdf_by_ve.values())
     if not pdf_by_ve or total_files == 0:
         logger.error(
-            "No PDF files found under sources/<VE_ID>/*.pdf. Put PDFs inside a volume folder "
-            "(e.g. sources/VE1ER999/) or use --assign-flat-toprocess with IE1KG25273-VE* in toprocess."
+            "No PDF files found under to_convert/<VE_ID>/*.pdf. Put PDFs inside a volume folder "
+            f"(e.g. to_convert/VE1ER999/) or use --assign-flat-toprocess with {IE_ID}-VE* in toprocess."
         )
         return
 
@@ -904,24 +932,15 @@ def convert_all_files(
 def main():
     parser = argparse.ArgumentParser(
         description=(
-            "IE1KG25273: Convert sources/*.pdf and sources/<VE>/**/*.pdf to TEI XML "
-            "(PyMuPDF rawdict or pytiblegenc pdf_to_txt)"
+            f"{IE_ID}: Convert to_convert/*.pdf and to_convert/<VE>/**/*.pdf to TEI XML "
+            "Convert PDFs to TEI XML using the hybrid extraction pipeline"
         )
-    )
-    parser.add_argument(
-        "--extractor",
-        choices=["pymupdf", "pytiblegenc"],
-        default="pymupdf",
-        help=(
-            "PDF text extraction backend: pymupdf = MuPDF rawdict line breaks (default); "
-            "pytiblegenc = same pdf_to_txt options as IE3KG664 / Desktop SRC_CODE"
-        ),
     )
     parser.add_argument(
         "--single",
         "-s",
         metavar="PATH",
-        help="One PDF path under sources/ (e.g. file.pdf or VE1ER999/TI596-01-001.pdf; --ve if ambiguous)",
+        help="One PDF path under to_convert/ (e.g. file.pdf or VE1ER999/TI596-01-001.pdf; --ve if ambiguous)",
     )
     parser.add_argument("--ve", metavar="VE_ID", help="VE ID (e.g. VE1ER999) or filter batch to this VE")
     parser.add_argument(
@@ -937,9 +956,8 @@ def main():
         "--no-extraction-dedup",
         action="store_true",
         help=(
-            "Disable InDesign duplicate-layer dedup in the extractor "
-            "(PyMuPDF: raw-line + within-row shadow; pytiblegenc: sliding-window line dedup). "
-            "Use when suspected duplicate suppression removes real repeated lines."
+            "Disable InDesign duplicate-layer dedup (raw-line dedup, within-row shadow dedup, "
+            "and sliding-window line dedup). Use when suspected duplicate suppression removes real lines."
         ),
     )
     parser.add_argument(
@@ -963,7 +981,10 @@ def main():
     parser.add_argument(
         "--assign-flat-toprocess",
         action="store_true",
-        help="Also assign sources/*.pdf (root) across IE1KG25273-VE* folders in toprocess (default: ignore root PDFs)",
+        help=(
+            f"Also assign to_convert/*.pdf (root) across {IE_ID}-VE* folders in toprocess "
+            "(default: ignore root PDFs)"
+        ),
     )
     parser.add_argument(
         "--crop-top",
@@ -973,7 +994,7 @@ def main():
         help=(
             "Fraction of page height to physically redact at the TOP (running header). "
             "E.g. 0.08 blanks the top 8%% and removes text there. Overrides config.CROP_HEADER_FRACTION. "
-            "Used for both extractors (redacted temp PDF; pip install pymupdf)."
+            "Requires PyMuPDF (pip install pymupdf)."
         ),
     )
     parser.add_argument(
@@ -984,24 +1005,29 @@ def main():
         help=(
             "Fraction of page height to physically redact at the BOTTOM (running footer). "
             "E.g. 0.07 blanks the bottom 7%% and removes text there. Overrides config.CROP_FOOTER_FRACTION. "
-            "Used for both extractors (redacted temp PDF; pip install pymupdf)."
+            "Requires PyMuPDF (pip install pymupdf)."
+        ),
+    )
+    parser.add_argument(
+        "--preserve-box",
+        type=float,
+        nargs=4,
+        metavar=("X0", "Y0", "X1", "Y1"),
+        help=(
+            "Normalised page fractions [x0 y0 x1 y1] of the region to KEEP. "
+            "Everything outside is physically redacted before extraction. "
+            "Takes priority over --crop-top/--crop-bottom. "
+            "E.g. --preserve-box 0.11 0.09 0.89 0.82"
         ),
     )
     args = parser.parse_args()
 
-    if args.extractor == "pytiblegenc" and not PYTIBLEGENC_AVAILABLE:
-        parser.error(
-            "pytiblegenc is not installed. pip install git+https://github.com/buda-base/py-tiblegenc.git"
-        )
-    if args.extractor == "pymupdf" and not PYMUPDF_AVAILABLE:
+    if not PYMUPDF_AVAILABLE:
         parser.error("PyMuPDF is not installed. pip install pymupdf")
-
-    global PDF_EXTRACTOR
-    PDF_EXTRACTOR = args.extractor
 
     global ENABLE_FONT_CLASSIFICATION, ENABLE_NORMALIZATION
     global CROP_TOP_FRACTION, CROP_BOTTOM_FRACTION
-    global EXTRACTION_DEDUP, EXTRACTION_PHANTOM_SPACE_DROP, EXTRACTION_DUMP_DIR
+    global EXTRACTION_DEDUP, EXTRACTION_PHANTOM_SPACE_DROP, EXTRACTION_DUMP_DIR, PRESERVE_BOX
     if args.no_font_tags:
         ENABLE_FONT_CLASSIFICATION = False
     if args.no_normalization:
@@ -1021,6 +1047,11 @@ def main():
         if not 0.0 <= args.crop_bottom < 0.5:
             parser.error("--crop-bottom must be between 0.0 and 0.49")
         CROP_BOTTOM_FRACTION = args.crop_bottom
+    if args.preserve_box is not None:
+        x0, y0, x1, y1 = args.preserve_box
+        if not (0.0 <= x0 < x1 <= 1.0 and 0.0 <= y0 < y1 <= 1.0):
+            parser.error("--preserve-box fractions must satisfy 0 ≤ x0 < x1 ≤ 1 and 0 ≤ y0 < y1 ≤ 1")
+        PRESERVE_BOX = args.preserve_box
 
     if args.single:
         convert_single_file(args.single, args.ve, args.sequence)
