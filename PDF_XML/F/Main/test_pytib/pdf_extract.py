@@ -330,6 +330,11 @@ def _install_local_font_tables(force_reload: bool = False) -> None:
     if not PYTIBLEGENC_AVAILABLE:
         _LOCAL_TABLES_INSTALLED = True
         return
+    if force_reload:
+        # Font tables changing can change decode results and the glyph-DB
+        # derived structures; drop the dependent caches so they rebuild.
+        _reset_decode_cache()
+        _reset_glyph_db_cache()
 
     try:
         if not _LOCAL_TABLES_DIR.is_dir():
@@ -463,6 +468,66 @@ def _merge_into_pytiblegenc_table(
 def _install_tb_youtso_tables() -> None:
     """Deprecated alias kept for back-compat.  Forwards to the general loader."""
     _install_local_font_tables()
+
+
+# ---------------------------------------------------------------------------
+# Performance — cache the PDF-independent glyph-DB structures process-wide.
+#
+# ``build_font_hash_index_from_csv`` and ``build_glyph_lookup_tables`` parse
+# pytiblegenc's full ``glyph_db.csv`` (tens of thousands of rows) on every
+# call.  In the original code both ran once per PDF inside
+# ``extract_pdf_hybrid``, so a batch re-parsed the same static CSV for every
+# file — by far the largest per-file fixed cost.
+#
+# These two structures depend only on the glyph DB (which never changes during
+# a run) and the locally-installed font tables (installed once, idempotently),
+# so they are safe to build a single time and reuse for every PDF.  The
+# per-PDF ``identify_pdf_fonts_from_db`` call stays per-PDF (it inspects the
+# specific document's font dictionary).
+#
+# Call ``_reset_glyph_db_cache()`` if local font tables are reloaded with
+# ``force_reload=True`` mid-process and you need the lookup tables rebuilt.
+# ---------------------------------------------------------------------------
+_GLYPH_DB_CACHE: dict | None = None
+
+
+def _get_glyph_db_structures():
+    """
+    Return ``(glyph_db_path, glyph_index, glyph_lookup)`` from the glyph DB,
+    building them once per process and caching the result.
+
+    Returns ``(None, None, None)`` if pytiblegenc is unavailable or the build
+    fails (callers already handle the empty/None case gracefully).
+    """
+    global _GLYPH_DB_CACHE
+    if _GLYPH_DB_CACHE is not None:
+        return (
+            _GLYPH_DB_CACHE["path"],
+            _GLYPH_DB_CACHE["index"],
+            _GLYPH_DB_CACHE["lookup"],
+        )
+    if not PYTIBLEGENC_AVAILABLE:
+        return None, None, None
+    try:
+        glyph_db_path = get_glyph_db_path()
+        glyph_index = build_font_hash_index_from_csv(str(glyph_db_path))
+        glyph_lookup = build_glyph_lookup_tables(str(glyph_db_path))
+        _GLYPH_DB_CACHE = {
+            "path": glyph_db_path,
+            "index": glyph_index,
+            "lookup": glyph_lookup,
+        }
+        logger.info("Glyph DB structures built and cached (one-time).")
+        return glyph_db_path, glyph_index, glyph_lookup
+    except Exception as exc:
+        logger.warning("Could not build/caches glyph DB structures: %s", exc)
+        return None, None, None
+
+
+def _reset_glyph_db_cache() -> None:
+    """Drop the cached glyph-DB structures so the next call rebuilds them."""
+    global _GLYPH_DB_CACHE
+    _GLYPH_DB_CACHE = None
 
 
 def _get_font_name_aliases() -> dict[str, str]:
@@ -919,6 +984,179 @@ _COLUMN_GAP_MIN_PT: float = 30.0   # gap narrower than this → single column
 _COLUMN_MIN_BLOCKS_PER_SIDE: int = 2  # at least N lines on each side
 
 
+# ---------------------------------------------------------------------------
+# Rotated pecha pages — vertical body text + horizontal marginalia.
+#
+# Tibetan pecha-format PDFs are frequently produced as a landscape page with a
+# 90° rotation flag.  After PyMuPDF normalises that rotation, the genuine body
+# text reports a *vertical* writing direction (line "dir" ≈ (0, ±1)), while the
+# running header (volume/text title) and the folio number sit in the narrow
+# margins and report a *horizontal* direction (dir ≈ (±1, 0)).
+#
+# Two consequences, handled here and in extract_pdf_hybrid:
+#
+#   * Header/footer removal (issue 2): on a vertical-body page, any line whose
+#     direction is horizontal is marginalia and is dropped.  An edge-band guard
+#     keeps the rule conservative — only lines near the page edges are removed,
+#     so a stray horizontal glyph in the text body is never lost.
+#
+#   * Reading order (issue 3): for vertical body text the reading order runs
+#     along the X axis (successive vertical lines are laid out left→right or
+#     right→left), not the Y axis.  The normal (y, x) sort therefore scrambles
+#     the lines; extract_pdf_hybrid swaps to an x-primary sort/merge when a
+#     page is detected as vertical.
+# ---------------------------------------------------------------------------
+
+# A line counts as "vertical" when |dy| dominates |dx| in its direction vector.
+_VERTICAL_DIR_RATIO = 1.5
+# Fraction of the short page dimension treated as the marginal edge band.
+_PECHA_EDGE_BAND_FRAC = 0.18
+# A page is treated as vertical-pecha when at least this fraction of its
+# decoded characters live in vertical lines.
+_VERTICAL_PAGE_CHAR_FRAC = 0.6
+
+
+def _line_is_vertical(direction) -> bool:
+    """True when a MuPDF line ``dir`` vector points mostly up/down."""
+    dx, dy = direction
+    return abs(dy) > abs(dx) * _VERTICAL_DIR_RATIO
+
+
+def _line_is_horizontal(direction) -> bool:
+    """True when a MuPDF line ``dir`` vector points mostly left/right."""
+    dx, dy = direction
+    return abs(dx) > abs(dy) * _VERTICAL_DIR_RATIO
+
+
+def _page_is_vertical(entries) -> bool:
+    """
+    Decide whether a page's body text is vertical (rotated pecha).
+
+    *entries* is the per-line list of ``(y_mid, x0, fragments, direction, bbox)``
+    tuples collected in extract_pdf_hybrid.  The decision is by decoded-character
+    mass: if most characters sit in vertical lines the page is vertical.
+    """
+    vert = 0
+    total = 0
+    for _y, _x, frags, direction, _bbox in entries:
+        n = len(_FS_TAG_RE.sub("", "".join(frags)).strip())
+        if n == 0:
+            continue
+        total += n
+        if _line_is_vertical(direction):
+            vert += n
+    if total == 0:
+        return False
+    return (vert / total) >= _VERTICAL_PAGE_CHAR_FRAC
+
+
+# Number of pages sampled to decide whether a whole document is rotated pecha.
+_PECHA_DOC_SAMPLE = 12
+# Fraction of *content-bearing* sampled pages that must be vertical for the
+# document to be treated as pecha (so blank-body pages don't break detection).
+_PECHA_DOC_FRAC = 0.6
+
+
+def _document_is_pecha(doc, font_normalization, glyph_lookup, stats) -> bool:
+    """
+    Decide once per document whether it is a rotated pecha layout.
+
+    Rationale: individual pecha pages can be near-blank (only the running title
+    and folio number in the margins).  A per-page orientation test misclassifies
+    those as horizontal and lets the marginalia leak into the body.  Deciding at
+    the document level — by sampling pages and checking the dominant body
+    orientation among content-bearing pages — keeps the marginalia filter and
+    the vertical reading-order path active on blank-body pages too.
+
+    A strong, cheap precondition is the page rotation flag: pecha PDFs are
+    landscape pages flagged 90°/270°.  We require both that the rotation is
+    non-zero on the sampled pages *and* that vertical body text dominates.
+    """
+    try:
+        page_count = doc.page_count
+    except Exception:
+        return False
+    if page_count == 0:
+        return False
+
+    # Sample evenly across the document.
+    step = max(1, page_count // _PECHA_DOC_SAMPLE)
+    sample_idxs = list(range(0, page_count, step))[:_PECHA_DOC_SAMPLE]
+
+    rotated_any = False
+    vertical_pages = 0
+    content_pages = 0
+    for idx in sample_idxs:
+        try:
+            page = doc[idx]
+        except Exception:
+            continue
+        if page.rotation % 180 != 0:
+            rotated_any = True
+        recs = []
+        for block in page.get_text("rawdict").get("blocks", []):
+            if block.get("type", 1) != 0:
+                continue
+            for line in block.get("lines", []):
+                frags = _extract_line_text_hybrid(
+                    line, font_normalization, glyph_lookup, stats
+                )
+                if frags:
+                    recs.append(
+                        (0, 0, frags, line.get("dir", (1.0, 0.0)),
+                         line.get("bbox", [0, 0, 0, 0]))
+                    )
+        total = sum(
+            len(_FS_TAG_RE.sub("", "".join(f)).strip()) for _, _, f, _, _ in recs
+        )
+        if total < 30:
+            continue  # near-blank page — ignore for the vote
+        content_pages += 1
+        if _page_is_vertical(recs):
+            vertical_pages += 1
+
+    if content_pages == 0:
+        # No content-bearing page sampled; fall back to rotation flag alone.
+        return rotated_any
+    return rotated_any and (vertical_pages / content_pages) >= _PECHA_DOC_FRAC
+
+
+def _is_pecha_marginalia(direction, bbox, page_w: float, page_h: float) -> bool:
+    """
+    True when a line on a vertical-pecha page is running-header / folio-number
+    marginalia that should be dropped.
+
+    On a vertical-pecha page the genuine body text is *vertical*; the running
+    title and folio numbers are the *horizontal* lines printed in the margins.
+    The primary, robust signal is therefore the writing direction:
+
+      * A horizontal line is marginalia (body text is never horizontal here).
+
+    As a secondary safety net we also drop any *short* line (≤ 3 visible chars)
+    that sits inside the narrow top/bottom edge bands, which catches the rare
+    folio digit that PyMuPDF reports with a vertical direction.
+    """
+    if _line_is_horizontal(direction):
+        return True
+    return False
+
+
+def _is_short_edge_run(frags, bbox, page_h: float) -> bool:
+    """
+    Secondary guard for vertical pages: a very short text run (folio number,
+    section letter) sitting in the extreme top/bottom edge band.
+
+    Kept separate from the direction test so it only ever removes tiny runs,
+    never a full body column that happens to start near the edge.
+    """
+    text = _FS_TAG_RE.sub("", "".join(frags)).strip()
+    if len(text) > 3:
+        return False
+    band = page_h * _PECHA_EDGE_BAND_FRAC
+    y0, y1 = bbox[1], bbox[3]
+    return (y1 <= band) or (y0 >= (page_h - band))
+
+
 def _detect_column_splits(
     raw_lines: list[tuple[float, float, list]],
     page_width: float,
@@ -1194,6 +1432,51 @@ def extract_pdf_to_text(
     )
     return _merge_orphan_tibetan_line_breaks(text or "")
 
+# ---------------------------------------------------------------------------
+# Performance — per-character decode memoization.
+#
+# ``convert_string`` is called once per glyph.  For dense Tibetan pages that is
+# tens of thousands of calls, the vast majority of which repeat the same
+# (char, font) pair.  The decode result is deterministic for a given
+# (char, normalized_font) once the glyph DB and local tables are loaded, so we
+# memoize it.  ``glyph_lookup`` is process-stable (built once and cached), so
+# it does not need to be part of the key.
+#
+# ``stats`` mutation in the original path is preserved only where it matters:
+# we record each unhandled font once so the end-of-run warning still fires.
+# Per-character handled/unknown counters were used only for debug logging and
+# are not relied on downstream.
+# ---------------------------------------------------------------------------
+_DECODE_CACHE: dict[tuple[str, str], "str | None"] = {}
+
+# Sentinel distinct from None (None is a meaningful cached value: "unhandled font").
+_MISSING = object()
+
+
+def _reset_decode_cache() -> None:
+    """Clear the per-character decode memo (e.g. after reloading font tables)."""
+    _DECODE_CACHE.clear()
+
+
+def _decode_char_cached(c: str, target_font: str, glyph_lookup, stats: dict) -> "str | None":
+    """
+    Memoized wrapper around pytiblegenc ``convert_string`` for a single char.
+
+    Returns the decoded Unicode string, or ``None`` when the font has no
+    conversion table (caller then applies the Monlam fallback).
+    """
+    key = (c, target_font)
+    cached = _DECODE_CACHE.get(key, _MISSING)
+    if cached is not _MISSING:
+        return cached
+    from pytiblegenc.char_converter import convert_string
+    decoded = convert_string(
+        c, target_font, stats, error_chr_fun=None, glyph_lookup=glyph_lookup
+    )
+    _DECODE_CACHE[key] = decoded
+    return decoded
+
+
 def _extract_line_text_hybrid(
     line: dict,
     font_normalization: dict,
@@ -1205,8 +1488,6 @@ def _extract_line_text_hybrid(
     """
     Extracts text from a MuPDF line, but decodes legacy characters using pytiblegenc.
     """
-    from pytiblegenc.char_converter import convert_string
-
     fragments: list[str] = []
     span_prev_char_obj: dict | None = None
 
@@ -1240,14 +1521,8 @@ def _extract_line_text_hybrid(
 
                 c = char_obj.get("c", "")
                 
-                # HYBRID DECODING: Pass PyMuPDF's char through pytiblegenc
-                decoded_c = convert_string(
-                    c, 
-                    target_font, 
-                    stats, 
-                    error_chr_fun=None, 
-                    glyph_lookup=glyph_lookup
-                )
+                # HYBRID DECODING: Pass PyMuPDF's char through pytiblegenc (memoized)
+                decoded_c = _decode_char_cached(c, target_font, glyph_lookup, stats)
 
                 # Fallback: If pytiblegenc returns None (unhandled font), use original char + Monlam fixes
                 if decoded_c is None:
@@ -1260,7 +1535,7 @@ def _extract_line_text_hybrid(
             text = span.get("text", "")
             decoded_text = ""
             for ch in text:
-                dec = convert_string(ch, target_font, stats, error_chr_fun=None, glyph_lookup=glyph_lookup)
+                dec = _decode_char_cached(ch, target_font, glyph_lookup, stats)
                 if dec is None:
                     dec = _correct_monlam_glyph(ch)
                 decoded_text += dec
@@ -1307,13 +1582,15 @@ def extract_pdf_hybrid(
         font_normalization: dict = {}
         glyph_lookup = None
         try:
-            glyph_db_path = get_glyph_db_path()
-            glyph_index = build_font_hash_index_from_csv(str(glyph_db_path))
+            # PDF-independent structures: built once per process and cached.
+            glyph_db_path, glyph_index, glyph_lookup = _get_glyph_db_structures()
             raw_font_norm = {}
-            with open(str(target_pdf), "rb") as _f:
-                _parser = PDFParser(_f)
-                _doc_tmp = PDFDocument(_parser)
-                raw_font_norm = identify_pdf_fonts_from_db(_doc_tmp, glyph_index) or {}
+            # PDF-specific: must run per document (inspects this PDF's fonts).
+            if glyph_index is not None:
+                with open(str(target_pdf), "rb") as _f:
+                    _parser = PDFParser(_f)
+                    _doc_tmp = PDFDocument(_parser)
+                    raw_font_norm = identify_pdf_fonts_from_db(_doc_tmp, glyph_index) or {}
 
             # Clean keys: ensure both the raw PDF name and the subset-stripped name
             # are present so PyMuPDF and pdfminer name lookups both hit.
@@ -1321,8 +1598,6 @@ def extract_pdf_hybrid(
                 ck = k.split("+", 1)[-1] if "+" in k else k
                 font_normalization[ck] = v
                 font_normalization[k] = v
-
-            glyph_lookup = build_glyph_lookup_tables(str(glyph_db_path))
         except Exception as exc:
             logger.warning("Could not load font normalization or glyph lookup: %s", exc)
 
@@ -1337,10 +1612,18 @@ def extract_pdf_hybrid(
         doc = fitz.open(str(target_pdf))
         parts: list[str] = []
 
+        # Decide document orientation once (handles near-blank pecha pages,
+        # whose marginalia would otherwise leak when judged page-by-page).
+        doc_is_pecha = _document_is_pecha(doc, font_normalization, glyph_lookup, stats)
+        if doc_is_pecha:
+            logger.info("    Detected rotated pecha layout — vertical reading order, marginalia removal.")
+
         for page in doc:
             page_dict = page.get_text("rawdict")
             page_width = page.rect.width
-            raw_lines: list[tuple[float, float, list[str]]] = [] 
+            page_height = page.rect.height
+            # Rich per-line records: (y_mid, x0, fragments, direction, bbox).
+            line_records: list[tuple] = []
 
             for block in page_dict.get("blocks", []):
                 if block.get("type", 1) != 0:
@@ -1349,18 +1632,70 @@ def extract_pdf_hybrid(
                     bbox = line.get("bbox", [0, 0, 0, 0])
                     y_mid = (bbox[1] + bbox[3]) / 2.0
                     x0 = bbox[0]
-                    
+                    direction = line.get("dir", (1.0, 0.0))
+
                     # Send line to our new hybrid decoder
                     fragments = _extract_line_text_hybrid(
-                        line, 
-                        font_normalization, 
-                        glyph_lookup, 
-                        stats, 
+                        line,
+                        font_normalization,
+                        glyph_lookup,
+                        stats,
                         drop_phantom_spaces=phantom_space_drop
                     )
-                    
+
                     if fragments:
-                        raw_lines.append((y_mid, x0, fragments))
+                        line_records.append((y_mid, x0, fragments, direction, bbox))
+
+            # Detect rotated pecha layout (body text vertical, marginalia
+            # horizontal).  Prefer the document-level decision so near-blank
+            # pecha pages are handled correctly; fall back to per-page detection
+            # for mixed-orientation documents.
+            page_vertical = doc_is_pecha or _page_is_vertical(line_records)
+
+            if page_vertical:
+                # Issue 2 — drop running-header / folio-number marginalia: the
+                # only horizontal lines on a vertical page, confined to the edge
+                # bands.  Body (vertical) lines are always kept.
+                kept = []
+                dropped = 0
+                for rec in line_records:
+                    _y, _x, _frags, direction, bbox = rec
+                    if _is_pecha_marginalia(direction, bbox, page_width, page_height):
+                        dropped += 1
+                        continue
+                    if _is_short_edge_run(_frags, bbox, page_height):
+                        dropped += 1
+                        continue
+                    kept.append(rec)
+                line_records = kept
+                if dropped:
+                    logger.debug(
+                        "  hybrid: page %d vertical pecha — dropped %d marginalia line(s)",
+                        page.number + 1, dropped,
+                    )
+
+                # Issue 3 — reading order for vertical body text runs along X
+                # (each vertical line is a full reading line; columns go
+                # left→right).  Build (primary, secondary, frags) tuples keyed on
+                # x so the standard emit path produces correct order, and skip
+                # the y-midpoint row-merge (which is meaningless for columns).
+                raw_lines = [
+                    (round((bbox[0] + bbox[2]) / 2.0, 1), bbox[1], frags)
+                    for (_y, _x, frags, direction, bbox) in line_records
+                ]
+                if raw_lines and extraction_dedup:
+                    raw_lines = _deduplicate_raw_lines(raw_lines, _Y_MERGE_TOLERANCE)
+                # Sort by column position (x_mid), then by start-of-line (y0).
+                raw_lines.sort(key=lambda t: (t[0], t[1]))
+                # Each vertical line is its own row — no y-merge.
+                for _xmid, _y0, frags in raw_lines:
+                    parts.extend(frags)
+                    parts.append("\n")
+                parts.append(f"\n{PAGE_BREAK_STR}\n")
+                continue
+
+            # ── Horizontal (standard) page: original behaviour ───────────────
+            raw_lines = [(y, x, frags) for (y, x, frags, _d, _b) in line_records]
 
             # 4. Apply PyMuPDF Deduplication & Coordinate Sorting
             if raw_lines and extraction_dedup:
@@ -1370,6 +1705,7 @@ def extract_pdf_hybrid(
             # between two groups of text blocks, sort each column independently
             # (top→bottom) before the normal y-sort, so reading order is correct.
             column_splits = _detect_column_splits(raw_lines, page_width)
+            #column_splits = None
             if column_splits:
                 logger.debug(
                     "  hybrid: page %d multi-column detected, splits at x=%s",

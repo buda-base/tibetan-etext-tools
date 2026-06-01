@@ -103,7 +103,14 @@ EXTRACTION_DUMP_DIR: Optional[Path] = None
 PRESERVE_BOX: Optional[list] = None
 
 # Tibetan tsheg (U+0F0B), vowel ུ (U+0F74), ASCII digits, fullwidth digits (U+FF10-U+FF19)
-_PAGE_ARTIFACT_CHARS = r"\u0F0B\u0F740-9\uFF10-\uFF19\s"
+# NOTE: whitespace is handled explicitly in the patterns below; it must NOT be
+# part of this character class or the nested quantifiers backtrack
+# catastrophically on long lines (the class and the surrounding \s* overlap).
+_PAGE_ARTIFACT_CHARS = r"\u0F0B\u0F740-9\uFF10-\uFF19"
+# One "artifact-only" layout line: a <lb/> followed solely by artifact chars
+# and inline spaces/tabs (no newline inside the class), optionally ending the
+# physical line.  Atomic structure (no overlap between parts) keeps matching linear.
+_ARTIFACT_LINE = r"<lb/>[ \t]*[" + _PAGE_ARTIFACT_CHARS + r"]*[ \t]*\n?"
 
 
 def strip_page_number_artifacts(text: str) -> str:
@@ -112,17 +119,17 @@ def strip_page_number_artifacts(text: str) -> str:
     long tsheg runs, and standalone vowel ུ (e.g. "１ུ", "２ུ", "ུ", "་་་...1").
     """
     pattern = (
-        r"((?:<lb/>\s*[" + _PAGE_ARTIFACT_CHARS + r"]*\n?)+)" r"(\s*<lb/>\s*<pb/>)"
+        r"(?:" + _ARTIFACT_LINE + r")+" r"([ \t]*\n?[ \t]*<lb/>[ \t]*\n?[ \t]*<pb/>)"
     )
-    text = re.sub(pattern, r"\2", text)
+    text = re.sub(pattern, r"\1", text)
     pattern2 = (
-        r"((?:<lb/>\s*[" + _PAGE_ARTIFACT_CHARS + r"]*\n?)+)" r"(\s*<pb/>)"
+        r"(?:" + _ARTIFACT_LINE + r")+" r"([ \t]*\n?[ \t]*<pb/>)"
     )
-    text = re.sub(pattern2, r"\2", text)
-    
+    text = re.sub(pattern2, r"\1", text)
+
     # Remove page numbers before closing tags (e.g., <lb/>703</p>)
     text = re.sub(r'<lb/>\s*\d+\s*(?=</[^>]+>)', '', text)
-    
+
     return text
 
 
