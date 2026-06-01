@@ -1,0 +1,15 @@
+# Local font-name aliases for pytiblegenc.
+#
+# Format: pdf_font_name,pytiblegenc_table_name
+#
+# Use this when a PDF embeds a font whose byte→Tibetan layout is identical
+# to a font pytiblegenc already supports, but under a different name.
+# Verify identity by running:
+#     python tools/font_bridge.py <font.cff> --ground-truth <raw> <expected>
+# and confirming the recommendation suggests a direct alias.
+#
+# Lines beginning with "#" are ignored.  Blank lines are ignored.
+#
+# Examples (uncomment to activate):
+# MyPublisher-Tibetan,TCRC Bod-Yig
+# AcmePress-Uchen,TibetanMachineWeb

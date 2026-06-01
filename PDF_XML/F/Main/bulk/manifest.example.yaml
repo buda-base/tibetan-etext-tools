@@ -1,0 +1,52 @@
+# Sample bulk_convert.py manifest.
+#
+# Usage:
+#   python bulk_convert.py -r /path/to/root --manifest manifest.example.yaml
+#
+# Top-level keys are either "defaults" (applied to every IE first, then
+# overridden by IE-specific entries) or IE_IDs that match folders under
+# --root. Unknown keys raise an error.
+#
+# All settings here are also valid CLI flags on convert_pdf_to_xml.py;
+# the manifest is just a way to set them per-IE instead of globally.
+
+defaults:
+  # Top/bottom crop fractions (0.0 - 0.49). Strip running headers and
+  # page-number footers physically before extraction. 0.0 disables.
+  crop_top: 0.00
+  crop_bottom: 0.00
+
+# Example: a workset that needs an aggressive crop and a tight keep-region.
+# preserve_box [x0, y0, x1, y1] gives normalised fractions of the page area
+# to KEEP; everything outside is redacted. Takes priority over crop_top/bottom.
+IE1KG25273:
+  preserve_box: [0.11, 0.09, 0.89, 0.82]
+
+IE3KG648:
+  preserve_box: [0.12, 0.06, 0.87, 0.86]
+
+IE3KG219:
+  preserve_box: [0.11, 0.02, 0.89, 0.90]
+
+IE3KG719:
+  preserve_box: [0.11, 0.06, 0.89, 0.80]
+
+# Example: a Unicode-pipeline workset that needs GSUB resolution for
+# MonlamUniOuChan subsets. Point font_dir at a folder of FULL (not
+# subsetted) .ttf/.otf files. Empty string clears any global setting.
+IE5KG_MonlamSubset:
+  font_dir: /Users/me/tibetan-fonts
+
+# Example: known-good font but extractor is over-correcting narrow spaces;
+# also disable font-size <hi rend="…"> markup (e.g. monospace body text).
+IE9KG_NoFontTags:
+  no_font_tags: true
+  no_phantom_space: true
+
+# Escape hatch: any flag accepted by convert_pdf_to_xml.py that isn't
+# represented as a top-level manifest key. Tokens forwarded as-is.
+IE9KG_Debug:
+  extra_args:
+    - "--no-extraction-dedup"
+    - "--dump-extraction"
+    - "/tmp/debug_IE9KG"

@@ -1,73 +1,107 @@
+"""
+Pipeline configuration.
+
+Single-IE workflow
+------------------
+Edit ``IE_ID`` and ``BASE_DIR`` below, then run ``convert_pdf_to_xml.py``
+directly.  Everything else (paths, output, logs, checkpoints) is derived.
+
+Bulk workflow
+-------------
+``bulk_convert.py`` spawns one ``convert_pdf_to_xml.py`` subprocess per IE
+folder and overrides this module's settings through environment variables
+so the same config file works in both modes without manual editing:
+
+  PDF_BULK_BASE_DIR     parent directory containing IE*/ worksets
+  PDF_BULK_IE_ID        the IE folder to process this run
+  PDF_BULK_INPUT_SUBDIR which subfolder under <BASE_DIR>/<IE_ID>/ holds
+                        the PDFs (``sources`` or ``to_convert``); the
+                        bulk driver auto-detects and sets this
+  PDF_BULK_FONT_DIR     override for FONT_DIR (full Tibetan fonts for
+                        GSUB resolution); pass an empty string to clear
+
+When BOTH ``PDF_BULK_BASE_DIR`` and ``PDF_BULK_IE_ID`` are set, log and
+checkpoint paths are nested under ``<BASE_DIR>/logs/<IE_ID>/`` and
+``<BASE_DIR>/checkpoints/<IE_ID>/`` so concurrent workers don't collide.
+"""
+
+from __future__ import annotations
+
 import os
 from pathlib import Path
-from typing import Optional, Union
+from typing import Optional
 
-# Default single-workset layout. Batch driver sets PDF_BULK_BASE_DIR and PDF_BULK_IE_ID.
-_DEFAULT_BASE = Path(r"/Users/tenzinmonlam/Documents/dharmaduta/pdf_convert_5/1-11")
-_DEFAULT_IE = "IE1KG25273"
+# ─── Defaults (single-IE workflow) ─────────────────────────────────────────
+# Override these for ad-hoc single-IE runs.  The bulk driver replaces them
+# at process start via PDF_BULK_BASE_DIR / PDF_BULK_IE_ID.
 
-_b = os.environ.get("PDF_BULK_BASE_DIR")
-_i = os.environ.get("PDF_BULK_IE_ID")
-BASE_DIR = Path(_b).expanduser().resolve() if _b else _DEFAULT_BASE
-IE_ID = _i if _i else _DEFAULT_IE
+_DEFAULT_IE_ID = "IE3KG194"
+_DEFAULT_BASE_DIR = Path(
+    r"/Users/tenzinmonlam/Documents/dharmaduta/6th_batch_conversion/archive_fitered_pdfs/process/vald"
+)
 
-SOURCES_DIR = BASE_DIR / IE_ID / "sources"
-TOPROCESS_DIR = BASE_DIR / IE_ID / "toprocess"
-OUTPUT_DIR = BASE_DIR / f"{IE_ID}_output"
-ARCHIVE_DIR = OUTPUT_DIR / "archive"
-SOURCES_OUTPUT_DIR = OUTPUT_DIR / "sources"
+# ─── Env-var overrides (bulk workflow) ─────────────────────────────────────
 
-# Flat logs/checkpoints when running convert_pdf_to_xml.py alone; nested per IE when
-# bulk_multi_ie.py sets both PDF_BULK_BASE_DIR and PDF_BULK_IE_ID (parallel safety).
-_bulk_env = bool(_b and _i)
-if _bulk_env:
-    LOG_DIR = BASE_DIR / "logs" / IE_ID
-    CHECKPOINT_DIR = BASE_DIR / "checkpoints" / IE_ID
+_env_base = os.environ.get("PDF_BULK_BASE_DIR")
+_env_ie = os.environ.get("PDF_BULK_IE_ID")
+_env_subdir = os.environ.get("PDF_BULK_INPUT_SUBDIR")
+_env_font_dir = os.environ.get("PDF_BULK_FONT_DIR")
+
+BASE_DIR: Path = Path(_env_base).expanduser().resolve() if _env_base else _DEFAULT_BASE_DIR
+IE_ID: str = _env_ie if _env_ie else _DEFAULT_IE_ID
+
+# Input subfolder: ``sources`` (Unicode-PDF pipeline convention) or
+# ``to_convert`` (legacy-font pipeline convention).  Bulk driver auto-detects.
+# Default falls back to ``to_convert`` for backwards compatibility.
+_INPUT_SUBDIR: str = _env_subdir if _env_subdir else "to_convert"
+
+SOURCES_DIR: Path = BASE_DIR / IE_ID / _INPUT_SUBDIR
+TOPROCESS_DIR: Path = BASE_DIR / IE_ID / "toprocess"
+OUTPUT_DIR: Path = BASE_DIR / f"{IE_ID}_output"
+ARCHIVE_DIR: Path = OUTPUT_DIR / "archive"
+SOURCES_OUTPUT_DIR: Path = OUTPUT_DIR / "sources"
+
+# Logs/checkpoints: nest under <IE_ID>/ only when the bulk driver set both
+# env vars, so parallel workers can't trample each other's state.
+_in_bulk_mode: bool = bool(_env_base and _env_ie)
+if _in_bulk_mode:
+    LOG_DIR: Path = BASE_DIR / "logs" / IE_ID
+    CHECKPOINT_DIR: Path = BASE_DIR / "checkpoints" / IE_ID
 else:
     LOG_DIR = BASE_DIR / "logs"
     CHECKPOINT_DIR = BASE_DIR / "checkpoints"
 
-PDF_TO_XML_LOG = LOG_DIR / "pdf_to_xml.log"
-PDF_TO_XML_CHECKPOINT = CHECKPOINT_DIR / "pdf_to_xml_checkpoint.txt"
+PDF_TO_XML_LOG: Path = LOG_DIR / "pdf_to_xml.log"
+PDF_TO_XML_CHECKPOINT: Path = CHECKPOINT_DIR / "pdf_to_xml_checkpoint.txt"
 
-# ─── Header/footer redaction (physical) ───────────────────────────────────
-# 0.0 = none. Typical: 0.07–0.12. Override with --crop-top / --crop-bottom.
-CROP_HEADER_FRACTION: float = 0.00   # e.g. 0.08  strips top 8 %
-CROP_FOOTER_FRACTION: float = 0.00   # e.g. 0.07  strips bottom 7 %
+# ─── Header/footer redaction (physical) ────────────────────────────────────
+# 0.0 = none.  Typical: 0.07-0.12.  Override per-run with --crop-top /
+# --crop-bottom on convert_pdf_to_xml.py, or per-IE via the bulk manifest.
+CROP_HEADER_FRACTION: float = 0.08
+CROP_FOOTER_FRACTION: float = 0.07
 
-# ─── Full font files for GSUB-based glyph correction ──────────────────────
-# Point FONT_DIR at the full (unsubsetted) Monlam font files so that
-# pdf_extract.py can invert the GSUB table and permanently fix mis-decoded
-# vowel signs (e.g. ŀ→ོ, Ĳ→ེ, Ĩ→ི).
+# ─── Full font files for GSUB-based glyph correction ───────────────────────
+# Required only for the Unicode-PDF pipeline when MonlamUniOuChan* fonts have
+# stripped/wrong ToUnicode CMaps.  Set to a directory holding the full (not
+# subsetted) .ttf/.otf files, a single .ttf path, or None to disable.
 #
-# PDFs may embed multiple fonts (e.g. MonlamUniOuChan2 AND MonlamUniOuChan5).
-# Each is looked up by name at runtime, so all required fonts must be present.
-#
-# Accepted values:
-#   None                      — GSUB correction disabled (default)
-#   Path to a directory       — ALL .ttf/.otf files inside are used  ← recommended
-#   Path to a single .ttf     — only that one font is used
-#   List of paths             — mix of files and directories
-#
-# Recommended setup — put all fonts in one folder:
-#   fonts/
-#     monlam_uni_ouchan2.ttf   ← fixes MonlamUniOuChan2 glyphs
-#     monlam_uni_ouchan5.ttf   ← fixes MonlamUniOuChan5 glyphs
-#     (add more as needed)
-#   FONT_DIR = BASE_DIR / "fonts"
-#
-# Also works with a single file (useful during testing):
-#   FONT_DIR = Path("/Users/name/Downloads/tibetan-fonts/monlam_uni_ouchan2.ttf")
-#
-# File naming: underscores/hyphens are ignored when matching, so
-#   monlam_uni_ouchan2.ttf  matches PDF basefont  MonlamUniOuChan2  ✓
-FONT_DIR = Path("/Users/tenzinmonlam/Downloads/download_temp/tibetan-fonts/")
-# Example:
-# FONT_DIR = BASE_DIR / "fonts"
-# FONT_DIR = Path("/Users/tenzinmonlam/Downloads/download_temp/tibetan-fonts")
+# Per-run override (bulk manifest): PDF_BULK_FONT_DIR=<path> or "" to clear.
+FONT_DIR: Optional[Path]
+if _env_font_dir is not None:
+    FONT_DIR = Path(_env_font_dir).expanduser().resolve() if _env_font_dir else None
+else:
+    FONT_DIR = None  # edit to a Path() for single-IE runs that need GSUB
 
+# ─── Footnote detection (PyMuPDF extractor only) ───────────────────────────
+FOOTNOTE_DETECTION: bool = True
+FOOTNOTE_SEPARATOR_MIN_WIDTH_PT: float = 50.0
+FOOTNOTE_SEPARATOR_MAX_WIDTH_PT: float = 200.0
+FOOTNOTE_MARKER_MAX_FONT_SIZE: float = 10.0
+FOOTNOTE_BODY_FONT_SIZE_MAX: float = 11.0
 
-def ensure_directories():
+# ─── Helpers ───────────────────────────────────────────────────────────────
+
+def ensure_directories() -> None:
     for d in [
         OUTPUT_DIR,
         ARCHIVE_DIR,
@@ -78,7 +112,7 @@ def ensure_directories():
         d.mkdir(parents=True, exist_ok=True)
 
 
-def extract_ve_id_from_folder(folder_name: str) -> str:
+def extract_ve_id_from_folder(folder_name: str) -> Optional[str]:
     if folder_name.startswith(f"{IE_ID}-"):
         return folder_name.replace(f"{IE_ID}-", "")
     return None

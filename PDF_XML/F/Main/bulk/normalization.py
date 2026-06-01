@@ -6,6 +6,19 @@ from enum import Enum
 # Wingdings / Wingdings2 ToUnicode often maps bullets and symbols to U+F020–U+F0FF (PUA).
 _WINGDINGS_MS_PUA = re.compile(r"[\uF020-\uF0FF]")
 
+# CJK character ranges — used to skip Tibetan-specific normalization on Chinese/Japanese/Korean text.
+_CJK_RE = re.compile(
+    r"[\u2E80-\u2EFF"   # CJK Radicals Supplement
+    r"\u2F00-\u2FDF"    # Kangxi Radicals
+    r"\u3000-\u303F"    # CJK Symbols and Punctuation
+    r"\u3040-\u30FF"    # Hiragana + Katakana
+    r"\u3400-\u4DBF"    # CJK Extension A
+    r"\u4E00-\u9FFF"    # CJK Unified Ideographs
+    r"\uF900-\uFAFF"    # CJK Compatibility Ideographs
+    r"\uFE30-\uFE4F"    # CJK Compatibility Forms
+    r"\U00020000-\U0002A6DF]"  # CJK Extension B
+)
+
 
 def remove_wingdings_private_use(text: str) -> str:
     """Remove legacy Microsoft Wingdings/Wingdings2 private-use symbols from extracted text."""
@@ -38,6 +51,55 @@ _UNICODE_SPACES = [
     "\t", "\x0b", "\x0c"           # TAB, VT, FF
 ]
 _SPACE_TO_ASCII = {ord(ch): " " for ch in _UNICODE_SPACES}
+
+
+def fix_pdf_glyph_to_unicode_artifacts(text: str) -> str:
+    """
+    Repair common Monlam / legacy PDF ToUnicode mistakes (Latin PUA fallbacks).
+
+    Observed in IE3KG647 et al.:
+      - U+0140 (ŀ) used for Tibetan vowel sign o (U+0F7C)
+      - U+0132 (Ĳ) used inside ཚིག / ཚེས / ཚིགས / མཛེས / …
+    """
+    if not text:
+        return text
+    s = text
+    # ŀ: fix syllables that must stay མཚན (mtshan) before global ŀ → ོ
+    s = s.replace("མཚŀན", "མཚན")
+    s = s.replace("ŀ", "\u0f7c")
+
+    # Ĳ: longer matches first
+    s = s.replace("མཛĲས", "མཛེས")
+    s = s.replace("མཛĲད", "མཛེད")
+    s = s.replace("འཚĲར", "འཆར")
+    s = s.replace("ཚĲག", "ཚིག")
+    s = re.sub(r"ཚĲས(?=་[\u0f20-\u0f29])", "ཚེས", s)
+    s = re.sub(r"ཚĲས(?=\s+སྐ)", "ཚིགས", s)
+    s = re.sub(r"ཚĲས(?=\s+སྣ)", "ཚིགས", s)
+    s = re.sub(r"ཚĲས(?=\s)", "ཚིགས", s)
+    s = s.replace("ཚĲས", "ཚེས")
+    # Colophon / grammar: ཚĲ་སྐབས (tsheg after Ĳ, not ASCII space)
+    s = re.sub(r"ཚĲ(?=་སྐ)", "ཚིགས", s)
+    s = re.sub(r"ཚĲ(?=་སྣ)", "ཚིགས", s)
+    s = re.sub(r"ཚĲ(?=[བཔ])", "ཚིག", s)
+    s = re.sub(r"ཚĲ(?=\s)", "ཚིགས", s)
+    s = s.replace("ཚĲ", "ཚེ")
+    s = re.sub(r"([\u0f00-\u0fff])Ĳ", r"\1" + "\u0f7a", s)
+    return s
+
+
+def normalize_tibetan_boundary_spaces(text: str) -> str:
+    """Insert a single ASCII space where print PDFs separate shad/tsheg from the next unit."""
+    if not text:
+        return text
+    s = text
+    s = re.sub(r"(\u0f0d)([\u0f40-\u0f6c])", r"\1 \2", s)
+    s = re.sub(r"(\u0f0b)([\u0f20-\u0f33])", r"\1 \2", s)
+    s = re.sub(r"(\u0f0d)([\u0f20-\u0f33])", r"\1 \2", s)
+    # e.g. ༢༠༡༣ཟླ་ → ༢༠༡༣ ཟླ་ (Tibetan digits then syllable, common in colophons)
+    s = re.sub(r"([\u0f20-\u0f33])([\u0f40-\u0f6c])", r"\1 \2", s)
+    s = re.sub(r" {2,}", " ", s)
+    return s
 
 
 def normalize_spaces(
@@ -130,7 +192,18 @@ def normalize_unicode(
 
     # 6) Normalize spaces
     s = normalize_spaces(s, collapse_internal_spaces=collapse_internal_spaces)
-   
+
+    # Steps 6b–9 are Tibetan-specific and must not be applied to lines that
+    # contain CJK characters (Chinese/Japanese/Korean).  Applying Tibetan
+    # glyph-artifact fixes and Unicode reordering to CJK text corrupts it.
+    if _CJK_RE.search(s):
+        return s
+
+    # 6b) PDF cmap / legacy font mis-encodings (Latin letters standing in for Tibetan)
+    s = fix_pdf_glyph_to_unicode_artifacts(s)
+    # 6c) Restore visible gaps after shad / before Tibetan digits (dates, headings)
+    s = normalize_tibetan_boundary_spaces(s)
+
     # 8) Wingdings/Wingdings2 bullets and dingbats (PUA safety net)
     s = remove_wingdings_private_use(s)
 
@@ -290,5 +363,3 @@ def normalize_invalid_start_string(s):
     if is_suffix(s[0]):
         return s[1:]
     return s
-
-

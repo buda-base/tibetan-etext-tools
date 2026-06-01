@@ -1,0 +1,24 @@
+# Tibetan PDF → TEI conversion pipeline — Python dependencies.
+#
+# Install with:
+#   pip install -r requirements.txt
+#
+# Tested on Python 3.10+. PyMuPDF and pytiblegenc are mandatory; the others
+# cover specific extraction modes and the bulk driver's YAML manifests.
+
+# Core extraction
+pymupdf>=1.23
+pytiblegenc>=0.3
+pdfminer.six>=20221105   # required by pytiblegenc.pdfminer_text_converter
+
+# Filesystem / ordering
+natsort>=8
+
+# Optional, only if you use YAML manifests with bulk_convert.py
+# (JSON manifests work without any extra dependency)
+pyyaml>=6
+
+# Font-onboarding tools (tools/font_inspect.py, tools/font_bridge.py)
+# Only needed when adding new legacy Tibetan fonts.
+fonttools>=4.40
+Pillow>=10

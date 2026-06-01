@@ -1,37 +1,12 @@
-"""
-PDF text extraction for Monlam-font PDFs: PyMuPDF ``rawdict`` or ``pytiblegenc.pdf_to_txt``.
-
-Line breaks are layout-level (one ``\n`` per extractor line); ``PAGE_BREAK_STR`` marks pages.
-
-Fixes applied (all in the PyMuPDF path):
-  1. Phantom space detection rule corrected  (space_x < prev_x + threshold, not < next_x)
-  2. WinAnsi vowel glyph mis-mappings — resolved via gsub_resolver (GSUB inversion +
-     fuzzy shape matching).  The ToUnicode CMap is patched in-memory before extraction
-     so PyMuPDF decodes characters correctly without any per-character post-processing.
-     Set FONT_DIR in config.py to enable GSUB inversion from the full .ttf file.
-  3. Phantom space check threaded across span boundaries within a line
-  4. Epsilon tolerance for near-zero-advance phantom spaces from WinAnsi vowel spans
-  5. Duplicate text-layer deduplication for InDesign-generated PDFs
-     Two sub-steps:
-     a) _deduplicate_raw_lines: removes copies that share (y_bucket, x_bucket, text key);
-        keys use NFC, ZW strip, whitespace / U+3000 collapse, and 3 pt X buckets (CJK).
-     b) _dedup_within_row: removes copies that survive (a) because their x-offsets
-        span multiple buckets but are still within _SHADOW_X_THRESHOLD points — seen
-        in InDesign drop-shadow PDFs (e.g. TI1258) where 4 renders of the same glyph
-        produce 4× character repetition in the merged visual row.
-"""
-
 from __future__ import annotations
 
-import io
 import logging
 import os
 import re
 import tempfile
 import traceback
-import unicodedata
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Optional
 
 try:
     import pymupdf as fitz
@@ -45,430 +20,587 @@ except ImportError:
         fitz = None  # type: ignore
 
 try:
-    from pytiblegenc import pdf_to_txt
+    from pytiblegenc import (
+        get_glyph_db_path,
+        build_font_hash_index_from_csv,
+        identify_pdf_fonts_from_db,
+        build_glyph_lookup_tables,
+    )
+    from pytiblegenc.pdfminer_text_converter import DuffedTextConverter
+    from pytiblegenc.char_converter import get_base as _tibl_get_base, get_utfc_base as _tibl_get_utfc_base
+    from pdfminer.pdfdocument import PDFDocument
+    from pdfminer.pdfparser import PDFParser
+    from pdfminer.pdfinterp import PDFResourceManager, PDFPageInterpreter
+    from pdfminer.pdfpage import PDFPage
+    from io import StringIO
     PYTIBLEGENC_AVAILABLE = True
 except ImportError:
     PYTIBLEGENC_AVAILABLE = False
-    pdf_to_txt = None  # type: ignore
-
-try:
-    from fontTools import ttLib as _ttLib
-    FONTTOOLS_AVAILABLE = True
-except ImportError:
-    FONTTOOLS_AVAILABLE = False
-    _ttLib = None  # type: ignore
-
-try:
-    from gsub_resolver import build_glyph_unicode_map
-    GSUB_RESOLVER_AVAILABLE = True
-except ImportError:
-    GSUB_RESOLVER_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
 
 PAGE_BREAK_STR = "ZZZZ"
 _FONT_SIZE_FORMAT = "<fs:{}>"
+_FS_TAG_RE = re.compile(r"<fs:\d+>")
+
+# ─── Footnote markup tokens ─────────────────────────────────────────────────
+# A footnote is emitted into the flat extraction stream as a single-line token
+# so it survives normalization untouched, then converted to a TEI <note> in
+# convert_markup_to_tei.  The delimiters are deliberately unusual ASCII so they
+# pass through Unicode normalization (private-use chars get stripped) and never
+# collide with real Tibetan text.
+_NOTE_OPEN = "@@FNOTE@@"
+_NOTE_CLOSE = "@@ENDFN@@"
+_NOTE_TOKEN_RE = re.compile(re.escape(_NOTE_OPEN) + r"(.*?)" + re.escape(_NOTE_CLOSE))
+
+# ─── Footnote detection thresholds ──────────────────────────────────────────
+# A genuine footnote separator is a short horizontal rule on the LEFT margin
+# in the bottom region of the page, with smaller-than-body text beneath it.
+# These defaults are overridable from config (see _footnote_settings()).
+_FN_SEP_MIN_WIDTH_PT = 40.0     # separator at least this wide
+_FN_SEP_MAX_WIDTH_PT = 220.0    # …but not a full-width rule (that's a border)
+_FN_SEP_MIN_Y_FRACTION = 0.62   # separator must sit below this fraction of page height
+_FN_SEP_LEFT_MARGIN_TOL = 25.0  # separator x0 within this many pt of the body left margin
+_FN_BODY_SIZE_RATIO = 0.92      # footnote text must be ≤ this × body font size
+
+
+def get_pdf_page_content_flags(
+    pdf_path: Path,
+    *,
+    crop_top: float = 0.0,
+    crop_bottom: float = 0.0,
+    preserve_box: Optional[list] = None,
+) -> list[bool]:
+    """
+    Return a per-physical-page list of booleans: ``True`` where the page has
+    extractable text under the given crop/preserve settings, ``False`` for a
+    blank page.
+
+    This mirrors the page set that survives into the TEI body.  Blank pages
+    produce no text, so their ``<pb/>`` is collapsed away by the body post-
+    processing — which means the Nth surviving ``<pb/>`` corresponds to the
+    Nth ``True`` entry here, **not** to physical page N.  :func:`inject_page_labels`
+    uses this list to align ``PageLabels`` to the pages that actually appear,
+    fixing the label drift caused by blank pages.
+
+    Returns an empty list when PyMuPDF is unavailable or the PDF can't be read.
+    """
+    if not PYMUPDF_AVAILABLE:
+        return []
+    try:
+        doc = fitz.open(str(pdf_path))
+    except Exception as exc:
+        logger.warning("Could not open %s for content-flag scan: %s", pdf_path.name, exc)
+        return []
+
+    flags: list[bool] = []
+    try:
+        for page in doc:
+            r = page.rect
+            clip = None
+            if preserve_box is not None and len(preserve_box) == 4:
+                px0f, py0f, px1f, py1f = preserve_box
+                clip = fitz.Rect(
+                    r.x0 + px0f * r.width, r.y0 + py0f * r.height,
+                    r.x0 + px1f * r.width, r.y0 + py1f * r.height,
+                )
+            elif crop_top > 0.0 or crop_bottom > 0.0:
+                clip = fitz.Rect(
+                    r.x0, r.y0 + r.height * crop_top,
+                    r.x1, r.y1 - r.height * crop_bottom,
+                )
+            try:
+                txt = page.get_text("text", clip=clip) if clip is not None else page.get_text("text")
+            except Exception:
+                txt = page.get_text("text")
+            flags.append(bool(txt and txt.strip()))
+    finally:
+        doc.close()
+
+    return flags
+
+
+def get_pdf_page_labels(pdf_path: Path) -> dict:
+    """
+    Return a mapping of {page_index (0-based): label_string} for every page
+    in *pdf_path* that has a PageLabel entry.
+
+    Uses the PDF's ``PageLabels`` dictionary (the human-readable names that PDF
+    viewers display in their page-number box — Roman numerals, custom prefixes,
+    numeric sequences that don't start at 1, etc.).  This is distinct from the
+    physical page index, which always starts at 0.
+
+    Returns an empty dict when:
+    - PyMuPDF is unavailable,
+    - the PDF has no ``PageLabels`` dict, or
+    - every label is just the plain sequential page number (``"1"``, ``"2"``, …),
+      which is indistinguishable from having no labels.
+
+    Example return value for a PDF with pages labelled [i, ii, iii, 1, 2, 3, …]:
+        {0: 'i', 1: 'ii', 2: 'iii', 3: '1', 4: '2', 5: '3', ...}
+    """
+    if not PYMUPDF_AVAILABLE:
+        return {}
+    try:
+        doc = fitz.open(str(pdf_path))
+        raw_labels: list = doc.get_page_labels()  # list of rule dicts from PyMuPDF
+        page_count: int = doc.page_count
+        doc.close()
+    except Exception as exc:
+        logger.warning("Could not read PageLabels from %s: %s", pdf_path.name, exc)
+        return {}
+
+    if not raw_labels:
+        return {}
+
+    # ── helper: integer → Roman numeral ─────────────────────────────────────
+    def _to_roman(n: int) -> str:
+        if n <= 0:
+            return str(n)
+        val = [1000, 900, 500, 400, 100, 90, 50, 40, 10, 9, 5, 4, 1]
+        sym = ["M", "CM", "D", "CD", "C", "XC", "L", "XL", "X", "IX", "V", "IV", "I"]
+        res = ""
+        for v, s in zip(val, sym):
+            while n >= v:
+                res += s
+                n -= v
+        return res
+
+    # ── helper: 1-based integer → alphabetic (1→a, 26→z, 27→aa …) ──────────
+    def _to_alpha(n: int) -> str:
+        if n <= 0:
+            return str(n)
+        res = ""
+        while n > 0:
+            n, r = divmod(n - 1, 26)
+            res = chr(ord("a") + r) + res
+        return res
+
+    # ── expand PageLabel rules into one label per page ───────────────────────
+    # PyMuPDF returns rules sorted by startpage, but sort anyway for safety.
+    rules = sorted(raw_labels, key=lambda r: r.get("startpage", 0))
+    all_labels: list = [""] * page_count
+
+    for rule_idx, rule in enumerate(rules):
+        start = rule.get("startpage", 0)
+        end = (
+            rules[rule_idx + 1].get("startpage", page_count)
+            if rule_idx + 1 < len(rules)
+            else page_count
+        )
+        prefix = rule.get("prefix", "") or ""
+        style = rule.get("style", "") or ""
+        first = rule.get("firstpagenum", 1) or 1
+
+        for i in range(start, min(end, page_count)):
+            n = first + (i - start)
+            if style == "D":
+                num_str = str(n)
+            elif style == "r":
+                num_str = _to_roman(n).lower()
+            elif style == "R":
+                num_str = _to_roman(n).upper()
+            elif style == "a":
+                num_str = _to_alpha(n).lower()
+            elif style == "A":
+                num_str = _to_alpha(n).upper()
+            else:
+                # No numbering style — prefix-only label (e.g. "Cover")
+                num_str = ""
+            all_labels[i] = prefix + num_str
+
+    # ── discard when every label equals plain "1", "2", "3", … ─────────────
+    trivial = all(all_labels[i] == str(i + 1) for i in range(page_count))
+    if trivial:
+        return {}
+
+    # Build result dict; pages whose label is the empty string get no entry
+    # so the caller can use .get(idx) and emit <pb/> (no n= attr) for those.
+    return {i: lbl for i, lbl in enumerate(all_labels) if lbl != ""}
 
 
 # ---------------------------------------------------------------------------
-# Fix 2 — GSUB-based CMap patching
+# Fix 7 — Legacy font name alias map
 #
-# For Unicode Tibetan fonts (MonlamUniOuChan2 etc.) the PDF's ToUnicode CMap
-# maps some GSUB-substituted glyph alternates to wrong Latin Extended codepoints
-# instead of the correct Tibetan vowels.  The fix uses gsub_resolver to identify
-# the correct mappings and patches them directly into the CMap stream in memory
-# before PyMuPDF processes the page — so PyMuPDF decodes characters correctly
-# without any per-character post-processing.
+# Some authoring tools (PageMaker 7, older InDesign versions) embed Tibetan
+# font names with spaces stripped: "TCRCYoutso" instead of "TCRC Youtso".
+# pytiblegenc's convert_string() does an exact dict lookup on the font name,
+# so "TCRCYoutso" is never found → the font lands in unhandled_fonts and raw
+# legacy encoding bytes pass through unchanged.
 #
-# Resolution hierarchy (applied once per unique embedded font per PDF):
-#   A) GSUB inversion via gsub_resolver + full .ttf from FONT_DIR        [best]
-#   B) Fuzzy shape matching via gsub_resolver using the PDF's CMap        [good]
+# Fix: build a map of {stripped_name: canonical_table_name} from pytiblegenc's
+# own loaded conversion tables, then inject it into font_normalization before
+# each pytiblegenc extraction so the converter sees the right key.
 #
-# To enable (A): set FONT_DIR in config.py to the directory containing the full
-# (unsubsetted) font files, e.g. MonlamUniOuChan2.ttf, MonlamUniOuChan5.ttf.
-# Without it, (B) is used automatically from the PDF's embedded subset.
+# The map is built lazily at first use (avoids import-time cost) and cached.
+# ---------------------------------------------------------------------------
+_FONT_NAME_ALIASES: dict[str, str] | None = None
+
+
+# ---------------------------------------------------------------------------
+# Fix 8 — TibetanChogyal missing-cid patch
 # ---------------------------------------------------------------------------
 
-_TIBETAN_MIN = 0x0F00
-_TIBETAN_MAX = 0x0FFF
+# Maps cid → Tibetan Unicode string for the 8 undecoded TibetanChogyal slots.
+_CHOGYAL_CID_PATCH: dict[int, str] = {
+    2: "\u0F66\u0FA4\u0FB1",  # སྤྱ  sa + pa-ta subscript + ya-ta subscript
+    3: "\u0F42",              # ག    ga (alternate glyph slot, same shape as cid=35)
+    4: "\u0F4E",              # ཎ    retroflex na (Sanskrit ṇa; e.g. པཎ་ཆེན་ Panchen)
+    5: "\u0F51\u0FAD",        # དྭ   da + wa-zur subscript
+    6: "\u0F51",              # ད    da  (alternate glyph slot, same shape as cid=43)
+    7: "\u0F40",              # ཀ    ka  (alternate glyph slot, same shape as cid=33)
+    8: "",                    # ''   glyph index out-of-range → zero-width, emit nothing
+    9: "\u0F7F",              # ཿ    visarga (alternate glyph slot, same shape as cid=239)
+}
+
+# Base font name (after stripping the random subset prefix "XXXXXX+") that
+# this patch applies to.  The Skt variants have different encodings and do
+# not exhibit this problem.
+_CHOGYAL_BASE_NAME = "TibetanChogyal"
 
 
-def _is_tibetan(s: str) -> bool:
-    return bool(s) and all(_TIBETAN_MIN <= ord(c) <= _TIBETAN_MAX for c in s)
-
-
-def _get_font_paths() -> list[Path]:
+def _install_chogyal_cid_patch() -> None:
     """
-    Return a list of font file paths from config.
+    Monkey-patch ``pytiblegenc.pdfminer_text_converter.convert_string`` so that
+    ``(cid:N)`` strings produced by pdfminer for undecoded TibetanChogyal glyphs
+    are replaced with the correct Tibetan Unicode before pytiblegenc discards them.
 
-    ``FONT_DIR`` in config.py can be:
-      - A directory Path: all .ttf/.otf files inside it are candidates.
-      - A single .ttf/.otf file Path: used directly.
-      - A list of file/directory Paths: each entry is handled as above.
-      - None: returns an empty list (GSUB correction disabled).
+    Background
+    ----------
+    When pdfminer cannot resolve a cid to a unicode character it calls
+    ``handle_undefined_char(font, cid)`` which returns the string ``"(cid:N)"``.
+    That string is passed to ``convert_string()``.  The very first thing
+    ``convert_string`` does is::
 
-    This tolerates the common mistake of pointing FONT_DIR at the .ttf file
-    itself rather than its parent directory.
+        if s.startswith("(cid:"):
+            return ""
+
+    so the character is silently dropped — **before** ``error_chr_fun`` is ever
+    called.  The only reliable interception point is ``convert_string`` itself.
+
+    This function wraps the module-level ``convert_string`` reference that
+    ``DuffedTextConverter.convert_item`` imports, so the patch is transparent to
+    all other callers.  It is idempotent: calling it twice has no effect.
     """
-    try:
-        from config import FONT_DIR  # type: ignore
-    except (ImportError, AttributeError):
-        return []
-
-    if FONT_DIR is None:
-        return []
-
-    # Normalise to list
-    entries = FONT_DIR if isinstance(FONT_DIR, (list, tuple)) else [FONT_DIR]
-    paths: list[Path] = []
-    for entry in entries:
-        p = Path(entry)
-        if p.is_dir():
-            paths.extend(f for f in p.iterdir() if f.suffix.lower() in (".ttf", ".otf"))
-        elif p.is_file() and p.suffix.lower() in (".ttf", ".otf"):
-            paths.append(p)
-        else:
-            logger.debug("_get_font_paths: skipping non-existent or unsupported path: %s", p)
-    return paths
-
-
-def _find_font_file(basefont_name: str) -> Optional[Path]:
-    """
-    Find the font file whose stem matches *basefont_name*.
-
-    Strips the PDF subset prefix (e.g. "FPDEGJ+MonlamUniOuChan2" → "MonlamUniOuChan2")
-    and matches case-insensitively with separators (underscores, hyphens, spaces)
-    ignored on both sides, so ``monlam_uni_ouchan2.ttf`` matches ``MonlamUniOuChan2``.
-    """
-    stem = basefont_name.split("+")[-1] if "+" in basefont_name else basefont_name
-
-    def _norm(s: str) -> str:
-        return s.lower().replace("_", "").replace("-", "").replace(" ", "")
-
-    target = _norm(stem)
-    for font_path in _get_font_paths():
-        if _norm(font_path.stem) == target:
-            return font_path
-    return None
-
-
-def _parse_tounicode_cmap(cmap_text: str) -> dict[int, str]:
-    """
-    Parse a PDF ToUnicode CMap stream into {glyph_id: unicode_string}.
-
-    Handles bfchar, bfrange (linear), and bfrange (array) forms.
-    """
-    result: dict[int, str] = {}
-
-    for m in re.finditer(r"<([0-9a-fA-F]{2,4})>\s+<([0-9a-fA-F]+)>", cmap_text):
-        gid = int(m.group(1), 16)
-        uni_hex = m.group(2)
-        result[gid] = "".join(
-            chr(int(uni_hex[i: i + 4], 16)) for i in range(0, len(uni_hex), 4)
-        )
-
-    for m in re.finditer(
-        r"<([0-9a-fA-F]{2,4})>\s+<([0-9a-fA-F]{2,4})>\s+<([0-9a-fA-F]+)>", cmap_text
-    ):
-        start, end = int(m.group(1), 16), int(m.group(2), 16)
-        base_hex = m.group(3)
-        if len(base_hex) == 4:
-            base_cp = int(base_hex, 16)
-            for i in range(end - start + 1):
-                result[start + i] = chr(base_cp + i)
-
-    for m in re.finditer(
-        r"<([0-9a-fA-F]{2,4})>\s+<([0-9a-fA-F]{2,4})>\s+\[<([^>]+)>", cmap_text
-    ):
-        start = int(m.group(1), 16)
-        uni_hex = m.group(3)
-        result[start] = "".join(
-            chr(int(uni_hex[i: i + 4], 16)) for i in range(0, len(uni_hex), 4)
-        )
-
-    return result
-
-
-def _compute_fuzzy_hash(tt, glyph_name: str, resolution: int = 6) -> Optional[str]:
-    """
-    Resolution-6 fuzzy outline hash for glyph matching across GID spaces.
-
-    Because subset fonts renumber GIDs relative to the full font, we cannot
-    match by GID.  Instead we hash the normalised glyph outline: same shape
-    → same hash regardless of which font or GID the glyph came from.
-    """
-    from hashlib import sha256
-    try:
-        if "glyf" not in tt:
-            return None
-        glyf_tbl = tt["glyf"]
-        g = glyf_tbl[glyph_name]
-        coords, end_pts, flags = g.getCoordinates(glyf_tbl)
-    except Exception:
-        return None
-    upem = tt["head"].unitsPerEm
-    if not coords:
-        return None
-    norm = [(x / upem, y / upem) for x, y in coords]
-    min_x = min(p[0] for p in norm)
-    min_y = min(p[1] for p in norm)
-    norm = [(x - min_x, y - min_y) for x, y in norm]
-    cends = set(end_pts)
-    parts: list[str] = []
-    for i, (x, y) in enumerate(norm):
-        rx = round(x * resolution) / resolution
-        ry = round(y * resolution) / resolution
-        parts.append(f"{rx:.4f},{ry:.4f},{flags[i] & 1}")
-        if i in cends:
-            parts.append("|")
-    return sha256(";".join(parts).encode()).hexdigest()
-
-
-def _build_cmap_corrections(
-    font_bytes: bytes,
-    basefont: str,
-    cmap_gid_to_unicode: dict[int, str],
-) -> dict[int, str]:
-    """
-    Return {gid: correct_unicode} for every GID in the PDF font whose CMap
-    value is absent or wrong (non-Tibetan for a Tibetan font).
-
-    Algorithm
-    ---------
-    PDF subset fonts renumber glyphs starting from 0, so subset GID N has no
-    relation to full font GID N.  Matching by GID number across the two fonts
-    produces wrong results.  Instead we match by *glyph outline shape*:
-
-    1. Load the full font from FONT_DIR and build a GSUB-derived map:
-           glyph_name → correct_unicode   (from GSUB inversion)
-    2. Build a fuzzy-hash → correct_unicode table from the full font:
-           sha256(normalised_outline) → unicode
-    3. Iterate the SUBSET font's glyph_order (same GID numbering as the PDF CMap):
-       For each GID whose CMap entry is absent or non-Tibetan:
-         a. Compute the fuzzy hash of that glyph's outline in the SUBSET font
-         b. Look up the hash in the full font's table
-         c. If found → record as a correction for that GID
-
-    Returns an empty dict if fontTools / gsub_resolver are unavailable or if
-    no full font is found in FONT_DIR (subset-only mode yields no corrections
-    because the subset font itself lacks cmap+GSUB tables).
-    """
-    if not FONTTOOLS_AVAILABLE or not GSUB_RESOLVER_AVAILABLE:
-        return {}
-
-    # ── Load full font (GSUB source) ────────────────────────────────────────
-    full_font = None
-    font_file = _find_font_file(basefont)
-    if font_file:
-        try:
-            full_font = _ttLib.TTFont(str(font_file))
-        except Exception as exc:
-            logger.debug("_build_cmap_corrections: failed to load %s: %s", font_file, exc)
-
-    if full_font is None:
-        logger.debug(
-            "_build_cmap_corrections: no full font for %s — skipping GSUB correction",
-            basefont,
-        )
-        return {}
-
-    # ── Build glyph map from the full font (cmap + GSUB) ───────────────────
-    # Use the full font's OWN cmap (not the PDF subset CMap) so that:
-    #   Step 2.1: all ~193 Tibetan cmap entries are trusted reference glyphs
-    #   Step 2.3a: GSUB inversion adds alternate/ligature forms on top
-    #   Step 2.3b: fuzzy matching catches any remaining variants
-    # This gives the widest possible hash table to match against.
-    try:
-        full_font_cmap: dict[int, str] = {}
-        if "cmap" in full_font:
-            raw_cmap = full_font["cmap"].getBestCmap() or {}
-            full_font_cmap = {cp: chr(cp) for cp in raw_cmap.keys()}
-    except Exception:
-        full_font_cmap = {}
-    glyph_map = build_glyph_unicode_map(full_font, full_font_cmap)
-
-    # ── Build full-font hash table: outline_hash → unicode ──────────────────
-    full_hash_table: dict[str, str] = {}
-    for glyph_name, unicode_str in glyph_map.items():
-        if not _is_tibetan(unicode_str):
-            continue
-        fh = _compute_fuzzy_hash(full_font, glyph_name)
-        if fh:
-            full_hash_table[fh] = unicode_str
-
-    logger.debug(
-        "_build_cmap_corrections: full font hash table has %d Tibetan entries for %s",
-        len(full_hash_table), basefont,
-    )
-
-    if not full_hash_table:
-        return {}
-
-    # ── Load subset font (PDF GID space) ────────────────────────────────────
-    subset_font = None
-    if font_bytes:
-        try:
-            subset_font = _ttLib.TTFont(io.BytesIO(font_bytes))
-        except Exception as exc:
-            logger.debug("_build_cmap_corrections: failed to load subset: %s", exc)
-
-    if subset_font is None:
-        return {}
-
-    subset_order = subset_font.getGlyphOrder()
-
-    # ── Match each subset GID by shape against the full font ────────────────
-    corrections: dict[int, str] = {}
-    for gid, glyph_name in enumerate(subset_order):
-        current_uni = cmap_gid_to_unicode.get(gid)
-        if current_uni is not None and _is_tibetan(current_uni):
-            continue  # already correct in CMap
-
-        fh = _compute_fuzzy_hash(subset_font, glyph_name)
-        if not fh:
-            continue
-
-        resolved = full_hash_table.get(fh)
-        if resolved and _is_tibetan(resolved):
-            corrections[gid] = resolved
-            logger.debug(
-                "_build_cmap_corrections: GID 0x%04X (%s) %r → %r  [shape match]",
-                gid, glyph_name, current_uni or "MISSING", resolved,
-            )
-
-    logger.info(
-        "_build_cmap_corrections: %d corrections for %s",
-        len(corrections), basefont,
-    )
-    return corrections
-
-
-def _patch_cmap_stream(cmap_text: str, corrections: dict[int, str]) -> str:
-    """
-    Inject *corrections* as additional bfchar entries into a ToUnicode CMap stream.
-
-    The entries are inserted just before ``endcmap`` so they override any
-    existing (wrong) mapping for the same GID — PDF CMap resolution uses the
-    last matching entry when duplicates exist.
-    """
-    if not corrections:
-        return cmap_text
-
-    entries = [f"<{gid:04x}> <{''.join(f'{ord(c):04x}' for c in uni)}>"
-               for gid, uni in sorted(corrections.items())]
-    patch = f"\n{len(entries)} beginbfchar\n" + "\n".join(entries) + "\nendbfchar\n"
-    return cmap_text.replace("endcmap", patch + "endcmap")
-
-
-def _patch_font_cmaps(doc) -> None:
-    """
-    Patch all ToUnicode CMap streams in *doc* in-memory before text extraction.
-
-    Iterates every Identity-H (Unicode CID) font in the document, builds the
-    correction map via gsub_resolver, and rewrites any CMap streams that contain
-    wrong mappings.  Each unique font xref is processed only once.
-
-    This must be called once per document, before any call to page.get_text().
-    After patching, PyMuPDF decodes characters correctly from the amended CMap
-    without any further per-character post-processing.
-    """
-    if not FONTTOOLS_AVAILABLE or not GSUB_RESOLVER_AVAILABLE:
+    if not PYTIBLEGENC_AVAILABLE:
         return
 
-    patched_tou_xrefs: set[int] = set()
+    try:
+        import pytiblegenc.pdfminer_text_converter as _ptc
+        from pytiblegenc.char_converter import convert_string as _orig_cs
 
-    for pn in range(len(doc)):
-        page = doc[pn]
-        for font_entry in page.get_fonts(full=True):
-            font_xref = font_entry[0]
-            enc = font_entry[5]
+        # Idempotency guard
+        if getattr(_ptc, "_chogyal_cid_patch_installed", False):
+            return
 
-            if enc != "Identity-H":
-                continue  # only Unicode CID fonts need patching
+        def _patched_convert_string(
+            s: str,
+            font_name: str,
+            stats: dict,
+            error_chr_fun=None,
+            glyph_lookup=None,
+        ) -> "str | None":
+            # Intercept (cid:N) for TibetanChogyal before the original strips it.
+            if s.startswith("(cid:") and s.endswith(")"):
+                clean_font = (
+                    font_name.split("+", 1)[-1] if "+" in font_name else font_name
+                )
+                if clean_font == _CHOGYAL_BASE_NAME:
+                    try:
+                        cid = int(s[5:-1])
+                    except ValueError:
+                        pass
+                    else:
+                        replacement = _CHOGYAL_CID_PATCH.get(cid)
+                        if replacement is not None:
+                            return replacement
+            return _orig_cs(s, font_name, stats, error_chr_fun, glyph_lookup)
 
-            basefont = font_entry[3]
-            font_obj = doc.xref_object(font_xref, compressed=False)
+        _ptc.convert_string = _patched_convert_string
+        _ptc._chogyal_cid_patch_installed = True
+        logger.debug("TibetanChogyal cid patch installed into convert_string")
 
-            tou_m = re.search(r"/ToUnicode\s+(\d+)\s+0\s+R", font_obj)
-            if not tou_m:
-                continue
-            tou_xref = int(tou_m.group(1))
+    except Exception as exc:
+        logger.warning("Could not install TibetanChogyal cid patch: %s", exc)
 
-            if tou_xref in patched_tou_xrefs:
-                continue  # already patched this CMap
 
-            # Get font bytes (subset embedded in PDF).
-            # DescendantFonts may be an inline array [ N 0 R ] or an indirect
-            # reference (N 0 R) pointing to an array — handle both.
-            font_bytes = b""
-            desc_xref: Optional[int] = None
+# ---------------------------------------------------------------------------
+# Fix 9 — Local font conversion tables
+#
+# pytiblegenc ships with ~70 font tables, but the BDRC corpus contains many
+# more legacy Tibetan fonts (publisher-custom, regional variants, fonts whose
+# upstream support is incomplete).  Each unsupported font causes its
+# characters to fall through pytiblegenc's lookup and pass into the output
+# unchanged — typically as Latin/Mac-Roman garbage like ``z;∫-Gh§≈``.
+#
+# This module loads two kinds of supplementary data from a sibling
+# ``local_font_tables/`` directory:
+#
+#   1. **Glyph CSVs** — one CSV per font (or font family).  Each row is
+#      ``font_name,decimal_codepoint,tibetan_unicode`` (same format as the
+#      upstream ``tiblegenc.csv``).  Rows are merged into pytiblegenc's
+#      ``get_utfc_base()`` dict at extraction start.  Drop a new CSV in the
+#      directory and it's picked up automatically — no code change needed.
+#
+#   2. **Alias map** — ``_aliases.csv`` with two columns,
+#      ``pdf_font_name,pytiblegenc_table_name``.  Use this for fonts that
+#      share an existing table's byte layout but are embedded under a
+#      different name (e.g. ``MyPublisher-Tibetan`` is byte-identical to
+#      ``TCRC Bod-Yig`` — one row aliases the entire mapping with no per-
+#      glyph work).
+#
+# Naming convention: any CSV in the directory whose name doesn't start with
+# an underscore is treated as a glyph table.  Underscore-prefixed files are
+# reserved for control data (``_aliases.csv`` today; future control files
+# can use the same prefix).
+#
+# pytiblegenc's ``normalize_font_name()`` strips a trailing literal
+# ``"Normal"`` from font names before lookup, so for every font name ending
+# in ``Normal`` we also register under the stripped form.  This is the only
+# normalization quirk; everything else lines up cleanly.
+# ---------------------------------------------------------------------------
 
-            # Inline array: /DescendantFonts [ 350 0 R ]
-            inline_m = re.search(r"/DescendantFonts\s*\[\s*(\d+)", font_obj)
-            if inline_m:
-                desc_xref = int(inline_m.group(1))
-            else:
-                # Indirect reference: /DescendantFonts 51 0 R
-                indir_m = re.search(r"/DescendantFonts\s+(\d+)\s+0\s+R", font_obj)
-                if indir_m:
-                    arr_obj = doc.xref_object(int(indir_m.group(1)), compressed=False)
-                    arr_m = re.search(r"(\d+)\s+0\s+R", arr_obj)
-                    if arr_m:
-                        desc_xref = int(arr_m.group(1))
+_LOCAL_TABLES_DIR = Path(__file__).parent / "local_font_tables"
+_ALIASES_FILENAME = "_aliases.csv"
 
-            if desc_xref is not None:
-                desc_obj = doc.xref_object(desc_xref, compressed=False)
-                fd_m = re.search(r"/FontDescriptor\s+(\d+)", desc_obj)
-                if fd_m:
-                    fd_obj = doc.xref_object(int(fd_m.group(1)), compressed=False)
-                    ff2_m = re.search(r"/FontFile2\s+(\d+)", fd_obj)
-                    if ff2_m:
-                        try:
-                            font_bytes = doc.xref_stream(int(ff2_m.group(1)))
-                        except Exception:
-                            pass
+# Idempotency flag — the install runs once per process.  Subsequent calls
+# return immediately so re-entering ``extract_pdf_hybrid`` doesn't repeatedly
+# re-parse CSVs or log spam.
+_LOCAL_TABLES_INSTALLED = False
 
-            # Parse existing CMap
-            try:
-                cmap_text = doc.xref_stream(tou_xref).decode("latin-1", "replace")
-            except Exception as exc:
-                logger.debug("_patch_font_cmaps: cannot read CMap xref=%d: %s", tou_xref, exc)
-                continue
 
-            cmap_gid_to_unicode = _parse_tounicode_cmap(cmap_text)
+def _install_local_font_tables(force_reload: bool = False) -> None:
+    """
+    Load every CSV in ``local_font_tables/`` and merge its rows into
+    pytiblegenc's ``get_utfc_base()`` dict.
 
-            # Build corrections
-            corrections = _build_cmap_corrections(font_bytes, basefont, cmap_gid_to_unicode)
+    Parameters
+    ----------
+    force_reload
+        If True, ignore the idempotency flag and re-read every CSV.  Useful
+        for development/REPL workflows where you edit a CSV and want the
+        change picked up without restarting the process.
 
-            if corrections:
-                patched_text = _patch_cmap_stream(cmap_text, corrections)
-                try:
-                    doc.update_stream(tou_xref, patched_text.encode("latin-1"))
-                    logger.info(
-                        "_patch_font_cmaps: patched %d GIDs in CMap xref=%d (%s)",
-                        len(corrections), tou_xref, basefont,
-                    )
-                except Exception as exc:
+    File layout
+    -----------
+    ``local_font_tables/``
+        ``<anything>.csv``       — glyph table (rows: font_name, cp, tibetan)
+        ``_aliases.csv``         — alias map  (rows: pdf_name, table_name)
+
+    The directory may not exist; that's fine, the function is a no-op then.
+
+    Behaviour on conflicts
+    ----------------------
+    *Per-glyph merge*: existing entries in pytiblegenc's table always win
+    (we use ``setdefault``).  Upstream pytiblegenc takes precedence so
+    upgrades don't silently change behaviour.
+
+    *Across CSVs*: if two local CSVs declare the same ``(font_name, cp)``,
+    whichever is read first wins (Python's directory iteration order is
+    insertion order on modern filesystems, but don't rely on it — keep one
+    font per CSV).
+    """
+    global _LOCAL_TABLES_INSTALLED
+    if _LOCAL_TABLES_INSTALLED and not force_reload:
+        return
+    if not PYTIBLEGENC_AVAILABLE:
+        _LOCAL_TABLES_INSTALLED = True
+        return
+
+    try:
+        if not _LOCAL_TABLES_DIR.is_dir():
+            logger.debug(
+                "No local font-tables directory at %s — skipping local "
+                "font table installation.",
+                _LOCAL_TABLES_DIR,
+            )
+            _LOCAL_TABLES_INSTALLED = True
+            return
+
+        utfc_base = _tibl_get_utfc_base()
+
+        # --- 1. Load glyph CSVs (anything not starting with "_") -----------
+        registered: set[str] = set()
+        csv_count = 0
+        row_count = 0
+
+        for csv_path in sorted(_LOCAL_TABLES_DIR.glob("*.csv")):
+            if csv_path.name.startswith("_"):
+                continue  # reserved for control files (e.g. _aliases.csv)
+            csv_count += 1
+            per_font, rows = _read_glyph_csv(csv_path)
+            row_count += rows
+            for font_name, table in per_font.items():
+                _merge_into_pytiblegenc_table(utfc_base, font_name, table)
+                registered.add(font_name)
+                # Register stripped form for normalize_font_name compatibility
+                if font_name.endswith("Normal"):
+                    stripped = font_name[: -len("Normal")].strip()
+                    if stripped and stripped != font_name:
+                        _merge_into_pytiblegenc_table(utfc_base, stripped, table)
+                        registered.add(stripped)
+
+        # --- 2. Load _aliases.csv (font_name → existing_table_name) --------
+        alias_count = 0
+        alias_path = _LOCAL_TABLES_DIR / _ALIASES_FILENAME
+        if alias_path.is_file():
+            for pdf_name, target_name in _read_alias_csv(alias_path):
+                if target_name not in utfc_base:
                     logger.warning(
-                        "_patch_font_cmaps: failed to update CMap xref=%d: %s",
-                        tou_xref, exc,
+                        "Alias %r → %r skipped: target table not in "
+                        "pytiblegenc (typo? upstream rename?).",
+                        pdf_name, target_name,
                     )
+                    continue
+                target_table = utfc_base[target_name]
+                # Register under both raw alias and stripped form.
+                _merge_into_pytiblegenc_table(utfc_base, pdf_name, target_table)
+                registered.add(pdf_name)
+                if pdf_name.endswith("Normal"):
+                    stripped = pdf_name[: -len("Normal")].strip()
+                    if stripped and stripped != pdf_name:
+                        _merge_into_pytiblegenc_table(utfc_base, stripped, target_table)
+                        registered.add(stripped)
+                alias_count += 1
 
-            patched_tou_xrefs.add(tou_xref)
+        # --- 3. Report ----------------------------------------------------
+        if csv_count or alias_count:
+            logger.info(
+                "Local font tables installed: %d glyph CSVs (%d rows), "
+                "%d aliases. Fonts registered: %s",
+                csv_count, row_count, alias_count,
+                ", ".join(sorted(registered)) if registered else "(none)",
+            )
+
+        _LOCAL_TABLES_INSTALLED = True
+
+    except Exception as exc:
+        logger.warning("Could not install local font tables: %s", exc)
+        # Don't set the flag so a later call has a chance to retry
+        # (e.g. if the directory appears mid-run).
 
 
-# ---------------------------------------------------------------------------
-# Infrastructure
-# ---------------------------------------------------------------------------
+def _read_glyph_csv(path: Path) -> tuple[dict[str, dict[str, str]], int]:
+    """Parse one glyph CSV; return ({font_name: {char: tibetan}}, row_count)."""
+    import csv as _csv
+    per_font: dict[str, dict[str, str]] = {}
+    rows = 0
+    with path.open(encoding="utf-8", newline="") as f:
+        for row in _csv.reader(f):
+            if not row or len(row) < 2:
+                continue
+            font_name = row[0].strip()
+            if not font_name or font_name.startswith("#"):
+                continue
+            try:
+                cp = int(row[1])
+            except ValueError:
+                continue
+            tib = row[2] if len(row) > 2 else ""
+            per_font.setdefault(font_name, {})[chr(cp)] = tib
+            rows += 1
+    return per_font, rows
+
+
+def _read_alias_csv(path: Path) -> list[tuple[str, str]]:
+    """Parse the alias CSV; return [(pdf_font_name, pytiblegenc_table_name)]."""
+    import csv as _csv
+    aliases: list[tuple[str, str]] = []
+    with path.open(encoding="utf-8", newline="") as f:
+        for row in _csv.reader(f):
+            if not row or len(row) < 2:
+                continue
+            pdf_name = row[0].strip()
+            target = row[1].strip()
+            if not pdf_name or pdf_name.startswith("#"):
+                continue
+            if not target:
+                continue
+            aliases.append((pdf_name, target))
+    return aliases
+
+
+def _merge_into_pytiblegenc_table(
+    utfc_base: dict, font_name: str, additions: dict[str, str]
+) -> None:
+    """Insert *additions* into ``utfc_base[font_name]`` without overwriting
+    pre-existing entries (so upstream pytiblegenc always wins if it has its
+    own mapping for the same key)."""
+    existing = utfc_base.get(font_name)
+    if existing is None:
+        utfc_base[font_name] = dict(additions)
+        return
+    for k, v in additions.items():
+        existing.setdefault(k, v)
+
+
+# Back-compat shim: keep the old install function name so any external code
+# that calls ``_install_tb_youtso_tables`` still works.
+def _install_tb_youtso_tables() -> None:
+    """Deprecated alias kept for back-compat.  Forwards to the general loader."""
+    _install_local_font_tables()
+
+
+def _get_font_name_aliases() -> dict[str, str]:
+    """
+    Return {pdf_embedded_name: pytiblegenc_table_name} for all font names
+    whose table key contains spaces (built from pytiblegenc's live tables).
+
+    Result is cached in _FONT_NAME_ALIASES after the first call.
+    """
+    global _FONT_NAME_ALIASES
+    if _FONT_NAME_ALIASES is not None:
+        return _FONT_NAME_ALIASES
+    if not PYTIBLEGENC_AVAILABLE:
+        _FONT_NAME_ALIASES = {}
+        return _FONT_NAME_ALIASES
+    try:
+        all_known: set[str] = set(_tibl_get_base().keys()) | set(_tibl_get_utfc_base().keys())
+        _FONT_NAME_ALIASES = {
+            name.replace(" ", ""): name
+            for name in all_known
+            if " " in name
+        }
+        logger.debug("Built font name alias map (%d entries): %s", len(_FONT_NAME_ALIASES), _FONT_NAME_ALIASES)
+    except Exception as exc:
+        logger.warning("Could not build font name alias map: %s", exc)
+        _FONT_NAME_ALIASES = {}
+    return _FONT_NAME_ALIASES
+
 
 def create_cropped_pdf(
-    pdf_path: Path, top_frac: float, bottom_frac: float
+    pdf_path: Path,
+    top_frac: float,
+    bottom_frac: float,
+    preserve_box: Optional[list] = None,
 ) -> Optional[Path]:
     """
-    Temp PDF with header/footer bands physically redacted (text removed, white fill).
-    Uses ``add_redact_annot`` + ``apply_redactions`` on ``page.rect`` fractions.
+    Temp PDF with margins physically redacted (text removed, white fill).
+
+    Two mutually exclusive modes:
+
+    **preserve_box mode** (preferred, takes priority when provided):
+        ``preserve_box`` is a list of 4 normalised coordinate fractions
+        ``[x0_frac, y0_frac, x1_frac, y1_frac]`` that describe the rectangle
+        the user wants to *keep*.  Everything outside that rectangle is
+        redacted.  The four exterior bands are:
+
+        * top    – above y0_frac
+        * bottom – below y1_frac
+        * left   – left of x0_frac  (only between y0 and y1)
+        * right  – right of x1_frac (only between y0 and y1)
+
+        Example: ``preserve_box=[0.11, 0.09, 0.89, 0.82]``
+
+    **Percentage-based fallback** (legacy):
+        When ``preserve_box`` is ``None``, ``top_frac`` and ``bottom_frac``
+        are used as before — they strip the top N% and bottom N% of each page.
+
+    Uses ``add_redact_annot`` + ``apply_redactions`` on absolute ``fitz.Rect``
+    coordinates derived from ``page.rect``.
     """
-    if top_frac == 0.0 and bottom_frac == 0.0:
+    # Nothing to do
+    if preserve_box is None and top_frac == 0.0 and bottom_frac == 0.0:
         return None
 
     if not PYMUPDF_AVAILABLE:
@@ -478,17 +610,62 @@ def create_cropped_pdf(
         )
         return None
 
+    # Validate preserve_box early so we can give a clear error message.
+    if preserve_box is not None:
+        if len(preserve_box) != 4:
+            raise ValueError(
+                f"preserve_box must have exactly 4 elements [x0,y0,x1,y1], "
+                f"got {len(preserve_box)}: {preserve_box}"
+            )
+        px0f, py0f, px1f, py1f = preserve_box
+        if not (0.0 <= px0f < px1f <= 1.0 and 0.0 <= py0f < py1f <= 1.0):
+            raise ValueError(
+                f"preserve_box fractions must satisfy "
+                f"0 ≤ x0 < x1 ≤ 1 and 0 ≤ y0 < y1 ≤ 1, got {preserve_box}"
+            )
+
     try:
         doc = fitz.open(str(pdf_path))
+
         for page in doc:
             r = page.rect
-            h = r.height
-            if top_frac > 0.0:
-                page.add_redact_annot(fitz.Rect(r.x0, r.y0, r.x1, r.y0 + h * top_frac))
-            if bottom_frac > 0.0:
-                page.add_redact_annot(
-                    fitz.Rect(r.x0, r.y0 + h * (1.0 - bottom_frac), r.x1, r.y1)
-                )
+            w, h = r.width, r.height
+
+            if preserve_box is not None:
+                # ── Coordinate-based mode ─────────────────────────────────
+                # Convert normalised fractions → absolute points.
+                abs_x0 = r.x0 + px0f * w
+                abs_y0 = r.y0 + py0f * h
+                abs_x1 = r.x0 + px1f * w
+                abs_y1 = r.y0 + py1f * h
+
+                # Top band  : full width, above the preserved box
+                if abs_y0 > r.y0:
+                    page.add_redact_annot(fitz.Rect(r.x0, r.y0, r.x1, abs_y0))
+
+                # Bottom band : full width, below the preserved box
+                if abs_y1 < r.y1:
+                    page.add_redact_annot(fitz.Rect(r.x0, abs_y1, r.x1, r.y1))
+
+                # Left band : only between y0 and y1 (top/bottom already covered)
+                if abs_x0 > r.x0:
+                    page.add_redact_annot(fitz.Rect(r.x0, abs_y0, abs_x0, abs_y1))
+
+                # Right band : only between y0 and y1
+                if abs_x1 < r.x1:
+                    page.add_redact_annot(fitz.Rect(abs_x1, abs_y0, r.x1, abs_y1))
+
+            else:
+                # ── Percentage-based fallback (legacy) ────────────────────
+                if top_frac > 0.0:
+                    page.add_redact_annot(
+                        fitz.Rect(r.x0, r.y0, r.x1, r.y0 + h * top_frac)
+                    )
+                if bottom_frac > 0.0:
+                    page.add_redact_annot(
+                        fitz.Rect(r.x0, r.y0 + h * (1.0 - bottom_frac), r.x1, r.y1)
+                    )
+
             page.apply_redactions(
                 images=fitz.PDF_REDACT_IMAGE_NONE,
                 graphics=0,
@@ -500,18 +677,25 @@ def create_cropped_pdf(
         )
         tmp_path = Path(tmp.name)
         tmp.close()
+
         doc.save(str(tmp_path), garbage=4, deflate=True)
         doc.close()
 
-        logger.info(
-            f"    Redacted temp PDF: {tmp_path.name} "
-            f"(top={top_frac*100:.1f}%, bottom={bottom_frac*100:.1f}%)"
-        )
+        if preserve_box is not None:
+            logger.info(
+                f"    Redacted temp PDF: {tmp_path.name} "
+                f"(preserve_box={preserve_box})"
+            )
+        else:
+            logger.info(
+                f"    Redacted temp PDF: {tmp_path.name} "
+                f"(top={top_frac*100:.1f}%, bottom={bottom_frac*100:.1f}%)"
+            )
         return tmp_path
 
     except Exception as e:
         logger.warning(
-            f"    Failed to redact header/footer on {pdf_path.name}: {e} — using original PDF."
+            f"    Failed to redact margins on {pdf_path.name}: {e} — using original PDF."
         )
         return None
 
@@ -524,52 +708,22 @@ def _is_wingdings_font(font_name: str) -> bool:
     return "wingdings" in compact
 
 
-def extract_pdf_pytiblegenc(
-    pdf_path: Path,
-    *,
-    crop_top: float = 0.0,
-    crop_bottom: float = 0.0,
-) -> str:
-    """
-    Extract via ``pytiblegenc.pdf_to_txt`` (same options as IE3KG664 / Desktop SRC_CODE).
-    """
-    logger.info(f"    Extracting (pytiblegenc pdf_to_txt): {pdf_path.name}")
-
-    if not PYTIBLEGENC_AVAILABLE:
-        logger.error(
-            "pytiblegenc is required for --extractor pytiblegenc. "
-            "pip install git+https://github.com/buda-base/py-tiblegenc.git"
-        )
-        return ""
-
-    tmp_pdf: Optional[Path] = None
-    try:
-        if crop_top > 0.0 or crop_bottom > 0.0:
-            tmp_pdf = create_cropped_pdf(pdf_path, crop_top, crop_bottom)
-        target_pdf = tmp_pdf if tmp_pdf else pdf_path
-        text = pdf_to_txt(
-            str(target_pdf),
-            page_break_str=f"\n{PAGE_BREAK_STR}\n",
-            track_font_size=True,
-            font_size_format=_FONT_SIZE_FORMAT,
-            normalize=False,
-            simplify_font_sizes_option=False,
-        )
-        return text
-    except Exception as e:
-        logger.error(f"    ERROR extracting {pdf_path.name}: {e}")
-        traceback.print_exc()
-        return ""
-    finally:
-        if tmp_pdf is not None and tmp_pdf.exists():
-            try:
-                os.unlink(tmp_pdf)
-            except OSError:
-                pass
-
 
 # ---------------------------------------------------------------------------
-# Fix 1, 3, 4 — Phantom space detection
+# Fix 1 & 4 — Phantom space detection
+#
+# Legacy Monlam/Dedris fonts encode combining marks (vowels, subscripts) as
+# separate glyphs whose x-origin is shifted LEFT of the base character's
+# advance position.  PyMuPDF materialises the resulting gap as a U+0020 space.
+# Two sub-cases:
+#
+#   a) Negative advance   (subscripts): space_x < prev_x
+#   b) Near-zero advance  (WinAnsi vowel spans corrected by Fix 2): the
+#      corrected vowel and the space that follows share virtually the same
+#      x (~0.2–0.3 pt difference — sub-pixel noise).
+#
+# Both are caught by: space_x < prev_x + THRESHOLD
+# Real inter-word spaces always advance ≥ 4–5 pt, so they are never affected.
 # ---------------------------------------------------------------------------
 _PHANTOM_SPACE_ADVANCE_THRESHOLD = 1.5  # points
 
@@ -580,6 +734,7 @@ def _is_phantom_space(char_obj: dict, prev_char_obj: dict | None) -> bool:
 
     A space is phantom iff it does not advance rightward by at least
     ``_PHANTOM_SPACE_ADVANCE_THRESHOLD`` points from the preceding glyph.
+    See module-level comment above for the full rationale.
     """
     if char_obj.get("c") != " ":
         return False
@@ -590,101 +745,606 @@ def _is_phantom_space(char_obj: dict, prev_char_obj: dict | None) -> bool:
     return space_x < prev_x + _PHANTOM_SPACE_ADVANCE_THRESHOLD
 
 
-def _extract_line_text(line: dict) -> list[str]:
+# ---------------------------------------------------------------------------
+# Fix 2 — WinAnsi vowel glyph mis-mappings
+#
+# The WinAnsi-encoded instance of MonlamUniOuChan2 ships a broken ToUnicode
+# table that maps Tibetan vowel glyph slots to Latin Extended codepoints.
+# Verified by rasterising affected pages and comparing against extracted chars.
+#
+#   U+0140  ŀ  (l with middle dot)  →  U+0F7C  ོ  (Tibetan vowel sign O)
+#   U+0132  Ĳ  (IJ digraph)         →  U+0F7A  ེ  (Tibetan vowel sign E)
+#   U+0128  Ĩ  (I with tilde)       →  U+0F72  ི  (Tibetan vowel sign I)
+# ---------------------------------------------------------------------------
+_MONLAM_GLYPH_CORRECTIONS: dict[str, str] = {
+    "\u0140": "\u0F7C",  # ŀ → ོ
+    "\u0132": "\u0F7A",  # Ĳ → ེ
+    "\u0128": "\u0F72",  # Ĩ → ི
+}
+
+
+def _correct_monlam_glyph(c: str) -> str:
+    """Return the correct Tibetan character for a known Monlam WinAnsi mis-mapping."""
+    return _MONLAM_GLYPH_CORRECTIONS.get(c, c)
+
+
+# Leading marks that belong on the previous syllable when PDF layout splits a line.
+_RE_TIBETAN_ORPHAN_LEADING = re.compile(
+    r"^[\u0F71\u0F72\u0F73\u0F74\u0F75\u0F76\u0F77\u0F78\u0F79"
+    r"\u0F7A\u0F7B\u0F7C\u0F7D\u0F7E\u0F7F\u0F80\u0F81\u0F82\u0F83"
+    r"\u0F93-\u0FBC]+"
+)
+
+
+def _plain_without_fs(s: str) -> str:
+    return _FS_TAG_RE.sub("", s) if s else ""
+
+
+def _prev_line_allows_tibetan_orphan_merge(prev_line: str) -> bool:
+    """True when the previous layout line ends in Tibetan and should absorb leading marks."""
+    plain = _plain_without_fs(prev_line).rstrip()
+    if not plain:
+        return False
+    # Do not glue into Latin-only lines (e.g. English copyright block).
+    return bool(re.search(r"[\u0F00-\u0FFF]$", plain))
+
+
+def _split_leading_tibetan_orphan_fs_aware(line: str) -> tuple[str, str]:
     """
-    Extract text fragments from a single MuPDF ``line`` dict.
-
-    Returns a list of strings (font-size tags interleaved with text characters).
-    Wingdings fonts are skipped entirely.
-
-    Fixes applied
-    -------------
-    Fix 1+3+4 — Phantom spaces: dropped when space_x < prev_x + threshold.
-    ``span_prev_char_obj`` is threaded across span boundaries (Fix 3) so
-    cross-span phantoms are also caught.
-
-    Fix 2 is handled upstream by ``_patch_font_cmaps()``, which rewrites the
-    document's ToUnicode CMap streams before extraction, so PyMuPDF already
-    returns the correct Tibetan codepoints here.
+    If *line* begins with Tibetan combining/subjoined marks (optionally after
+    leading ``<fs:N>`` tags), return (prefix_to_append_to_previous_line, remainder).
+    Otherwise ("", line).
     """
-    fragments: list[str] = []
-    span_prev_char_obj: dict | None = None
-
-    for span in line.get("spans", []):
-        if _is_wingdings_font(span.get("font") or ""):
+    if not line:
+        return "", line
+    plain = _plain_without_fs(line)
+    m = _RE_TIBETAN_ORPHAN_LEADING.match(plain)
+    if not m:
+        return "", line
+    expected = m.group(0)
+    taken: list[str] = []
+    i = 0
+    pos = 0  # index into expected
+    while i < len(line) and pos < len(expected):
+        mt = re.match(r"<fs:\d+>", line[i:])
+        if mt:
+            if pos == 0:
+                taken.append(mt.group(0))
+            i += len(mt.group(0))
             continue
-
-        fs = round(span.get("size", 12))
-        fragments.append(_FONT_SIZE_FORMAT.format(fs))
-
-        char_objs = span.get("chars") or []
-        if char_objs:
-            for char_obj in char_objs:
-                # Fix 1+3+4: drop phantom glyph-advance spaces
-                if _is_phantom_space(char_obj, span_prev_char_obj):
-                    continue
-                fragments.append(char_obj.get("c", ""))
-                span_prev_char_obj = char_obj
+        ch = line[i]
+        if ch == expected[pos]:
+            taken.append(ch)
+            pos += 1
+            i += 1
         else:
-            fragments.append(span.get("text") or "")
-            span_prev_char_obj = None
+            return "", line
+    if pos != len(expected):
+        return "", line
+    return "".join(taken), line[i:]
 
-    return fragments
+
+def _merge_orphan_tibetan_line_breaks(text: str) -> str:
+    """
+    Join lines where the PDF split a Tibetan stack across two MuPDF newlines.
+
+    Operates on the raw extractor stream (``<fs:N>`` tags and ``\\n`` only;
+    page breaks use ``PAGE_BREAK_STR``).
+    """
+    if not text or not text.strip():
+        return text
+    sep = f"\n{PAGE_BREAK_STR}\n"
+    pages = text.split(sep)
+    out_pages: list[str] = []
+
+    for page in pages:
+        lines = page.split("\n")
+        if not lines:
+            out_pages.append(page)
+            continue
+        merged: list[str] = [lines[0]]
+        for j in range(1, len(lines)):
+            curr = lines[j]
+            prev = merged[-1]
+            if not _prev_line_allows_tibetan_orphan_merge(prev):
+                merged.append(curr)
+                continue
+            prefix, rest = _split_leading_tibetan_orphan_fs_aware(curr)
+            if not prefix:
+                merged.append(curr)
+                continue
+            # Join the rest of this layout line onto the same row (PDF split before the vowel).
+            merged[-1] = prev + prefix + rest
+        out_pages.append("\n".join(merged))
+
+    return sep.join(out_pages)
 
 
 # ---------------------------------------------------------------------------
 # Fix 5 — Duplicate text-layer deduplication
+#
+# Some InDesign / Acrobat-generated PDFs place every visual line twice in the
+# content stream at identical coordinates (same y_mid, same x0, same text).
+# Without deduplication both copies land in the same merged visual row and
+# their fragments are emitted twice, producing verbatim repeated text.
+#
+# Strategy: after collecting raw_lines, remove any entry whose (y_bucket, x0,
+# text) key has already been seen.  y_bucket is y_mid rounded to the nearest
+# _Y_MERGE_TOLERANCE step so sub-pixel y differences between copies don't
+# defeat the check.  text_key strips font-size tags before comparison.
 # ---------------------------------------------------------------------------
-_FS_TAG_RE = re.compile(r"<fs:\d+>")
-_DEDUP_X_BUCKET_PT = 3.0
-_ZW_STRIP_FOR_DEDUP_KEY = dict.fromkeys(
-    map(ord, "\u200B\u200C\u200D\u2060\uFEFF\u034F\u180E")
-)
-
-
-def _text_key_for_dedup(frags: list[str]) -> str:
-    """
-    Build a comparison string so two overlapping PDF text layers dedupe together.
-
-    Duplicate CJK/Latin colophon lines often differ across layers in: NFC vs NFD,
-    U+3000 ideographic space vs ASCII space, or zero-width characters from HTML
-    paste.  Tibetan-only lines behave as before when the grapheme string matches.
-    """
-    raw = _FS_TAG_RE.sub("", "".join(frags))
-    raw = raw.translate(_ZW_STRIP_FOR_DEDUP_KEY)
-    raw = unicodedata.normalize("NFC", raw)
-    raw = raw.replace("\u3000", " ")
-    raw = re.sub(r"\s+", " ", raw).strip()
-    return raw
 
 
 def _deduplicate_raw_lines(
     raw_lines: list[tuple[float, float, list[str]]],
     y_tolerance: float,
-) -> list[tuple[float, float, list[str]]]:
-    """Remove duplicate raw lines from InDesign overlapping text layers."""
+    line_spans: Optional[list[tuple[float, float]]] = None,
+):
+    """
+    Remove duplicate raw lines produced by PDFs with overlapping text layers.
+
+    Keeps the first occurrence of each (y_bucket, x0_rounded, text_key) triple.
+    See module-level Fix 5 comment for full rationale.
+
+    If *line_spans* (a parallel list of (x0, x1) extents, same length and order
+    as *raw_lines*) is supplied, the matching spans are filtered in lockstep and
+    the function returns ``(deduped_lines, deduped_spans)`` so column detection
+    keeps a correctly aligned span for every surviving line.  When *line_spans*
+    is ``None`` the function returns just the deduplicated list (legacy behaviour).
+    """
     seen: set[tuple[float, float, str]] = set()
     deduped: list[tuple[float, float, list[str]]] = []
-    xb = _DEDUP_X_BUCKET_PT
-    for y_mid, x0, frags in raw_lines:
+    deduped_spans: list[tuple[float, float]] = []
+
+    for idx, (y_mid, x0, frags) in enumerate(raw_lines):
         y_bucket = round(y_mid / y_tolerance) * y_tolerance
-        x_bucket = round(x0 / xb) * xb
-        text_key = _text_key_for_dedup(frags)
+        x_bucket = round(x0, 1)
+        text_key = _FS_TAG_RE.sub("", "".join(frags))
+
         key = (y_bucket, x_bucket, text_key)
         if key in seen:
             continue
         seen.add(key)
         deduped.append((y_mid, x0, frags))
+        if line_spans is not None and idx < len(line_spans):
+            deduped_spans.append(line_spans[idx])
+
+    if line_spans is not None:
+        return deduped, deduped_spans
     return deduped
 
 
-_Y_MERGE_TOLERANCE = 3.0
+# ---------------------------------------------------------------------------
+# Footnote detection
+#
+# A footnote in these Tibetan prints is laid out as a short horizontal rule on
+# the LEFT margin, low on the page, with smaller-than-body text beneath it.
+# The body carries an inline reference marker like "[1]".  We detect the rule,
+# treat everything at/below it as note content, pull it out of the normal body
+# flow, and re-attach it inline right after its matching marker as a TEI <note>.
+#
+# Care is taken to avoid false positives — a table of contents has decorative
+# rules before section titles, but those are centred/indented and sit high on
+# the page, so the left-margin + bottom-region requirement rejects them.
+# ---------------------------------------------------------------------------
+
+def _footnote_settings() -> dict:
+    """
+    Read footnote thresholds from config when available, else use module
+    defaults.  Returns a dict the detector consumes.  config is optional so
+    pdf_extract stays importable standalone (e.g. in tests).
+    """
+    s = {
+        "enabled": True,
+        "sep_min_w": _FN_SEP_MIN_WIDTH_PT,
+        "sep_max_w": _FN_SEP_MAX_WIDTH_PT,
+        "min_y_frac": _FN_SEP_MIN_Y_FRACTION,
+        "left_tol": _FN_SEP_LEFT_MARGIN_TOL,
+        "body_ratio": _FN_BODY_SIZE_RATIO,
+    }
+    try:
+        import config  # type: ignore
+        s["enabled"] = bool(getattr(config, "FOOTNOTE_DETECTION", True))
+        if hasattr(config, "FOOTNOTE_SEPARATOR_MIN_WIDTH_PT"):
+            s["sep_min_w"] = float(config.FOOTNOTE_SEPARATOR_MIN_WIDTH_PT)
+        if hasattr(config, "FOOTNOTE_SEPARATOR_MAX_WIDTH_PT"):
+            s["sep_max_w"] = float(config.FOOTNOTE_SEPARATOR_MAX_WIDTH_PT)
+    except Exception:
+        pass
+    return s
+
+
+def _find_footnote_separator_y(page, body_left_x: float, settings: dict) -> Optional[float]:
+    """
+    Return the y-coordinate of a footnote separator rule on *page*, or None.
+
+    A qualifying separator is a (near-)horizontal line/rectangle that:
+      * is between sep_min_w and sep_max_w wide,
+      * starts within left_tol of the body's left margin, and
+      * sits below min_y_frac of the page height.
+
+    When several qualify (rare), the highest one is returned so all note lines
+    below it are captured.
+    """
+    h = page.rect.height
+    min_y = page.rect.y0 + h * settings["min_y_frac"]
+    candidates: list[float] = []
+
+    try:
+        drawings = page.get_drawings()
+    except Exception:
+        return None
+
+    for dr in drawings:
+        for item in dr.get("items", []):
+            x0 = x1 = y = None
+            if item[0] == "l":  # line: (op, p1, p2)
+                p1, p2 = item[1], item[2]
+                if abs(p1.y - p2.y) < 1.5:  # horizontal
+                    x0, x1, y = min(p1.x, p2.x), max(p1.x, p2.x), (p1.y + p2.y) / 2.0
+            elif item[0] == "re":  # rectangle: (op, rect)
+                r = item[1]
+                if r.height < 2.5:  # a thin filled rect == a rule
+                    x0, x1, y = r.x0, r.x1, (r.y0 + r.y1) / 2.0
+            if y is None:
+                continue
+            width = x1 - x0
+            if not (settings["sep_min_w"] <= width <= settings["sep_max_w"]):
+                continue
+            if abs(x0 - body_left_x) > settings["left_tol"]:
+                continue  # not on the left margin → decorative / TOC rule
+            if y < min_y:
+                continue  # too high → not a footnote separator
+            candidates.append(y)
+
+    if not candidates:
+        return None
+    return min(candidates)  # highest separator → capture everything beneath
+
+
+# Inline footnote marker as it survives decoding, e.g. "[1]", "[12]".
+_FN_MARKER_RE = re.compile(r"\[(\d+)\]")
+
+# Tibetan digits U+0F20–U+0F29.
+_TIB_DIGIT_RE = re.compile(r"[\u0f20-\u0f29]+")
+_TIB_TO_ARABIC = {chr(0x0f20 + i): str(i) for i in range(10)}
+
+
+def _tib_to_arabic(s: str) -> str:
+    """Convert a run of Tibetan digits to an ASCII number string."""
+    return "".join(_TIB_TO_ARABIC.get(c, c) for c in s)
+
+
+def _split_footnotes_by_tibetan_numerals(block: str) -> list[tuple[str, str]]:
+    """
+    Split a footnote block whose individual notes are introduced by a leading
+    Tibetan-digit number (e.g. ``༡ … ༢ … ༣ …``) into ``(num, text)`` pairs.
+
+    Many Tibetan prints number footnotes with Tibetan numerals at the start of
+    each note rather than with bracketed ASCII markers.  We find candidate
+    numeral runs and keep only the chain that counts up 1, 2, 3, … so stray
+    Tibetan digits inside note text (page refs, dates) don't cause false splits.
+    Returns [] when no plausible 1-based chain is found.
+    """
+    candidates = list(_TIB_DIGIT_RE.finditer(block))
+    if not candidates:
+        return []
+
+    # Greedily build the longest run that starts at 1 and increments by 1.
+    starts: list[tuple[int, int, int]] = []  # (expected_value, start_idx, end_idx)
+    expected = 1
+    for m in candidates:
+        val_str = _tib_to_arabic(m.group(0))
+        if not val_str.isdigit():
+            continue
+        val = int(val_str)
+        if val == expected:
+            starts.append((val, m.start(), m.end()))
+            expected += 1
+
+    # Need at least the first note (#1) to anchor; a lone #1 is still valid.
+    if not starts:
+        return []
+
+    notes: list[tuple[str, str]] = []
+    for i, (val, s, e) in enumerate(starts):
+        text_end = starts[i + 1][1] if i + 1 < len(starts) else len(block)
+        text = block[e:text_end].strip(" ་\u0f0b")  # trim spaces / leading tsheg
+        text = text.strip()
+        if text:
+            notes.append((str(val), text))
+    return notes
+
+
+def _build_footnote_tokens(
+    footnote_lines: list[tuple[float, float, list[str]]],
+    extraction_dedup: bool,
+) -> list[str]:
+    """
+    Turn the collected below-separator lines into one note token per footnote.
+
+    The lines are sorted top→bottom (merging same-row fragments left→right),
+    joined into one text block, then split into individual footnotes.  Two
+    numbering conventions are recognised, in order:
+
+      1. Bracketed ASCII markers ``[N]`` introducing each note.
+      2. Leading Tibetan-digit numbers ``༡ ༢ ༣ …`` (common in Tibetan prints).
+
+    Each token is
+
+        _NOTE_OPEN + "<N>|<decoded text>" + _NOTE_CLOSE
+
+    with ``<N>`` an ASCII number so it aligns with the Arabic reference markers
+    the body carries (the converter matches them positionally per page).  If no
+    numbering is found the whole block becomes one unnumbered note so content is
+    never dropped.  convert_markup_to_tei consumes these and emits TEI <note>.
+    """
+    # Sort + merge rows the same way the body flow does.
+    footnote_lines.sort(key=lambda t: (t[0], t[1]))
+    merged: list[list[tuple[float, float, list[str]]]] = []
+    for y_mid, x0, frags in footnote_lines:
+        if merged:
+            avg_y = sum(e[0] for e in merged[-1]) / len(merged[-1])
+            if abs(y_mid - avg_y) <= _Y_MERGE_TOLERANCE:
+                merged[-1].append((y_mid, x0, frags))
+                continue
+        merged.append([(y_mid, x0, frags)])
+
+    row_texts: list[str] = []
+    for row in merged:
+        row.sort(key=lambda t: t[1])
+        if extraction_dedup:
+            row = _dedup_within_row(row)
+        row_texts.append("".join("".join(fr) for _y, _x, fr in row))
+
+    block = " ".join(t for t in row_texts if t.strip())
+    # Drop font-size tags inside footnotes — note text is uniformly small.
+    block = _FS_TAG_RE.sub("", block).strip()
+    if not block:
+        return []
+
+    # Convention 1 — bracketed ASCII markers "[N]".
+    matches = list(_FN_MARKER_RE.finditer(block))
+    if matches:
+        tokens: list[str] = []
+        for i, m in enumerate(matches):
+            num = m.group(1)
+            start = m.end()
+            end = matches[i + 1].start() if i + 1 < len(matches) else len(block)
+            text = block[start:end].strip()
+            if text:
+                tokens.append(_NOTE_OPEN + f"{num}|" + text + _NOTE_CLOSE)
+        return tokens
+
+    # Convention 2 — leading Tibetan-digit numbering "༡ ༢ ༣ …".
+    tib_notes = _split_footnotes_by_tibetan_numerals(block)
+    if tib_notes:
+        return [
+            _NOTE_OPEN + f"{num}|" + text + _NOTE_CLOSE
+            for num, text in tib_notes
+        ]
+
+    # No recognisable numbering — emit the whole block as one unnumbered note.
+    return [_NOTE_OPEN + "|" + block + _NOTE_CLOSE]
+
+
+# Tolerance in points for treating two MuPDF lines as the same visual row.
+# Tibetan glyphs with vowel marks can cause small Y shifts across spans.
+_Y_MERGE_TOLERANCE = 4.0
 
 # Maximum x-offset between two same-text entries in a merged row that are still
 # considered InDesign shadow copies rather than genuine repeated words.
 # InDesign drop-shadow offsets are typically 1–3 pt; genuine word repetitions
 # in the same line are separated by at least one character-advance (≥ 8 pt).
 _SHADOW_X_THRESHOLD = 5.0
+
+# ---------------------------------------------------------------------------
+# Multi-column layout detection and sorting
+#
+# Some Tibetan documents (e.g. tables of contents, commentary pages) use a
+# two-column layout.  PyMuPDF's default coordinate sort (y ascending, then x)
+# reads across both columns row-by-row, jumbling the two streams.
+#
+# Strategy:
+#   1. Collect the x0 of every text block on the page.
+#   2. Look for a clear horizontal gap in the x0 distribution that splits
+#      blocks into two (or more) non-overlapping clusters.  The gap must be
+#      wider than _COLUMN_GAP_MIN_PT and the page must have at least
+#      _COLUMN_MIN_BLOCKS_PER_SIDE blocks on each side to count as multi-column.
+#   3. When a multi-column layout is detected, assign each raw_line to a column
+#      by its x0, sort each column top-to-bottom independently, then concatenate
+#      columns left-to-right.  Single-column pages are unaffected.
+#
+# This is intentionally conservative: a gap must be *wider than half the median
+# block width* to avoid splitting wide blocks that merely start at different x
+# positions.  False-positive column detection would corrupt single-column pages,
+# which is worse than missing a real column.
+# ---------------------------------------------------------------------------
+
+_COLUMN_GAP_MIN_PT: float = 30.0   # gap narrower than this → single column
+_COLUMN_MIN_BLOCKS_PER_SIDE: int = 2  # at least N lines on each side
+
+# A genuine column divider is crossed by almost no lines (left-column lines
+# end before it; right-column lines start after it).  If more than this
+# fraction of lines span a candidate divider, the page is single-column with
+# varied indents — not multi-column — and the divider is rejected.  Real
+# two-column scans cross at ~0 %; single-column prose crosses well above 30 %.
+_COLUMN_MAX_CROSS_FRACTION: float = 0.10
+
+
+def _detect_column_splits(
+    raw_lines: list[tuple[float, float, list]],
+    page_width: float,
+    line_spans: Optional[list[tuple[float, float]]] = None,
+) -> list[float]:
+    """
+    Return a sorted list of x-coordinates that serve as column dividers.
+
+    Each divider x means: lines with x0 < x belong to the column to the left,
+    lines with x0 >= x belong to the column to the right.
+
+    Returns an empty list when no reliable multi-column split is found
+    (i.e. treat the page as single-column).
+
+    Parameters
+    ----------
+    raw_lines : list of (y_mid, x0, fragments)
+    page_width : float  — used to compute a sensible gap threshold
+    line_spans : optional list of (x0, x1) horizontal extents, one per entry
+        in *raw_lines* and in the same order.  When supplied, a candidate
+        divider is only accepted if very few lines physically *cross* it
+        (their text spans the divider).  This is the decisive test that
+        separates a genuine two-column layout — where left-column lines end
+        before the divider and right-column lines start after it, so almost
+        nothing crosses — from a single-column page whose lines merely start
+        at different indents (paragraph indents, centred headings, right-
+        aligned colophons).  On such single-column pages the full-width body
+        lines cross any candidate divider, so the divider is rejected.
+
+    Without *line_spans* the function falls back to the older start-position
+    heuristic; callers that can supply spans always should.
+    """
+    if not raw_lines:
+        return []
+
+    x0_values = sorted(set(round(ln[1]) for ln in raw_lines))
+    if len(x0_values) < 2:
+        return []
+
+    # Find gaps between consecutive x0 values
+    gaps: list[tuple[float, float]] = []  # (gap_size, gap_start)
+    for i in range(1, len(x0_values)):
+        gap = x0_values[i] - x0_values[i - 1]
+        if gap >= _COLUMN_GAP_MIN_PT:
+            gaps.append((gap, x0_values[i - 1] + gap / 2.0))  # midpoint of gap
+
+    if not gaps:
+        return []
+
+    # Keep only gaps that are at least as wide as _COLUMN_GAP_MIN_PT AND
+    # larger than 50 % of the median x0 spread (avoids micro-splits).
+    x0_spread = x0_values[-1] - x0_values[0]
+    threshold = max(_COLUMN_GAP_MIN_PT, x0_spread * 0.15)
+    candidate_splits = sorted(
+        mid for size, mid in gaps if size >= threshold
+    )
+
+    if not candidate_splits:
+        return []
+
+    # ── Crossing validation (decisive test) ────────────────────────────────
+    # A real column divider has almost no lines spanning across it.  Reject
+    # any candidate that too many lines cross; if every candidate is rejected
+    # the page is single-column.  This must run before the count check so a
+    # page of full-width prose with varied indents is never treated as multi-
+    # column (the bug that scrambled single-column reading order).
+    if line_spans is not None:
+        total = len(line_spans)
+        kept: list[float] = []
+        for div in candidate_splits:
+            # Snap the divider into the actual whitespace gutter.  The gap was
+            # computed from line *start* positions, whose midpoint can fall
+            # inside the left column on a genuine two-column page (left lines
+            # are wider than their indent gap).  The true divider sits between
+            # the rightmost edge of the lines that start left of the candidate
+            # and the leftmost start of the lines that begin right of it.
+            left_edges = [x1 for x0, x1 in line_spans if x0 < div]
+            right_starts = [x0 for x0, _x1 in line_spans if x0 >= div]
+            if left_edges and right_starts:
+                gutter = (max(left_edges) + min(right_starts)) / 2.0
+            else:
+                gutter = div
+            crossing = sum(1 for x0, x1 in line_spans if x0 < gutter < x1)
+            if total and (crossing / total) <= _COLUMN_MAX_CROSS_FRACTION:
+                kept.append(gutter)
+        candidate_splits = sorted(kept)
+        if not candidate_splits:
+            return []
+
+    # Validate: each resulting column must have at least
+    # _COLUMN_MIN_BLOCKS_PER_SIDE lines assigned to it.
+    # Build column boundaries: (-∞, split0), (split0, split1), …, (splitN-1, +∞)
+    boundaries = (
+        [(-1e9, candidate_splits[0])]
+        + [(candidate_splits[i], candidate_splits[i + 1])
+           for i in range(len(candidate_splits) - 1)]
+        + [(candidate_splits[-1], 1e9)]
+    )
+    col_counts = [0] * len(boundaries)
+    for _y, x0, _frags in raw_lines:
+        for ci, (lo, hi) in enumerate(boundaries):
+            if lo <= x0 < hi:
+                col_counts[ci] += 1
+                break
+
+    if any(c < _COLUMN_MIN_BLOCKS_PER_SIDE for c in col_counts):
+        return []
+
+    return candidate_splits
+
+
+def _sort_lines_multicolumn(
+    raw_lines: list[tuple[float, float, list]],
+    column_splits: list[float],
+) -> list[tuple[float, float, list]]:
+    """
+    Re-order *raw_lines* so that lines are sorted column-by-column
+    (left column top→bottom, then right column top→bottom, …).
+
+    When *column_splits* is empty this is a no-op (returns the list unchanged).
+    """
+    if not column_splits:
+        return raw_lines
+
+    # Build column slot boundaries
+    splits = sorted(column_splits)
+    boundaries = (
+        [(-1e9, splits[0])]
+        + [(splits[i], splits[i + 1]) for i in range(len(splits) - 1)]
+        + [(splits[-1], 1e9)]
+    )
+
+    columns: list[list[tuple[float, float, list]]] = [[] for _ in boundaries]
+    for entry in raw_lines:
+        _y, x0, _frags = entry
+        for ci, (lo, hi) in enumerate(boundaries):
+            if lo <= x0 < hi:
+                columns[ci].append(entry)
+                break
+
+    # Sort each column top-to-bottom (ascending y_mid)
+    result: list[tuple[float, float, list]] = []
+    for col in columns:
+        col.sort(key=lambda t: t[0])
+        result.extend(col)
+
+    return result
+
+# Unicode ranges for CJK Unified Ideographs, CJK Extension A/B, and common
+# CJK symbols/punctuation.  If a row contains any of these characters the
+# drop-shadow heuristic must be disabled: CJK table layouts genuinely repeat
+# the same character in adjacent cells (e.g. 書號 … 書名) and the threshold
+# logic would incorrectly suppress those real column entries.
+_CJK_RE = re.compile(
+    r"[\u2E80-\u2EFF"   # CJK Radicals Supplement
+    r"\u2F00-\u2FDF"    # Kangxi Radicals
+    r"\u3000-\u303F"    # CJK Symbols and Punctuation
+    r"\u3040-\u30FF"    # Hiragana + Katakana
+    r"\u3400-\u4DBF"    # CJK Extension A
+    r"\u4E00-\u9FFF"    # CJK Unified Ideographs
+    r"\uF900-\uFAFF"    # CJK Compatibility Ideographs
+    r"\uFE30-\uFE4F"    # CJK Compatibility Forms
+    r"\U00020000-\U0002A6DF]"  # CJK Extension B
+)
+
+
+def _row_contains_cjk(row: list[tuple[float, float, list[str]]]) -> bool:
+    """Return True if any fragment in *row* contains a CJK character."""
+    for _y, _x, frags in row:
+        text = _FS_TAG_RE.sub("", "".join(frags))
+        if _CJK_RE.search(text):
+            return True
+    return False
 
 
 def _dedup_within_row(
@@ -704,11 +1364,20 @@ def _dedup_within_row(
       - Suppress any subsequent occurrence of the same text_key whose x0 is
         within ``_SHADOW_X_THRESHOLD`` of the first occurrence.
       - Genuine word repetitions (word-spaced ≥ 8–10 pt apart) are kept.
+
+    **CJK exception**: if the row contains any CJK character the heuristic is
+    disabled entirely and the row is returned unchanged.  CJK table layouts
+    legitimately repeat the same character in adjacent label/value cells; the
+    threshold-based suppression would incorrectly remove real content.
     """
+    # Do not apply drop-shadow dedup to rows that contain CJK characters.
+    if _row_contains_cjk(row):
+        return row
+
     first_x: dict[str, float] = {}
     result: list[tuple[float, float, list[str]]] = []
     for y, x, frags in row:
-        text_key = _text_key_for_dedup(frags)
+        text_key = _FS_TAG_RE.sub("", "".join(frags))
         if not text_key:
             result.append((y, x, frags))
             continue
@@ -721,47 +1390,290 @@ def _dedup_within_row(
     return result
 
 
-def extract_pdf_pymupdf(
+# ---------------------------------------------------------------------------
+# Fix 6 — pytiblegenc duplicate-line deduplication
+#
+# InDesign PDFs printed through PScript5.dll / Acrobat Distiller embed every
+# text line twice in the content stream at exactly the same coordinates. The
+# PyMuPDF rawdict path catches this via _deduplicate_raw_lines (Fix 5), but
+# pytiblegenc.pdf_to_txt renders both copies and emits them as consecutive
+# identical lines separated by a single newline. The page-break marker
+# (PAGE_BREAK_STR) is the only guaranteed non-text separator.
+#
+# Strategy: split the raw output into per-page chunks, then within each chunk
+# remove any line that is identical to the immediately preceding non-empty
+# line. This is conservative — it only removes a line when it is *adjacent*
+# and *identical*, so legitimately repeated lines separated by other content
+# (e.g. a refrain that genuinely appears twice in a verse) are kept.
+#
+# Font-size tags (<fs:N>) are stripped before comparison so that a line whose
+# only difference from its predecessor is a tag variant is still detected as
+# a duplicate.
+# ---------------------------------------------------------------------------
+# How many preceding lines to look back when checking for duplicates.
+# Must be large enough to span the interleaving gap in the 4× drop-shadow pattern
+# (gap between first and last copy of a line ≈ 3×(unique_lines_per_group) ≈ 3–15 lines)
+# but small enough not to suppress legitimately repeated text in verse/prose.
+# 16 covers the worst observed case (4 lines × 4 copies = 16 entries) with margin.
+_DEDUP_WINDOW_SIZE = 16
+
+
+def _deduplicate_pytiblegenc_output(text: str, page_break_str: str) -> str:
+    """
+    Remove duplicate lines from pytiblegenc ``pdf_to_txt`` output using a sliding window.
+
+    Each page is processed independently (page-break markers are never removed).
+    Within a page, a line is suppressed when its content — after stripping font-size
+    tags — is non-empty and has already appeared in the preceding
+    ``_DEDUP_WINDOW_SIZE`` non-empty lines.
+
+    This handles two distinct InDesign duplication patterns:
+
+    * **2× consecutive** (PScript5/Acrobat Distiller): pdfminer emits identical
+      pairs ``A A B B …`` — caught trivially by window ≥ 1.
+
+    * **4× interleaved** (Adobe PDF Library drop-shadow): pdfminer sorts all four
+      copies by y-coordinate, yielding ``A A A B A B B C B C C D …`` — the third
+      copy of A is separated from the first by up to ``window-1`` other lines.
+      A window of 16 safely covers all observed cases.
+
+    The window resets between pages so it never suppresses text that legitimately
+    recurs across a page boundary (running headers handled separately by
+    ``strip_page_header_artifacts``).
+    """
+    pages = text.split(f"\n{page_break_str}\n")
+    deduped_pages = []
+
+    for page_text in pages:
+        lines = page_text.split("\n")
+        result_lines: list[str] = []
+        # Sliding window: a deque of the last _DEDUP_WINDOW_SIZE non-empty keys.
+        recent: list[str] = []
+
+        for line in lines:
+            key = _FS_TAG_RE.sub("", line).strip()
+            # Never suppress lines that contain CJK characters: repeated CJK
+            # characters in adjacent table cells are genuine content, not
+            # InDesign shadow artefacts.
+            if key and key in recent and not _CJK_RE.search(key):
+                # This line appeared in the recent window — drop as duplicate.
+                continue
+            result_lines.append(line)
+            if key:
+                recent.append(key)
+                if len(recent) > _DEDUP_WINDOW_SIZE:
+                    recent.pop(0)
+
+        deduped_pages.append("\n".join(result_lines))
+
+    return f"\n{page_break_str}\n".join(deduped_pages)
+
+
+
+def extract_pdf_to_text(
     pdf_path: Path,
     *,
     crop_top: float = 0.0,
     crop_bottom: float = 0.0,
+    preserve_box: Optional[list] = None,
+    extraction_dedup: bool = True,
+    phantom_space_drop: bool = True,
+) -> str:
+    """Extract text from *pdf_path* using the hybrid PyMuPDF + pytiblegenc pipeline."""
+    text = extract_pdf_hybrid(
+        pdf_path,
+        crop_top=crop_top,
+        crop_bottom=crop_bottom,
+        preserve_box=preserve_box,
+        extraction_dedup=extraction_dedup,
+        phantom_space_drop=phantom_space_drop,
+    )
+    return _merge_orphan_tibetan_line_breaks(text or "")
+
+def _extract_line_text_hybrid(
+    line: dict,
+    font_normalization: dict,
+    glyph_lookup: dict,
+    stats: dict,
+    *,
+    drop_phantom_spaces: bool = True
+) -> list[str]:
+    """
+    Extracts text from a MuPDF line, but decodes legacy characters using pytiblegenc.
+    """
+    from pytiblegenc.char_converter import convert_string
+
+    fragments: list[str] = []
+    span_prev_char_obj: dict | None = None
+
+    for span in line.get("spans", []):
+        raw_font_name = span.get("font", "")
+        if _is_wingdings_font(raw_font_name):
+            continue
+
+        fs = round(span.get("size", 12))
+        fragments.append(_FONT_SIZE_FORMAT.format(fs))
+
+        # 1. Clean the font name (remove PDF subset prefixes like 'ABCDEF+')
+        clean_font = raw_font_name.split("+", 1)[-1] if "+" in raw_font_name else raw_font_name
+
+        # 2. Resolve to canonical pytiblegenc font name using normalization map or aliases
+        canonical_fonts = font_normalization.get(clean_font) or font_normalization.get(raw_font_name)
+        if canonical_fonts:
+            # Use the first matched canonical font from the hash DB
+            target_font = list(canonical_fonts)[0] 
+        else:
+            # Fallback to alias map
+            aliases = _get_font_name_aliases()
+            target_font = aliases.get(clean_font, clean_font)
+
+        char_objs = span.get("chars") or []
+        if char_objs:
+            for char_obj in char_objs:
+                # Fix 1+3+4: drop phantom glyph-advance spaces
+                if drop_phantom_spaces and _is_phantom_space(char_obj, span_prev_char_obj):
+                    continue
+
+                c = char_obj.get("c", "")
+                
+                # HYBRID DECODING: Pass PyMuPDF's char through pytiblegenc
+                decoded_c = convert_string(
+                    c, 
+                    target_font, 
+                    stats, 
+                    error_chr_fun=None, 
+                    glyph_lookup=glyph_lookup
+                )
+
+                # Fallback: If pytiblegenc returns None (unhandled font), use original char + Monlam fixes
+                if decoded_c is None:
+                    decoded_c = _correct_monlam_glyph(c)
+
+                fragments.append(decoded_c)
+                span_prev_char_obj = char_obj
+        else:
+            # If no char-level data, process the whole text string
+            text = span.get("text", "")
+            decoded_text = ""
+            for ch in text:
+                dec = convert_string(ch, target_font, stats, error_chr_fun=None, glyph_lookup=glyph_lookup)
+                if dec is None:
+                    dec = _correct_monlam_glyph(ch)
+                decoded_text += dec
+            fragments.append(decoded_text)
+            span_prev_char_obj = None
+
+    return fragments
+
+def extract_pdf_hybrid(
+    pdf_path: Path,
+    *,
+    crop_top: float = 0.0,
+    crop_bottom: float = 0.0,
+    preserve_box: Optional[list] = None,
+    extraction_dedup: bool = True,
+    phantom_space_drop: bool = True,
 ) -> str:
     """
-    Extract text using PyMuPDF ``rawdict``: one ``\\n`` per **visual** line.
-
-    MuPDF often splits a single visual line into multiple ``line`` objects.
-    We merge lines whose Y midpoints are within ``_Y_MERGE_TOLERANCE`` pts,
-    sort left-to-right, and apply all five artefact fixes.
-
-    Fix 2 (WinAnsi CMap correction) is applied once before the page loop by
-    ``_patch_font_cmaps()``, which rewrites bad ToUnicode CMap entries in-memory
-    so all subsequent page.get_text() calls decode characters correctly.
+    Extracts text using PyMuPDF's layout sorting, but pytiblegenc's font decoding.
     """
-    logger.info(f"    Extracting (PyMuPDF rawdict): {pdf_path.name}")
+    logger.info(f"    Extracting (Hybrid Mode): {pdf_path.name}")
 
-    if not PYMUPDF_AVAILABLE:
-        logger.error("PyMuPDF is required for --extractor pymupdf. pip install pymupdf")
+    if not PYMUPDF_AVAILABLE or not PYTIBLEGENC_AVAILABLE:
+        logger.error("Both PyMuPDF and pytiblegenc are required for the hybrid extractor.")
         return ""
 
     tmp_pdf: Optional[Path] = None
 
     try:
-        if crop_top > 0.0 or crop_bottom > 0.0:
+        # 1. Handle Redaction / Cropping
+        if preserve_box is not None:
+            tmp_pdf = create_cropped_pdf(pdf_path, crop_top, crop_bottom, preserve_box=preserve_box)
+        elif crop_top > 0.0 or crop_bottom > 0.0:
             tmp_pdf = create_cropped_pdf(pdf_path, crop_top, crop_bottom)
 
         target_pdf = tmp_pdf if tmp_pdf else pdf_path
+
+        # 2. Setup pytiblegenc Font Normalization & Glyph Lookup
+        # Install local font tables (Fix 9) and the TibetanChogyal cid
+        # patch (Fix 8) before the first extraction call.  Both are idempotent.
+        _install_local_font_tables()
+        _install_chogyal_cid_patch()
+
+        font_normalization: dict = {}
+        glyph_lookup = None
+        try:
+            glyph_db_path = get_glyph_db_path()
+            glyph_index = build_font_hash_index_from_csv(str(glyph_db_path))
+            raw_font_norm = {}
+            with open(str(target_pdf), "rb") as _f:
+                _parser = PDFParser(_f)
+                _doc_tmp = PDFDocument(_parser)
+                raw_font_norm = identify_pdf_fonts_from_db(_doc_tmp, glyph_index) or {}
+
+            # Clean keys: ensure both the raw PDF name and the subset-stripped name
+            # are present so PyMuPDF and pdfminer name lookups both hit.
+            for k, v in raw_font_norm.items():
+                ck = k.split("+", 1)[-1] if "+" in k else k
+                font_normalization[ck] = v
+                font_normalization[k] = v
+
+            glyph_lookup = build_glyph_lookup_tables(str(glyph_db_path))
+        except Exception as exc:
+            logger.warning("Could not load font normalization or glyph lookup: %s", exc)
+
+        # Inject legacy aliases (Fix 7)
+        for alias, canonical in _get_font_name_aliases().items():
+            if alias not in font_normalization:
+                font_normalization[alias] = {canonical}
+
+        stats: dict = {"unhandled_fonts": {}, "handled_fonts": {}, "unknown_characters": {}, "error_characters": 0, "diffs_with_utfc": {}}
+
+        # 3. PyMuPDF Extraction Loop
         doc = fitz.open(str(target_pdf))
-
-        # Fix 2: patch all bad ToUnicode CMap entries before any page extraction
-        _patch_font_cmaps(doc)
-
         parts: list[str] = []
+        fn_settings = _footnote_settings()
 
         for page in doc:
             page_dict = page.get_text("rawdict")
+            page_width = page.rect.width
+            raw_lines: list[tuple[float, float, list[str]]] = [] 
+            # Parallel list of (x0, x1) horizontal extents, one per appended
+            # raw_line, used by _detect_column_splits to reject false column
+            # dividers on single-column pages (see crossing validation).
+            line_spans: list[tuple[float, float]] = []
+            # Footnote lines pulled out of the body flow: (y, x0, fragments).
+            footnote_lines: list[tuple[float, float, list[str]]] = []
 
-            raw_lines: list[tuple[float, float, list[str]]] = []
+            # Locate a footnote separator (left-margin rule, low on the page).
+            # The body left margin is the smallest line-start x on the page.
+            fn_sep_y: Optional[float] = None
+            if fn_settings["enabled"]:
+                left_xs = [
+                    ln.get("bbox", [1e9])[0]
+                    for blk in page_dict.get("blocks", [])
+                    if blk.get("type", 1) == 0
+                    for ln in blk.get("lines", [])
+                ]
+                if left_xs:
+                    body_left_x = min(left_xs)
+                    fn_sep_y = _find_footnote_separator_y(page, body_left_x, fn_settings)
+
+            # Estimate the body font size (most common span size, weighted by
+            # span length) so we can tell footnote text (smaller) apart from a
+            # page number (body-size) that also sits below the separator.
+            body_font_size = None
+            if fn_sep_y is not None:
+                from collections import Counter as _Counter
+                _sz = _Counter()
+                for blk in page_dict.get("blocks", []):
+                    if blk.get("type", 1) != 0:
+                        continue
+                    for ln in blk.get("lines", []):
+                        for sp in ln.get("spans", []):
+                            _sz[round(sp.get("size", 0), 1)] += len(sp.get("text", "") or "")
+                if _sz:
+                    body_font_size = _sz.most_common(1)[0][0]
 
             for block in page_dict.get("blocks", []):
                 if block.get("type", 1) != 0:
@@ -770,16 +1682,61 @@ def extract_pdf_pymupdf(
                     bbox = line.get("bbox", [0, 0, 0, 0])
                     y_mid = (bbox[1] + bbox[3]) / 2.0
                     x0 = bbox[0]
-                    fragments = _extract_line_text(line)
-                    if fragments:
+                    
+                    # Send line to our new hybrid decoder
+                    fragments = _extract_line_text_hybrid(
+                        line, 
+                        font_normalization, 
+                        glyph_lookup, 
+                        stats, 
+                        drop_phantom_spaces=phantom_space_drop
+                    )
+                    
+                    if not fragments:
+                        continue
+
+                    # Route lines below the footnote separator into the note
+                    # collection — but only those whose font is smaller than the
+                    # body.  A body-size line below the separator is the printed
+                    # page number, not footnote text, so it's dropped here (the
+                    # existing footer-stripping handles real footers elsewhere).
+                    if fn_sep_y is not None and y_mid >= fn_sep_y:
+                        line_size = max(
+                            (round(sp.get("size", 0), 1) for sp in line.get("spans", [])),
+                            default=0,
+                        )
+                        if (
+                            body_font_size is None
+                            or line_size <= body_font_size * fn_settings["body_ratio"]
+                        ):
+                            footnote_lines.append((y_mid, x0, fragments))
+                        # else: body-size line below separator → page number, skip
+                    else:
                         raw_lines.append((y_mid, x0, fragments))
+                        line_spans.append((bbox[0], bbox[2]))
 
-            # Fix 5: remove duplicate lines from overlapping PDF text layers
-            if raw_lines:
-                raw_lines = _deduplicate_raw_lines(raw_lines, _Y_MERGE_TOLERANCE)
+            # 4. Apply PyMuPDF Deduplication & Coordinate Sorting
+            if raw_lines and extraction_dedup:
+                raw_lines, line_spans = _deduplicate_raw_lines(
+                    raw_lines, _Y_MERGE_TOLERANCE, line_spans
+                )
 
-            raw_lines.sort(key=lambda t: (t[0], t[1]))
+            # Multi-column detection: if the page has a clear horizontal gap
+            # between two groups of text blocks, sort each column independently
+            # (top→bottom) before the normal y-sort, so reading order is correct.
+            column_splits = _detect_column_splits(raw_lines, page_width, line_spans)
+            if column_splits:
+                logger.debug(
+                    "  hybrid: page %d multi-column detected, splits at x=%s",
+                    page.number + 1,
+                    [f"{s:.1f}" for s in column_splits],
+                )
+                raw_lines = _sort_lines_multicolumn(raw_lines, column_splits)
+            else:
+                # Sort top-to-bottom, then left-to-right
+                raw_lines.sort(key=lambda t: (t[0], t[1]))
 
+            # Merge lines that share the same Y midpoint
             merged_rows: list[list[tuple[float, float, list[str]]]] = []
             for y_mid, x0, frags in raw_lines:
                 if merged_rows:
@@ -789,18 +1746,37 @@ def extract_pdf_pymupdf(
                         continue
                 merged_rows.append([(y_mid, x0, frags)])
 
+            # Emit text
             for row in merged_rows:
                 row.sort(key=lambda t: t[1])
-                # Fix 5b: remove shadow copies that survived pre-merge dedup.
-                row = _dedup_within_row(row)
+                if extraction_dedup:
+                    row = _dedup_within_row(row)
                 for _y, _x, frags in row:
                     parts.extend(frags)
                 parts.append("\n")
 
+            # Emit footnotes (if any) as single-line note tokens.  Each token
+            # is reattached inline at its marker in convert_markup_to_tei.
+            if footnote_lines:
+                note_tokens = _build_footnote_tokens(footnote_lines, extraction_dedup)
+                for tok in note_tokens:
+                    parts.append(tok)
+                    parts.append("\n")
+
             parts.append(f"\n{PAGE_BREAK_STR}\n")
 
         doc.close()
-        return "".join(parts)
+
+        # Apply sliding-window dedup to catch interleaved shadow copies
+        text_output = "".join(parts)
+        if extraction_dedup:
+            text_output = _deduplicate_pytiblegenc_output(text_output, PAGE_BREAK_STR)
+
+        # Log unhandled fonts to help debug missed legacy fonts
+        if stats["unhandled_fonts"]:
+            logger.warning("Hybrid Mode - Unhandled fonts (no conversion table): %s", stats["unhandled_fonts"])
+
+        return text_output
 
     except Exception as e:
         logger.error(f"    ERROR extracting {pdf_path.name}: {e}")
@@ -812,20 +1788,3 @@ def extract_pdf_pymupdf(
                 os.unlink(tmp_pdf)
             except OSError:
                 pass
-
-
-def extract_pdf_to_text(
-    pdf_path: Path,
-    extractor: str,
-    *,
-    crop_top: float = 0.0,
-    crop_bottom: float = 0.0,
-) -> str:
-    """Dispatch to PyMuPDF or pytiblegenc."""
-    if extractor == "pytiblegenc":
-        return extract_pdf_pytiblegenc(
-            pdf_path, crop_top=crop_top, crop_bottom=crop_bottom
-        )
-    return extract_pdf_pymupdf(
-        pdf_path, crop_top=crop_top, crop_bottom=crop_bottom
-    )
