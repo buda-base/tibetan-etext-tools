@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pdf2line"
+version = "0.1.0"
+description = "Convert PDFs to plain text, one page per line (Tibetan-aware)."
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = ["pymupdf>=1.23"]
+
+[project.optional-dependencies]
+legacy = ["pytiblegenc"]
+
+[project.scripts]
+pdf2line = "pdf2line.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["pdf2line*"]
