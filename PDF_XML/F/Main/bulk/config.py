@@ -35,9 +35,9 @@ from typing import Optional
 # Override these for ad-hoc single-IE runs.  The bulk driver replaces them
 # at process start via PDF_BULK_BASE_DIR / PDF_BULK_IE_ID.
 
-_DEFAULT_IE_ID = "IE3KG194"
+_DEFAULT_IE_ID = "IE3CN26447"
 _DEFAULT_BASE_DIR = Path(
-    r"/Users/tenzinmonlam/Documents/dharmaduta/6th_batch_conversion/archive_fitered_pdfs/process/vald"
+    r"D:\monlam_dharmaduta\task\archive_filtered_pdf\IE3CN26447"
 )
 
 # ─── Env-var overrides (bulk workflow) ─────────────────────────────────────

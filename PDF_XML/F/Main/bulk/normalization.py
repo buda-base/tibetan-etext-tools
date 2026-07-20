@@ -85,6 +85,20 @@ def fix_pdf_glyph_to_unicode_artifacts(text: str) -> str:
     s = re.sub(r"ཚĲ(?=\s)", "ཚིགས", s)
     s = s.replace("ཚĲ", "ཚེ")
     s = re.sub(r"([\u0f00-\u0fff])Ĳ", r"\1" + "\u0f7a", s)
+
+    # Ľ (U+013D) — MuPDF GID-as-Unicode fallback for the Tibetan
+    # Naro (ོ U+0F7C) + Anusvara (ཾ U+0F7E) ligature glyph in
+    # MonlamUniOuChan2.  Only substitute in Tibetan context (preceded by
+    # a Tibetan codepoint) to avoid corrupting Latin text that legitimately
+    # contains Ľ (e.g. Slovak / Czech transliterations in front matter).
+    s = re.sub(r"([\u0f00-\u0fff])\u013d", r"\1" + "\u0f7c\u0f7e", s)
+
+    # † ‡ (U+2020, U+2021) — WinAnsi code-page slots 0x86/0x87 map to
+    # these Unicode dagger characters but Monlam fonts use those slots for
+    # dot-leader glyphs (rows of dots filling TOC lines).  Replace with
+    # an ASCII full stop so the dot pattern is preserved in the output.
+    s = s.replace("\u2020", ".").replace("\u2021", ".")
+
     return s
 
 
@@ -116,10 +130,15 @@ def normalize_spaces(
       3. Collapse multiple spaces to one.
       4. Apply Tibetan-specific space normalization rules.
 
-    Tibetan-specific rules:
-      - Remove space after tsheg (U+0F0B, U+0F0C, U+0FD2) if followed by
-        initial letter (U+0F40-U+0F6C) or shad (U+0F0D-U+0F11)
-      - Remove space between final letter (U+0F40-U+0FBC) and tsheg
+    Tibetan-specific rules (Fix 6):
+      - Remove space between a Tibetan letter/stack and its following
+        tsheg or shad (both belong to the preceding syllable).
+      - Remove space after tsheg ONLY when followed by another tsheg/shad
+        (pure punctuation noise).  Do NOT strip tsheg→consonant spaces:
+        they are legitimate inter-syllable / word-boundary separators in
+        printed Tibetan and must be preserved for correct segmentation.
+      - Spaces after shad (U+0F0D–U+0F11) before a consonant are kept:
+        they are sentence / paragraph separators and must survive into XML.
     """
     if not text:
         return ""
@@ -137,12 +156,25 @@ def normalize_spaces(
     if collapse_internal_spaces:
         s = re.sub(r" {2,}", " ", s)
 
-    # 4) Tibetan-specific space normalization
+    # 4) Tibetan-specific space normalization (Fix 6)
     if tibetan_specific:
-        # Remove space after tsheg if followed by initial letter or shad
-        s = re.sub(r"([\u0f0b\u0f0c\u0fd2]) +([\u0f40-\u0f6c\u0f0d-\u0f11])", r"\1\2", s)
-        # Remove space between final letter and tsheg
-        s = re.sub(r"([\u0f40-\u0fbc]) +([\u0f0b\u0f0c\u0fd2])", r"\1\2", s)
+        # Remove space between a Tibetan consonant/stack and its following
+        # tsheg or shad — both are punctuation that belong to the preceding
+        # syllable (U+0F0B/0F0C/0FD2 = tsheg variants; U+0F0D–U+0F11 = shad).
+        s = re.sub(
+            r"([\u0f40-\u0fbc]) +([\u0f0b\u0f0c\u0fd2\u0f0d-\u0f11])",
+            r"\1\2", s,
+        )
+        # Remove space after tsheg ONLY when immediately followed by another
+        # tsheg or shad — that is pure punctuation noise from the PDF.
+        # Do NOT strip tsheg→consonant spaces: they are legitimate inter-
+        # syllable / word-boundary separators in printed Tibetan.
+        s = re.sub(
+            r"([\u0f0b\u0f0c\u0fd2]) +([\u0f0b\u0f0c\u0fd2\u0f0d-\u0f11])",
+            r"\1\2", s,
+        )
+        # NOTE: spaces after shad (U+0F0D–U+0F11) before a consonant are
+        # preserved — they are sentence/paragraph separators in the XML.
 
     return s
 
@@ -362,4 +394,150 @@ def normalize_invalid_start_string(s):
         return s[1] + s[0] + (s[2:] if len(s) > 2 else "")
     if is_suffix(s[0]):
         return s[1:]
+    return s
+
+# ---------------------------------------------------------------------------
+# Fix A — InDesign shadow text deduplication
+#
+# InDesign / Acrobat-generated PDFs sometimes embed text layers twice with
+# slight offset (drop-shadow or glow effects).  After extraction the same
+# Tibetan syllable appears twice in sequence, either as a bare consonant stack
+# followed by its vowelled copy (Pattern A) or as two identical units (Pattern B).
+# These three functions detect and remove the duplicates.
+# ---------------------------------------------------------------------------
+
+# Tokenise Tibetan text into "units" (base consonant + optional subjoined +
+# optional vowel marks) and non-unit runs (punctuation, Latin, digits, spaces).
+_UNIT_RE = re.compile(
+    r'[ཀ-ཬ]'                                    # Tibetan base consonant
+    r'[ྍ-ྼ]*'                                    # subjoined consonants (0+)
+    r'[ཱ-྄྆྇ཾཿ]*'          # vowel signs + marks (0+)
+)
+_NON_UNIT_RE = re.compile(
+    r'[^ཀ-ཬྍ-ྼཱ-྄྆྇ཾཿ]+'
+)
+_VOWEL_MARK_RE = re.compile(r'[ཱ-྄྆྇ཾཿ]')
+
+
+def _has_tibetan_vowel_mark(unit: str) -> bool:
+    """True if *unit* contains at least one Tibetan vowel / dependent vowel mark."""
+    return bool(_VOWEL_MARK_RE.search(unit))
+
+
+def _consonant_skeleton(unit: str) -> str:
+    """Return *unit* with all vowel signs stripped, leaving only base + subjoineds."""
+    return _VOWEL_MARK_RE.sub("", unit)
+
+
+def collapse_duplicate_consonant_clusters(text: str) -> str:
+    """
+    Remove InDesign shadow stacks: bare consonant copy + vowelled copy (Pattern A),
+    or identical units (Pattern B).
+
+    Pattern A — bare copy immediately before vowelled copy:
+        གྱགྱི  →  གྱི    (bare གྱ before vowelled གྱི)
+
+    Pattern B — identical units (vowelled, or multi-char stack):
+        ཆུཆུབ  →  ཆུབ    ཙཱཙཱ  →  ཙཱ
+
+    The token-based approach keeps non-Tibetan content and Tibetan syllables
+    without shadow copies completely unchanged.
+    """
+    if not text:
+        return text
+
+    tokens: list[tuple[str, bool]] = []
+    pos = 0
+    n = len(text)
+    while pos < n:
+        m = _UNIT_RE.match(text, pos)
+        if m:
+            tokens.append((m.group(), True))
+            pos = m.end()
+            continue
+        m = _NON_UNIT_RE.match(text, pos)
+        if m:
+            tokens.append((m.group(), False))
+            pos = m.end()
+            continue
+        tokens.append((text[pos], False))
+        pos += 1
+
+    result: list[str] = []
+    i = 0
+    while i < len(tokens):
+        tok, is_unit = tokens[i]
+        if is_unit and i + 1 < len(tokens) and tokens[i + 1][1]:
+            nxt = tokens[i + 1][0]
+            if _consonant_skeleton(tok) == _consonant_skeleton(nxt):
+                pattern_a = (
+                    not _has_tibetan_vowel_mark(tok)
+                    and _has_tibetan_vowel_mark(nxt)
+                )
+                pattern_b = (
+                    tok == nxt
+                    and (
+                        _has_tibetan_vowel_mark(tok)
+                        or len(tok) > 1
+                    )
+                )
+                if pattern_a or pattern_b:
+                    i += 1  # skip shadow copy; next iteration keeps the real copy
+                    continue
+        result.append(tok)
+        i += 1
+
+    return "".join(result)
+
+
+# Consecutive identical Tibetan combining marks from overlapping PDF layers.
+_COLLAPSE_DUP_TIB_MARKS_RE = re.compile(
+    r"([ཱ-྇ྍ-ྼ༹༵༷])\1+"
+)
+
+
+def collapse_duplicate_tibetan_marks(text: str) -> str:
+    """
+    Collapse consecutive identical Tibetan combining marks (vowels, subjoined
+    consonants, etc.) caused by overlapping text layers in layered PDFs.
+
+    Example: ཀིི → ཀི  (double vowel sign i from two overlapping layers)
+    """
+    if not text:
+        return text
+    return _COLLAPSE_DUP_TIB_MARKS_RE.sub(r"\1", text)
+
+
+# InDesign section running headers in UTF-16-BE hex angle-bracket encoding.
+# <FEFF0053006500630031003A> = BOM + "Sec1:"
+_INDESIGN_SECTION_MARKER_RE = re.compile(
+    r"<FEFF005300650063003[12]003A>"
+    r"(?:[IVXLCDMivxlcdm]+|\d+)?"
+)
+# Font-size-tagged Roman numeral header lines, e.g. <fs:12>XIV\n
+_FS_ONLY_ROMAN_HEADER_RE = re.compile(
+    r"(?:^|\n)<fs:\d+>\s*[IVXLCDMivxlcdm]+\s*(?=\n)"
+)
+# Bare Roman numeral lines immediately before a ZZZZ page-break marker.
+_ROMAN_LINE_BEFORE_PAGE_BREAK_RE = re.compile(
+    r"(?:^|\n)\s*[IVXLCDMivxlcdm]{1,6}\s*(?=\n+\s*ZZZZ)"
+)
+
+
+def remove_indesign_section_markers(text: str) -> str:
+    """
+    Remove InDesign section running headers encoded as UTF-16-BE hex strings
+    in angle brackets, e.g. ``<FEFF0053006500630031003A>III`` (BOM + "Sec1:" + page).
+
+    Also strips font-size-tagged Roman numeral header lines and bare Roman
+    numeral lines that appear immediately before ZZZZ page-break markers —
+    these are InDesign running section headers that land in the extraction
+    stream as spurious page-number artifacts.
+    """
+    if not text:
+        return text
+    s = _INDESIGN_SECTION_MARKER_RE.sub("", text)
+    s = _FS_ONLY_ROMAN_HEADER_RE.sub("\n", s)
+    s = _ROMAN_LINE_BEFORE_PAGE_BREAK_RE.sub("\n", s)
+    s = re.sub(r"\n{3,}", "\n\n", s)
     return s

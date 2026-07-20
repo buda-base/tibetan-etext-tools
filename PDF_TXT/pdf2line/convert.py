@@ -1,10 +1,10 @@
 """
-pdf2line.convert — Orchestrate extraction -> assembly -> normalization -> file.
+pdf2line.convert - Orchestrate extraction -> assembly -> normalization -> file.
 
-One ``.txt`` per PDF written flat into one output dir.
+One .txt per PDF written flat into one output dir.
 
 Output structure:
-- Non-Tibetan boilerplate is one block at the top with single newlines between lines.
+- Non-Tibetan boilerplate is one block at the top with single newlines.
 - Visual line breaks within a pecha page are preserved as single newlines.
 - Pecha pages are separated by a blank line (double newline).
 """
@@ -16,7 +16,7 @@ import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, asdict
 from pathlib import Path
-from typing import List, Optional
+from typing import List
 
 from .extract import extract_pages
 from .assemble import split_into_pages
@@ -43,18 +43,33 @@ def convert_pdf(
     crop_top: float = 0.0,
     crop_bottom: float = 0.0,
     keep_page_numbers: bool = False,
-    keep_boilerplate: bool = True,
+    collect_boilerplate: bool = True,
     normalize: bool = False,
     overwrite: bool = False,
+    two_up: bool = False,
+    auto_two_up: bool = False,
+    hybrid_min_tibetan_ratio: float = 0.20,
 ) -> Result:
     """
     Convert one PDF into one .txt.
 
     Visual line breaks within a pecha page are preserved and pecha pages are
     separated by a blank line (double newline).
+
+    Parameters
+    ----------
+    two_up :
+        Force split each PDF page into left and right halves before extraction
+        (for scans where one PDF page contains two facing pecha pages).
+    auto_two_up :
+        Automatically detect two-up scans based on page aspect ratio
+        (width > 1.5x height triggers the split).
+    hybrid_min_tibetan_ratio :
+        Threshold used by the hybrid backend to decide whether to retry with
+        pytiblegenc (default 0.20).
     """
     start = time.time()
-    out_path = out_dir / f"{pdf_path.stem}.txt"
+    out_path = out_dir / (pdf_path.stem + ".txt")
 
     if out_path.exists() and not overwrite:
         return Result(pdf_path.name, out_path.name, 0, True,
@@ -62,22 +77,24 @@ def convert_pdf(
 
     try:
         pages = extract_pages(
-            pdf_path, backend=backend, crop_top=crop_top, crop_bottom=crop_bottom
+            pdf_path,
+            backend=backend,
+            crop_top=crop_top,
+            crop_bottom=crop_bottom,
+            two_up=two_up,
+            auto_two_up=auto_two_up,
+            hybrid_min_tibetan_ratio=hybrid_min_tibetan_ratio,
         )
-        # Split on page-number lines; internal visual line breaks are preserved.
         lines = split_into_pages(
             pages,
             drop_page_numbers=not keep_page_numbers,
-            collect_boilerplate=keep_boilerplate,
+            collect_boilerplate=collect_boilerplate,
         )
         if normalize:
             lines = [normalize_line(l) for l in lines]
 
-        # Separate pecha pages with a blank line.
-        page_sep = "\n\n"
-
         out_dir.mkdir(parents=True, exist_ok=True)
-        out_path.write_text(page_sep.join(lines) + "\n", encoding="utf-8")
+        out_path.write_text("\n\n".join(lines) + "\n", encoding="utf-8")
         return Result(pdf_path.name, out_path.name, len(lines), True,
                       "", round(time.time() - start, 2))
     except Exception as exc:
@@ -113,7 +130,14 @@ def convert_folder(
         with ProcessPoolExecutor(max_workers=jobs) as ex:
             futs = {ex.submit(convert_pdf, p, out_dir, **pdf_kwargs): p for p in pdfs}
             for fut in as_completed(futs):
-                r = fut.result()
+                pdf_path = futs[fut]
+                try:
+                    r = fut.result()
+                except Exception as exc:
+                    # Worker crash: wrap as a failed Result so the batch continues.
+                    r = Result(pdf_path.name, pdf_path.stem + ".txt", 0, False,
+                               "worker crash: " + str(exc), 0.0)
+                    logger.error("WORKER CRASH %s: %s", pdf_path.name, exc)
                 results.append(r)
                 _log(r)
     else:

@@ -8,42 +8,7 @@ and emits full TEI P5 documents with BDRC-oriented header metadata.
 import re
 import hashlib
 from pathlib import Path
-from collections import Counter
-import logging
-
 from config import IE_ID
-
-logger = logging.getLogger(__name__)
-
-
-def classify_font_sizes(converted_streams: list) -> dict:
-    """
-    Classify font sizes into large, regular, and small categories.
-    """
-    size_counts = Counter()
-    
-    for item in converted_streams:
-        text = item.get("text", "")
-        font_size = item.get("font_size", 12)
-        tibetan_chars = len([c for c in text if 0x0F00 <= ord(c) <= 0x0FFF])
-        if tibetan_chars > 0:
-            size_counts[font_size] += tibetan_chars
-    
-    if not size_counts:
-        return {}
-    
-    most_common = max(size_counts.items(), key=lambda x: x[1])[0]
-    
-    classifications = {}
-    for fs in size_counts.keys():
-        if fs == most_common:
-            classifications[fs] = 'regular'
-        elif fs > most_common:
-            classifications[fs] = 'large'
-        else:
-            classifications[fs] = 'small'
-    
-    return classifications
 
 
 def escape_xml(text: str) -> str:
@@ -64,87 +29,6 @@ def calculate_sha256(file_path: Path) -> str:
         return sha256_hash.hexdigest()
     except FileNotFoundError:
         return "FILE_NOT_FOUND"
-
-
-def build_tei_body(converted_streams: list, enable_font_classification: bool = True) -> str:
-    """Build the body content for TEI XML from converted streams."""
-    tei_lines = []
-    current_markup = None
-    
-    # Skip leading breaks (newlines and page_breaks) at the start
-    # These can occur from RTF structure between header/footer definitions
-    start_idx = 0
-    for i, item in enumerate(converted_streams):
-        if item.get("type") == "page_break":
-            continue  # Skip leading page_breaks
-        if item.get("text", "").strip() == "":
-            continue  # Skip empty/whitespace-only items
-        start_idx = i
-        break
-    
-    # Always add initial page break at start
-    tei_lines.append('<pb/>\n')
-    
-    # Process from start_idx
-    if start_idx > 0:
-        converted_streams = converted_streams[start_idx:]
-    
-    if enable_font_classification:
-        classifications = classify_font_sizes(converted_streams)
-        if classifications:
-            logger.info(f"  Font classifications: {classifications}")
-    else:
-        classifications = {}
-    
-    for item in converted_streams:
-        # Handle page break markers (from footer detection)
-        if item.get("type") == "page_break":
-            # Close any open markup tags before page break
-            if current_markup == 'small':
-                tei_lines.append('</hi>')
-            elif current_markup == 'large':
-                tei_lines.append('</hi>')
-            current_markup = None
-            tei_lines.append('\n<pb/>\n')
-            continue
-        
-        # Skip items without text
-        if "text" not in item:
-            continue
-        
-        text = item["text"]
-        font_size = item.get("font_size", 12)
-        escaped_text = escape_xml(text)
-        
-        if enable_font_classification and classifications:
-            classification = classifications.get(font_size, 'regular')
-            
-            if classification != current_markup:
-                if current_markup == 'small':
-                    tei_lines.append('</hi>')
-                elif current_markup == 'large':
-                    tei_lines.append('</hi>')
-                
-                if classification == 'small':
-                    tei_lines.append('<hi rend="small">')
-                elif classification == 'large':
-                    tei_lines.append('<hi rend="head">')
-                
-                current_markup = classification if classification != 'regular' else None
-        
-        tei_lines.append(escaped_text)
-    
-    if current_markup == 'small':
-        tei_lines.append('</hi>')
-    elif current_markup == 'large':
-        tei_lines.append('</hi>')
-    
-    body_content = ''.join(tei_lines)
-    
-    if enable_font_classification:
-        body_content = re.sub(r'<hi rend="[^"]+"></hi>', '', body_content)
-    
-    return body_content
 
 
 def post_process_body(body_content: str) -> str:

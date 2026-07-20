@@ -54,7 +54,13 @@ from config import (
     CROP_HEADER_FRACTION,
     CROP_FOOTER_FRACTION,
 )
-from normalization import normalize_unicode, remove_wingdings_private_use
+from normalization import (
+    normalize_unicode,
+    remove_wingdings_private_use,
+    collapse_duplicate_consonant_clusters,
+    collapse_duplicate_tibetan_marks,
+    remove_indesign_section_markers,
+)
 #from tibetan_text_fixes import fix_hi_tag_spacing, fix_toc_leader_dots
 from tei_generator import post_process_body, generate_tei_xml, calculate_sha256
 from pdf_extract import (
@@ -854,6 +860,11 @@ def convert_pdf_to_tei(pdf_path: Path, ve_id: str, sequence: int) -> str:
     if ENABLE_NORMALIZATION:
         logger.info("    Applying normalization...")
         normalized_text = normalize_unicode(simplified_text)
+        # Fix A — InDesign shadow text: remove duplicate consonant stacks,
+        # duplicate combining marks, and section-header artifacts.
+        normalized_text = collapse_duplicate_consonant_clusters(normalized_text)
+        normalized_text = collapse_duplicate_tibetan_marks(normalized_text)
+        normalized_text = remove_indesign_section_markers(normalized_text)
     else:
         # Still strip Wingdings PUA when full normalization is off (font artefact only).
         normalized_text = remove_wingdings_private_use(simplified_text)

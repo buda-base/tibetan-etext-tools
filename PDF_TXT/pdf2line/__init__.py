@@ -13,6 +13,9 @@ Public API
 
 See ``pdf2line.cli`` for the command-line entry point (``pdf2line ...``).
 """
+import logging
+logging.getLogger("pdf2line").addHandler(logging.NullHandler())
+
 from .extract import extract_pdf_text, extract_pages
 from .assemble import split_into_pages, is_page_number, is_boilerplate, has_tibetan
 from .convert import convert_pdf, convert_folder

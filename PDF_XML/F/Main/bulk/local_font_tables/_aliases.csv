@@ -13,3 +13,13 @@
 # Examples (uncomment to activate):
 # MyPublisher-Tibetan,TCRC Bod-Yig
 # AcmePress-Uchen,TibetanMachineWeb
+
+# IE8LS75784 / W8LS75784-Autobiography-of-6th-Tharig-Rinpoche.pdf:
+# PDF embeds TCC's TibetanChogyal family under "Gen_"/"Gen." prefixed names.
+# pytiblegenc ships built-in tables under the bare names below (confirmed via
+# get_base()/get_utfc_base() locally) -- same font family, just a differently
+# prefixed embed name, so a direct alias is correct here.
+Gen_TibetanChogyal,TibetanChogyal
+Gen.TibetanChogyalSkt1,TibetanChogyalSkt1
+Gen.TibetanChogyalSkt2,TibetanChogyalSkt2
+Gen.TibetanChogyalSkt3,TibetanChogyalSkt3

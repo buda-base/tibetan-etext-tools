@@ -12,6 +12,7 @@ dependencies = ["pymupdf>=1.23"]
 
 [project.optional-dependencies]
 legacy = ["pytiblegenc"]
+dev = ["pytest>=7", "pytest-cov"]
 
 [project.scripts]
 pdf2line = "pdf2line.cli:main"

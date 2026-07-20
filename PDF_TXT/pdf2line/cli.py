@@ -2,7 +2,8 @@
 pdf2line.cli — Command-line interface.
 
     pdf2line -i ./pdfs -o ./out
-    pdf2line -i book.pdf -o ./out --backend pymupdf
+    pdf2line -i book.pdf -o ./out --backend hybrid
+    pdf2line -i scans/ -o ./out --auto-two-up
 """
 from __future__ import annotations
 
@@ -25,28 +26,58 @@ def build_parser() -> argparse.ArgumentParser:
                    help="A PDF file, or a folder containing PDFs.")
     p.add_argument("-o", "--output", required=True,
                    help="Flat output folder for .txt files.")
+
+    # --- Extraction backend ---
     p.add_argument("--backend", choices=["hybrid", "pymupdf", "pytiblegenc"],
-                   default="pymupdf",
-                   help="Extraction backend (default: pymupdf). 'hybrid' falls "
-                        "back to pytiblegenc for legacy fonts.")
+                   default="hybrid",
+                   help="Extraction backend (default: hybrid). 'hybrid' tries "
+                        "PyMuPDF first and falls back to pytiblegenc for legacy fonts.")
+    p.add_argument("--hybrid-min-tibetan-ratio", type=float, default=0.20,
+                   metavar="RATIO",
+                   help="Tibetan-character fraction below which the hybrid backend "
+                        "retries with pytiblegenc (default: 0.20).")
+
+    # --- Crop ---
     p.add_argument("--crop-top", type=float, default=0.0,
-                   help="Crop fraction of page height from top.")
+                   help="Crop fraction of page height from top (e.g. 0.05).")
     p.add_argument("--crop-bottom", type=float, default=0.0,
-                   help="Crop fraction of page height from bottom.")
+                   help="Crop fraction of page height from bottom (e.g. 0.05).")
+
+    # --- Two-up / multi-column ---
+    p.add_argument("--two-up", action="store_true",
+                   help="Split every PDF page into left and right halves before "
+                        "extraction. Use when one scan page contains two facing "
+                        "pecha pages.")
+    p.add_argument("--auto-two-up", action="store_true",
+                   help="Automatically detect two-up pages by aspect ratio "
+                        "(width > 1.5 x height) and split them.")
+
+    # --- Assembly ---
     p.add_argument("--keep-page-numbers", action="store_true",
                    help="Keep the page-number line at the start of each page "
                         "instead of dropping it.")
     p.add_argument("--drop-boilerplate", action="store_true",
                    help="Drop non-Tibetan lines (URLs, English notes) instead "
-                        "of collecting them at the top.")
+                        "of collecting them at the top of the file.")
+
+    # --- Normalization ---
     p.add_argument("--normalize", action="store_true",
-                   help="Apply NFC/Tibetan normalization (default: off, raw).")
+                   help="Apply NFC + Tibetan Unicode normalization (default: off, "
+                        "raw output).")
+
+    # --- Output control ---
+    p.add_argument("--no-summary", action="store_true",
+                   help="Skip writing _summary.json in the output folder "
+                        "(folder mode only).")
+    p.add_argument("--overwrite", action="store_true",
+                   help="Overwrite existing .txt files (default: skip).")
+
+    # --- Parallelism / traversal ---
     p.add_argument("-j", "--jobs", type=int, default=1,
                    help="Parallel workers across PDFs (folder mode).")
     p.add_argument("-r", "--recursive", action="store_true",
                    help="Recurse into sub-folders (output stays flat).")
-    p.add_argument("--overwrite", action="store_true",
-                   help="Overwrite existing .txt files (default: skip).")
+
     return p
 
 
@@ -59,10 +90,13 @@ def main(argv=None) -> int:
 
     common = dict(
         backend=args.backend,
+        hybrid_min_tibetan_ratio=args.hybrid_min_tibetan_ratio,
         crop_top=args.crop_top,
         crop_bottom=args.crop_bottom,
+        two_up=args.two_up,
+        auto_two_up=args.auto_two_up,
         keep_page_numbers=args.keep_page_numbers,
-        keep_boilerplate=not args.drop_boilerplate,
+        collect_boilerplate=not args.drop_boilerplate,
         normalize=args.normalize,
         overwrite=args.overwrite,
     )
@@ -79,7 +113,11 @@ def main(argv=None) -> int:
 
     if in_path.is_dir():
         results = convert_folder(
-            in_path, out_dir, recursive=args.recursive, jobs=args.jobs, **common
+            in_path, out_dir,
+            recursive=args.recursive,
+            jobs=args.jobs,
+            write_summary=not args.no_summary,
+            **common,
         )
         return 0 if all(r.ok for r in results) else 1
 

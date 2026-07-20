@@ -1,5 +1,5 @@
 """
-pdf2line.normalize — Enhanced Unicode/Tibetan normalization.
+pdf2line.normalize - Enhanced Unicode/Tibetan normalization.
 
 Uses the comprehensive corpus_normalization module which applies:
 - Unicode NFC normalization
@@ -13,19 +13,11 @@ Uses the comprehensive corpus_normalization module which applies:
 - Double-shad expansion (U+0F0E -> U+0F0D U+0F0D)
 
 Normalization is optional and applied per output line. Disable with the
-``--no-normalize`` CLI flag.
+--no-normalize CLI flag (i.e. omit --normalize).
 """
 from __future__ import annotations
 
-import sys
-from pathlib import Path
-
-# Import normalize_corpus from the parent PDF_TXT directory
-_parent = Path(__file__).parent.parent
-if str(_parent) not in sys.path:
-    sys.path.insert(0, str(_parent))
-
-from corpus_normalization import normalize_corpus
+from .corpus_normalization import normalize_corpus
 
 
 def normalize_line(text: str) -> str:
@@ -33,13 +25,10 @@ def normalize_line(text: str) -> str:
     Normalize an already-assembled pecha-page string.
 
     The input may be a single line OR a multi-line string (visual lines within
-    a pecha page joined by ``\n``). Normalization is applied per visual line
-    so that the line break structure is preserved — ``normalize_corpus``'s
-    rule that collapses runs of newlines to one would otherwise be benign
-    here, but applying per-line keeps the boundaries explicit and avoids any
-    accidental swallowing of intentional separators.
+    a pecha page joined by newlines). Normalization is applied per visual line
+    so that the line break structure is preserved.
 
-    Uses ``normalize_corpus`` from the corpus_normalization module for
+    Uses normalize_corpus from the corpus_normalization module for
     comprehensive Unicode and Tibetan text normalization.
     """
     if not text:
