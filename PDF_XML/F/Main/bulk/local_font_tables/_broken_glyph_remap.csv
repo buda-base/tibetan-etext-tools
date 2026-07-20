@@ -1,0 +1,37 @@
+# Per-font broken-ToUnicode glyph remap.
+#
+# Format: font_name,decimal_codepoint,correct_tibetan_string
+#
+# Rows with an empty third column are placeholders -- loaded but skipped
+# (see pdf_extract.py:_load_broken_glyph_remap). Fill in correct_tibetan
+# once the glyph shape has been read from the reference images, then re-run
+# the conversion; no code change needed, the CSV is picked up automatically.
+#
+# Source: D:\monlam_dharmaduta\task\downloads_fixed\46.html\file_1.pdf
+# Reference images: see glyphs2/<font>_<decimal_codepoint>.png
+# (three sample occurrences per code, target glyph boxed in red, with
+# surrounding word context to help identify the correct spelling).
+#
+# A-Himalaya-R -- 17 broken codes, ~127/1229 characters (~10%) affected.
+A-Himalaya-R,33,
+A-Himalaya-R,34,
+A-Himalaya-R,35,
+A-Himalaya-R,36,
+A-Himalaya-R,37,
+A-Himalaya-R,38,
+A-Himalaya-R,39,
+A-Himalaya-R,40,
+A-Himalaya-R,41,
+A-Himalaya-R,42,
+A-Himalaya-R,43,
+A-Himalaya-R,44,
+A-Himalaya-R,45,
+A-Himalaya-R,46,
+A-Himalaya-R,47,
+A-Himalaya-R,49,
+A-Himalaya-R,50,
+#
+# MicrosoftHimalaya -- 3 broken codes, 3/30 characters affected.
+MicrosoftHimalaya,40,
+MicrosoftHimalaya,43,
+MicrosoftHimalaya,47,

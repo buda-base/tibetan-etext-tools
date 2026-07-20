@@ -866,6 +866,85 @@ def _correct_monlam_glyph(c: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Fix 12 — Per-font broken-ToUnicode glyph remap
+#
+# Some legacy-font PDFs embed a /ToUnicode CMap that is correct for most
+# glyphs but wrong for a small, bounded subset — typically because the PDF
+# producer's font-conversion tool had no entry for certain conjunct/stacked
+# Tibetan glyphs and fell back to emitting stray Latin punctuation
+# (e.g. A-Himalaya-R: 16 of its glyph codes decode to "!\"#$%&'()*+,-./"
+# instead of Tibetan). This is NOT the "font has no pytiblegenc conversion
+# table at all" case (_correct_monlam_glyph's fallback already handles that
+# by passing the character through unchanged) — here PyMuPDF's own
+# extraction is right ~90% of the time and wrong for a few specific codes.
+#
+# Deliberately kept separate from _install_local_font_tables()'s pytiblegenc
+# CSV merge: that mechanism registers a whole font's table with pytiblegenc,
+# and an incomplete table could change behaviour for glyphs that already
+# decode correctly via PyMuPDF's own ToUnicode. This remap only ever
+# touches the exact (font, character) pairs listed below/in the CSV,
+# leaving every other glyph from the same font untouched.
+#
+# Populated from local_font_tables/_broken_glyph_remap.csv (leading
+# underscore keeps it out of _install_local_font_tables()'s glyph-CSV scan).
+# Format: font_name,decimal_codepoint,correct_tibetan_string
+# ---------------------------------------------------------------------------
+_BROKEN_GLYPH_REMAP_FILENAME = "_broken_glyph_remap.csv"
+_BROKEN_GLYPH_REMAP: dict[tuple[str, str], str] = {}
+_BROKEN_GLYPH_REMAP_LOADED = False
+
+
+def _load_broken_glyph_remap(force_reload: bool = False) -> None:
+    global _BROKEN_GLYPH_REMAP_LOADED
+    if _BROKEN_GLYPH_REMAP_LOADED and not force_reload:
+        return
+    _BROKEN_GLYPH_REMAP.clear()
+    path = _LOCAL_TABLES_DIR / _BROKEN_GLYPH_REMAP_FILENAME
+    if not path.is_file():
+        _BROKEN_GLYPH_REMAP_LOADED = True
+        return
+    import csv as _csv
+    loaded = 0
+    skipped = 0
+    with path.open(encoding="utf-8", newline="") as f:
+        for row in _csv.reader(f):
+            if not row or len(row) < 3:
+                continue
+            font_name = row[0].strip()
+            if not font_name or font_name.startswith("#"):
+                continue
+            try:
+                cp = int(row[1])
+            except ValueError:
+                continue
+            correct = row[2]
+            if not correct:
+                skipped += 1  # placeholder row not yet filled in
+                continue
+            _BROKEN_GLYPH_REMAP[(font_name, chr(cp))] = correct
+            loaded += 1
+    if loaded or skipped:
+        logger.info(
+            "Broken-glyph remap loaded: %d entr(y/ies) from %s (%d placeholder "
+            "row(s) skipped, not yet filled in).",
+            loaded, path.name, skipped,
+        )
+    _BROKEN_GLYPH_REMAP_LOADED = True
+
+
+def _correct_broken_font_glyph(c: str, font: str) -> str:
+    """
+    Return the correct Tibetan string for a known (font, character) broken-
+    ToUnicode pair, falling back to the font-agnostic Monlam correction,
+    then to the character unchanged.
+    """
+    remapped = _BROKEN_GLYPH_REMAP.get((font, c))
+    if remapped is not None:
+        return remapped
+    return _correct_monlam_glyph(c)
+
+
+# ---------------------------------------------------------------------------
 # Fix 11 — Per-character decode cache
 #
 # pytiblegenc convert_string() is called for every character in every span.
@@ -1948,7 +2027,7 @@ def _extract_line_text_hybrid(
 
                 # Fallback: If pytiblegenc returns None (unhandled font), use original char + Monlam fixes
                 if decoded_c is None:
-                    decoded_c = _correct_monlam_glyph(c)
+                    decoded_c = _correct_broken_font_glyph(c, target_font)
 
                 fragments.append(decoded_c)
                 span_prev_char_obj = char_obj
@@ -1959,7 +2038,7 @@ def _extract_line_text_hybrid(
             for ch in text:
                 dec = _decode_char_cached(ch, target_font, glyph_lookup, stats)
                 if dec is None:
-                    dec = _correct_monlam_glyph(ch)
+                    dec = _correct_broken_font_glyph(ch, target_font)
                 decoded_text += dec
             fragments.append(decoded_text)
             span_prev_char_obj = None
@@ -2000,6 +2079,7 @@ def extract_pdf_hybrid(
         # patch (Fix 8) before the first extraction call.  Both are idempotent.
         _install_local_font_tables()
         _install_chogyal_cid_patch()
+        _load_broken_glyph_remap()
 
         font_normalization: dict = {}
         glyph_lookup = None

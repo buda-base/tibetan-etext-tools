@@ -78,7 +78,7 @@ PDF_TO_XML_CHECKPOINT: Path = CHECKPOINT_DIR / "pdf_to_xml_checkpoint.txt"
 # 0.0 = none.  Typical: 0.07-0.12.  Override per-run with --crop-top /
 # --crop-bottom on convert_pdf_to_xml.py, or per-IE via the bulk manifest.
 CROP_HEADER_FRACTION: float = 0.08
-CROP_FOOTER_FRACTION: float = 0.07
+CROP_FOOTER_FRACTION: float = 0.08
 
 # ─── Full font files for GSUB-based glyph correction ───────────────────────
 # Required only for the Unicode-PDF pipeline when MonlamUniOuChan* fonts have

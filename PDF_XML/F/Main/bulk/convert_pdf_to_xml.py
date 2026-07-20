@@ -113,7 +113,7 @@ EXTRACTION_DUMP_DIR: Optional[Path] = None
 PRESERVE_BOX: Optional[list] = None
 
 # Tibetan tsheg (U+0F0B), vowel ུ (U+0F74), ASCII digits, fullwidth digits (U+FF10-U+FF19)
-_PAGE_ARTIFACT_CHARS = r"\u0F0B\u0F740-9\uFF10-\uFF19\s"
+_PAGE_ARTIFACT_CHARS = r"\u0F0B\u0F740-9\uFF10-\uFF19\s\-"
 
 
 def strip_page_number_artifacts(text: str) -> str:
@@ -132,7 +132,24 @@ def strip_page_number_artifacts(text: str) -> str:
     
     # Remove page numbers before closing tags (e.g., <lb/>703</p>)
     text = re.sub(r'<lb/>\s*\d+\s*(?=</[^>]+>)', '', text)
-    
+
+    # Remove standalone Western-style folio/page-number lines ("-11-",
+    # "-102-", "- 217 -") wherever they occur, not just immediately before
+    # a <pb/>. On a landscape 2-up pecha spread, two book pages share one
+    # PDF <pb/>, so the folio number printed at the bottom of the *first*
+    # sub-page lands mid-flow (between the two sub-pages' text) rather than
+    # next to any <pb/> — the pb/-adjacent patterns above never see it.
+    # Some sources also space the digits out from the hyphens ("- 217 -")
+    # instead of packing them tight. A line whose entire content is
+    # "-<digits>-" (with or without internal spaces) is unambiguous, so
+    # it's safe to strip on sight regardless of position.
+    #
+    # convert_markup_to_tei() calls this per-page, before pages are
+    # concatenated, so a footer that happens to be the very last thing
+    # extracted on its page has no trailing "\n" yet at this point --
+    # match end-of-string too, not just a following newline.
+    text = re.sub(r'<lb/>\s*-\s*\d+\s*-\s*(?:\n|\Z)', '', text)
+
     return text
 
 
