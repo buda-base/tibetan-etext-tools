@@ -1528,6 +1528,64 @@ def _is_short_edge_run(frags, bbox, page_h: float) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Horizontal-page left-margin running-title marginalia
+#
+# Some horizontal (non-pecha) books print a running section title sideways
+# in the left margin, repeating the section heading in two or three scripts
+# -- e.g. a rotated Tibetan line, plus a CJK translation rendered as a stack
+# of individually-upright single-character "lines" (MuPDF reports each of
+# those with dir == (1,0) even though positionally they read top-to-bottom
+# as a column). Two distinct MuPDF line shapes therefore carry this
+# marginalia on an otherwise-horizontal page:
+#
+#   (a) genuinely rotated text -- dir far from (1,0);
+#   (b) upright text stacked one (or a couple of) character(s) per row, all
+#       confined to the same narrow x-band as (a).
+#
+# Detection must not fire on pages whose real body text legitimately starts
+# near the left edge -- e.g. a table-of-contents page-number column can sit
+# at a similar x0 to this margin band. So the filter only activates on a
+# page that already contains at least one clearly *rotated* line inside the
+# band; only then are the narrow same-band upright lines on THAT page also
+# dropped. Pages without a rotated marginalia line (TOC, colophon, ...) are
+# returned unchanged.
+# ---------------------------------------------------------------------------
+_LEFT_MARGIN_BAND_FRAC = 0.11          # x-band, as a fraction of page width
+_LEFT_MARGIN_MAX_LINE_WIDTH_PT = 20.0  # width of a "single-character stack" row
+
+
+def _strip_horizontal_page_left_margin_marginalia(
+    line_records: list[tuple], page_width: float
+) -> list[tuple]:
+    """
+    Drop left-margin running-title marginalia from a horizontal (non-pecha)
+    page's ``(y_mid, x0, fragments, direction, bbox)`` records.
+
+    No-op unless the page shows a genuinely rotated line inside the margin
+    band -- see the module comment above for why that guard exists.
+    """
+    band_x = page_width * _LEFT_MARGIN_BAND_FRAC
+
+    has_rotated_marginalia = any(
+        _line_is_vertical(direction) and bbox[0] < band_x
+        for (_y, _x, _f, direction, bbox) in line_records
+    )
+    if not has_rotated_marginalia:
+        return line_records
+
+    kept: list[tuple] = []
+    for rec in line_records:
+        _y, _x, _frags, direction, bbox = rec
+        in_band = bbox[0] < band_x and bbox[2] < band_x
+        if in_band and _line_is_vertical(direction):
+            continue  # rotated marginalia (a)
+        if in_band and (bbox[2] - bbox[0]) <= _LEFT_MARGIN_MAX_LINE_WIDTH_PT:
+            continue  # stacked single-character marginalia (b)
+        kept.append(rec)
+    return kept
+
+
+# ---------------------------------------------------------------------------
 # Landscape 2-up pecha spreads: stacked sub-page detection
 #
 # PyMuPDF's raw text coordinates for a page are reported in the PDF's
@@ -1695,7 +1753,41 @@ def _detect_column_splits(
     if not raw_lines:
         return []
 
-    x0_values = sorted(set(round(ln[1]) for ln in raw_lines))
+    # Build a frequency count of rounded x0 start positions.  A genuine
+    # column edge is shared by many lines; an isolated heading, running
+    # title, or folio number contributes a single distinct x0 value that can
+    # land between two real column clusters — fragmenting the one true
+    # inter-column gap into two smaller, spurious gaps, neither of which is
+    # the actual divider (see the "Multi-column layout detection" module
+    # comment above). Such an outlier line is usually also wide enough to
+    # physically span across the true gutter (a centred heading sits above
+    # *both* columns), so it must be excluded from every divider-finding
+    # computation below — not just the gap scan, but also the gutter-snap
+    # and crossing-count that follow — or it corrupts those the same way.
+    # "Clustered" lines (x0 shared by >= _COLUMN_MIN_BLOCKS_PER_SIDE lines)
+    # are used to *find* the divider; once found, it's applied to the full
+    # raw_lines list by the caller, so outlier lines still get assigned to
+    # whichever column they fall into — nothing is dropped from the output.
+    x0_counts: dict[float, int] = {}
+    for ln in raw_lines:
+        key = round(ln[1])
+        x0_counts[key] = x0_counts.get(key, 0) + 1
+
+    clustered_idx = [
+        i for i, ln in enumerate(raw_lines)
+        if x0_counts[round(ln[1])] >= _COLUMN_MIN_BLOCKS_PER_SIDE
+    ]
+    # Not enough clustered signal to trust the filter — fall back to using
+    # every line (old behaviour) rather than risk discarding real data.
+    if len(clustered_idx) < 2 * _COLUMN_MIN_BLOCKS_PER_SIDE:
+        clustered_idx = list(range(len(raw_lines)))
+
+    clustered_lines = [raw_lines[i] for i in clustered_idx]
+    clustered_spans = (
+        [line_spans[i] for i in clustered_idx] if line_spans is not None else None
+    )
+
+    x0_values = sorted(set(round(ln[1]) for ln in clustered_lines))
     if len(x0_values) < 2:
         return []
 
@@ -1726,8 +1818,8 @@ def _detect_column_splits(
     # the page is single-column.  This must run before the count check so a
     # page of full-width prose with varied indents is never treated as multi-
     # column (the bug that scrambled single-column reading order).
-    if line_spans is not None:
-        total = len(line_spans)
+    if clustered_spans is not None:
+        total = len(clustered_spans)
         kept: list[float] = []
         for div in candidate_splits:
             # Snap the divider into the actual whitespace gutter.  The gap was
@@ -1736,13 +1828,15 @@ def _detect_column_splits(
             # are wider than their indent gap).  The true divider sits between
             # the rightmost edge of the lines that start left of the candidate
             # and the leftmost start of the lines that begin right of it.
-            left_edges = [x1 for x0, x1 in line_spans if x0 < div]
-            right_starts = [x0 for x0, _x1 in line_spans if x0 >= div]
+            # Uses only clustered (non-outlier) spans — see comment above on
+            # why an outlier line must not influence this snap either.
+            left_edges = [x1 for x0, x1 in clustered_spans if x0 < div]
+            right_starts = [x0 for x0, _x1 in clustered_spans if x0 >= div]
             if left_edges and right_starts:
                 gutter = (max(left_edges) + min(right_starts)) / 2.0
             else:
                 gutter = div
-            crossing = sum(1 for x0, x1 in line_spans if x0 < gutter < x1)
+            crossing = sum(1 for x0, x1 in clustered_spans if x0 < gutter < x1)
             if total and (crossing / total) <= _COLUMN_MAX_CROSS_FRACTION:
                 kept.append(gutter)
         candidate_splits = sorted(kept)
@@ -2309,6 +2403,16 @@ def extract_pdf_hybrid(
                 continue  # skip the horizontal path for this page
 
             # ── Horizontal (standard) page ───────────────────────────────────
+            # Strip left-margin running-title marginalia (rotated + stacked-
+            # CJK) before building raw_lines, so it never enters the reading-
+            # order / column-detection pipeline. No-op on pages that lack the
+            # tell-tale rotated marginalia line (e.g. a front-matter TOC page
+            # whose page-number column legitimately starts near the same x —
+            # see _strip_horizontal_page_left_margin_marginalia).
+            line_records = _strip_horizontal_page_left_margin_marginalia(
+                line_records, page_width
+            )
+
             # Convert 5-tuples back to the 3-tuple form the rest of the
             # pipeline expects, rebuilding line_spans from the stored bboxes.
             raw_lines: list[tuple[float, float, list[str]]] = [
@@ -2390,4 +2494,4 @@ def extract_pdf_hybrid(
             try:
                 os.unlink(tmp_pdf)
             except OSError:
-                pass
+                pass
