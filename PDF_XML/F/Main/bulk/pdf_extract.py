@@ -2101,7 +2101,7 @@ def _extract_line_text_hybrid(
         canonical_fonts = font_normalization.get(clean_font) or font_normalization.get(raw_font_name)
         if canonical_fonts:
             # Use the first matched canonical font from the hash DB
-            target_font = list(canonical_fonts)[0] 
+            target_font = list(canonical_fonts)[0]
         else:
             # Fallback to alias map
             aliases = _get_font_name_aliases()
@@ -2115,7 +2115,7 @@ def _extract_line_text_hybrid(
                     continue
 
                 c = char_obj.get("c", "")
-                
+
                 # HYBRID DECODING: Pass PyMuPDF's char through pytiblegenc (memoized)
                 decoded_c = _decode_char_cached(c, target_font, glyph_lookup, stats)
 

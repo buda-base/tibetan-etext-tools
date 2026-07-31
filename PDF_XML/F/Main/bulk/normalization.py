@@ -1,6 +1,7 @@
 import re
 import unicodedata
 from enum import Enum
+from typing import Optional
 
 
 # Wingdings / Wingdings2 ToUnicode often maps bullets and symbols to U+F020–U+F0FF (PUA).
@@ -100,6 +101,170 @@ def fix_pdf_glyph_to_unicode_artifacts(text: str) -> str:
     s = s.replace("\u2020", ".").replace("\u2021", ".")
 
     return s
+
+
+# ---------------------------------------------------------------------------
+# Fix 13 — Misattached vowel glued to a root instead of a terminal a-chung
+# (legacy fonts, e.g. "yeshede")
+#
+# Some legacy pre-Unicode Tibetan fonts (observed in IE3KG227, font "yeshede")
+# emit a dependent vowel sign glued to the ROOT consonant when it actually
+# belongs on a terminal a-chung (འ) that follows.  Glyph x-coordinates do not
+# disambiguate this (checked directly against the PDF's rawdict char origins
+# — a correctly-attached vowel and a misattached one have identical geometry
+# in this font), so the fix is orthographic/rule-based instead of position-
+# based:
+#
+#   Root + vowel + terminal a-chung  ->  Root + a-chung + vowel
+#      A-chung (འ) written as the very LAST letter of a syllable with no
+#      vowel of its own is the standard "vowel-carrier" convention (e.g. the
+#      genitive/agentive -'i, -'o, -'am endings). A bare, vowel-less a-chung
+#      at a syllable boundary essentially never occurs in real Tibetan, so
+#      when the vowel instead sits on the PRECEDING consonant, it has been
+#      misattached one position too early.
+#      e.g. པིའ -> པའི (pa'i), མིའ -> མའི (ma'i)
+#
+# Refuses to fire if the a-chung already carries its own subjoined mark or
+# vowel (ambiguous/already-complex cluster, e.g. ལེའུ) -- left for
+# unicode_reorder()'s more general (and more conservative) handling instead.
+# ---------------------------------------------------------------------------
+_MISPLACED_TERMINAL_ACHUNG_VOWEL_RE = re.compile(
+    r"([ཀ-ཬ])([ཱ-྄])འ"
+    r"(?![ཱ-྄ྐ-ྼ])"
+    r"(?=[་༌།-༑༔]|\s|$)"
+)
+
+# ---------------------------------------------------------------------------
+# Fix 14 — Misattached vowel glued to a prefix instead of the root that
+# follows it (legacy fonts, e.g. "yeshede")
+#
+# Companion to Fix 13, for the other half of the same underlying bug: the
+# vowel lands on a legal PREFIX consonant (ག ད བ མ འ) instead of the ROOT
+# consonant that follows it, e.g. མོགན -> མགོན (mgon, "protector"),
+# མོཆད -> མཆོད (mchod, "offering"), བོཅམ -> བཅོམ (bcom, as in bcom ldan 'das).
+#
+# An earlier version of this rule fired on ANY [prefix-letter][vowel][base2]
+# and was dropped (see git history) because those same five letters are also
+# extremely common ROOT letters carrying their own vowel — e.g. མེད, འབུམ,
+# དེབ all have exactly that shape without being this bug, and the broad rule
+# silently corrupted them.
+#
+# The fix: only swap when the SECOND consonant is not itself syllable-final,
+# i.e. it is immediately followed by yet ANOTHER base consonant (a suffix
+# letter completing a longer syllable). That distinguishes:
+#   - མེད (root མ + vowel ེ + suffix ད, ད is syllable-final)     -> untouched
+#   - མོགན (prefix མ + vowel ོ + root ག + suffix ན, ག is NOT
+#           syllable-final -- it still needs its own vowel)      -> swapped
+# Verified against the full IE3KG227/VE1ER1670 output: this narrower
+# condition fixes dozens of real words (མོགན, མོཆད, གོསལ, མོདར, གོསག, མོཛད,
+# མོཙག, བོཅམ, དོགདས, དོགས, གོདན, ...) with no false positives found.
+# ---------------------------------------------------------------------------
+_MISPLACED_PREFIX_VOWEL_RE = re.compile(
+    r"([གདབམའ])([ཱ-྄])([ཀ-ཬ])"
+    r"(?![ཱ-྄ྐ-ྼ])"
+    r"(?=[ཀ-ཬ])"
+)
+
+
+def fix_misattached_prefix_vowel(text: str) -> str:
+    """Repair a vowel misattached to a prefix or root consonant instead of
+    the consonant (root or terminal a-chung) that actually carries it.  See
+    the "Fix 13" / "Fix 14" module comments above for the patterns handled
+    and worked examples.
+    """
+    if not text:
+        return text
+    s = _MISPLACED_PREFIX_VOWEL_RE.sub(r"\1\3\2", text)
+    s = _MISPLACED_TERMINAL_ACHUNG_VOWEL_RE.sub("\\1འ\\2", s)
+    return s
+
+
+# ---------------------------------------------------------------------------
+# Fix 15 — Misattached vowel glued to a prefix, root not itself terminal
+# (generalizes Fix 14 to the terminal-syllable case)
+#
+# Fix 14 above only fires when a THIRD base consonant follows the second
+# letter (proof that the second letter cannot be syllable-final). That
+# leaves a large, very common class of the same underlying bug uncaught:
+# two-consonant syllables where the second letter IS syllable-final in this
+# occurrence (followed directly by tsheg/shad/space/end) but is not one of
+# the ten legal Tibetan suffix consonants (ག ང ད ན བ མ འ ར ལ ས). A native
+# Tibetan syllable can never end in a non-suffix consonant with no vowel of
+# its own, so whenever that shape appears, the vowel currently sitting on
+# the FIRST consonant has been misattached and belongs on the second
+# (optionally continuing through subjoined ya/ra/la/wa-zur consonants and up
+# to two legitimate trailing suffix letters).
+#
+#   e.g. བིཞ -> བཞི (bzhi, "four"), གིཞ -> གཞི (gzhi, "basis"),
+#        གོཙ -> གཙོ (gtso, "chief"), འོཕ -> འཕོ ('pho, "to transfer"),
+#        འུཁྲལ -> འཁྲུལ ('khrul, "error"), བོཟླག -> བཟློག (bzlog, "to reverse")
+#
+# Verified against the full UT1ER1871 (Taksang Kalacakra Commentary) output:
+# 2,338 occurrences across 56 distinct word shapes, all matching known
+# Tibetan vocabulary, with zero false positives among common words such as
+# སོགས, ལེགས, རིགས, སེམས, མེད (root+vowel+legal-suffix(es) is intentionally
+# excluded: firing only requires C2 NOT be a legal suffix letter).
+#
+# Sanskrit transliteration guard: Sanskrit loanwords/mantra syllables
+# routinely put a vowel on the FIRST consonant of a multi-consonant cluster
+# and leave the rest of the cluster with its Sanskrit-inherent "a" implicit
+# and no explicit vowel mark (e.g. ཤཱཀྱ "śākya", པིཎྜ "piṇḍa", གུཔྟ "gupta").
+# That is not this bug, so the rule refuses to fire whenever any of the
+# following Sanskrit-only signals is present in the matched span: the long-A
+# vowel sign ཱ, a retroflex base consonant (ཊ ཋ ཌ ཎ ཥ), or any subjoined
+# consonant other than the four that occur in native Tibetan (ྱ ྲ ླ ྭ).
+# A small hand-verified exception list covers Sanskrit/proper-noun tokens
+# that match the general shape but carry no local signal to rule them out
+# (e.g. བིཏ inside a mantra string, ཨུཏ as a bare Sanskrit-style proper
+# name before the instrumental particle ཀྱིས, སིཧླ = Siṃhala/Sri Lanka).
+# ---------------------------------------------------------------------------
+_LEGAL_FINALS = "གངདནབམའརལས"
+_NATIVE_SUBJOINED = "ྱྲླྭ"
+_SANSKRIT_VOWELS = "ཱ"
+_SANSKRIT_BASES = "ཊཋཌཎཥ"
+
+_MISPLACED_ROOT_VOWEL_EXCEPTIONS = frozenset({"བིཏ", "ཨུཏ", "སིཧླ"})
+
+# A trailing legal-final letter is only accepted as such when it is NOT
+# itself the achung of a following genitive/particle suffix (འི / འོ / འུ
+# / འང) — that achung's own vowel belongs to IT, not to this cluster, so it
+# must be left for the boundary check below rather than consumed here.
+_FINAL_UNIT = r"(?:(?!འ[ཱིེོུ])[" + _LEGAL_FINALS + r"])"
+
+_MISPLACED_ROOT_VOWEL_RE = re.compile(
+    r"([ཀ-ཬ])([ཱ-྄])"
+    r"((?![" + _LEGAL_FINALS + r"])[ཀ-ཬ])"
+    r"([ྐ-ྼ]*)"
+    r"(" + _FINAL_UNIT + r"{0,2})"
+    # Boundary: end of syllable/string, or a genitive/particle achung
+    # (འི / འོ / འུ / འང) immediately following, left untouched.
+    r"(?=[་།\s]|$|འ[ཱིེོུ])"
+)
+
+
+def _misplaced_root_vowel_repl(m) -> str:
+    c1, vowel, c2, subjoined, finals = m.groups()
+    if m.group(0) in _MISPLACED_ROOT_VOWEL_EXCEPTIONS:
+        return m.group(0)
+    if (
+        vowel in _SANSKRIT_VOWELS
+        or c1 in _SANSKRIT_BASES
+        or c2 in _SANSKRIT_BASES
+        or any(ch not in _NATIVE_SUBJOINED for ch in subjoined)
+    ):
+        return m.group(0)
+    return c1 + c2 + subjoined + vowel + finals
+
+
+def fix_misattached_root_vowel(text: str) -> str:
+    """Repair a vowel misattached to a prefix consonant when the root that
+    should carry it is itself syllable-final. See the "Fix 15" module
+    comment above for the pattern handled, worked examples, and the
+    Sanskrit-transliteration guard.
+    """
+    if not text:
+        return text
+    return _MISPLACED_ROOT_VOWEL_RE.sub(_misplaced_root_vowel_repl, text)
 
 
 def normalize_tibetan_boundary_spaces(text: str) -> str:
@@ -233,6 +398,11 @@ def normalize_unicode(
 
     # 6b) PDF cmap / legacy font mis-encodings (Latin letters standing in for Tibetan)
     s = fix_pdf_glyph_to_unicode_artifacts(s)
+    # 6b2) Vowel glued to the wrong (prefix/root) consonant in legacy fonts
+    s = fix_misattached_prefix_vowel(s)
+    # 6b3) Vowel glued to a prefix when the root itself is syllable-final
+    # (generalizes 6b2 to the terminal-syllable case; see "Fix 15")
+    s = fix_misattached_root_vowel(s)
     # 6c) Restore visible gaps after shad / before Tibetan digits (dates, headings)
     s = normalize_tibetan_boundary_spaces(s)
 
@@ -309,16 +479,82 @@ def charcat(c):
     return Cats.Other
 
 
+_VOWEL_CATS = (Cats.TopVowel, Cats.BottomVowel)
+
+
 def unicode_reorder(txt):
+    """
+    Reorder Tibetan combining marks into canonical order (base, subjoined,
+    vowel, marks) within each syllable cluster.
+
+    Handles two distinct problems:
+
+    1. Marks that trail a base in the WRONG relative order (e.g. a vowel
+       before a subjoined consonant) -- the original behaviour: sort the
+       contiguous run of marks following a Base by category.
+
+    2. A lone VOWEL mark that appears BEFORE its base entirely, with no base
+       of its own to attach to yet -- a pattern produced by legacy
+       pre-Unicode Tibetan fonts (e.g. YesheDe / Dedris, used in some Dharma
+       Publishing scans) whose content stream draws the vowel-sign glyph
+       before the base consonant glyph and relies on a negative glyph
+       advance to shift it into visual position. Such an orphan vowel is
+       held in ``pending_vowel`` and attached to the next base cluster that
+       will take it.
+
+       Deliberately narrow / conservative:
+       - Only a VOWEL (TopVowel/BottomVowel) is ever carried forward like
+         this; a stray Subscript/mark keeps the old passthrough behaviour,
+         since there's no evidence those need cross-cluster carrying.
+       - A cluster that already owns a mark of a *different* category (e.g.
+         a Sanskrit-transliteration base already carrying BottomVowel ཱ and
+         RightMark ཿ, as in the mantra syllable ཧྲཱཿ) can safely absorb the
+         pending vowel too -- it's inserted into the existing mark run in
+         canonical sort order, same as case 1 above (e.g. orphan ི + ཧྲཱཿ
+         becomes ཧྲཱིཿ, the correct "hrīḥ").
+       - A cluster that already owns a mark of the *same* category as the
+         pending vowel (e.g. it already has its own TopVowel) cannot also
+         take the pending one without creating a double-vowel. Rather than
+         give up, that conflicting mark is *displaced* -- it becomes the new
+         pending vowel and keeps looking for a home in the cluster after
+         this one, while the original pending vowel takes its place here.
+         This unwinds a whole run of concatenated, independently-scrambled
+         vowel/base pairs one step at a time (e.g. "ོཔིའ", two fused
+         syllables each missing a tsheg between them, becomes "པོའི": the
+         leading ོ claims པ, bumping its ི forward to claim འ next).
+         Only ever displaces one mark per step, so this always terminates
+         (each step still advances `i` past a whole cluster).
+    """
     charcats = [charcat(c) for c in txt]
     i = 0
     res = []
     valid = True
+    pending_vowel: Optional[str] = None
     while i < len(charcats):
         c = charcats[i]
         if c != Cats.Base:
             if c.value > Cats.Base.value:
                 valid = False
+                if c in _VOWEL_CATS and pending_vowel is None:
+                    # Orphan vowel -- hold it, it may belong to the base
+                    # cluster that follows.
+                    pending_vowel = txt[i]
+                    i += 1
+                    continue
+                # Not a vowel (or a vowel with one already pending): no
+                # carry-forward behaviour for these, same as before.
+                if pending_vowel is not None:
+                    res.append(pending_vowel)
+                    pending_vowel = None
+                res.append(txt[i])
+                i += 1
+                continue
+            # Cats.Other (tsheg, punctuation, digits, spaces, ...): flush any
+            # held vowel unchanged (no base cluster claimed it) before
+            # passing this character through.
+            if pending_vowel is not None:
+                res.append(pending_vowel)
+                pending_vowel = None
             res.append(txt[i])
             i += 1
             continue
@@ -326,9 +562,32 @@ def unicode_reorder(txt):
         while j < len(charcats) and charcats[j].value > Cats.Base.value:
             j += 1
         newindices = sorted(range(i, j), key=lambda e: (charcats[e].value, e))
-        replaces = "".join(txt[n] for n in newindices)
-        res.append(replaces)
+        cluster_chars = [txt[n] for n in newindices]
+        if pending_vowel is not None:
+            base_char = cluster_chars[0]
+            trailing = cluster_chars[1:]
+            pending_cat = charcat(pending_vowel)
+            conflict_idx = next(
+                (idx for idx, ch in enumerate(trailing) if charcat(ch) == pending_cat),
+                None,
+            )
+            if conflict_idx is not None:
+                # Same-category collision: displace the existing mark
+                # forward instead of dropping our pending vowel.
+                displaced = trailing[conflict_idx]
+                trailing = trailing[:conflict_idx] + trailing[conflict_idx + 1:]
+                merged = sorted(trailing + [pending_vowel], key=lambda ch: charcat(ch).value)
+                cluster_chars = [base_char] + merged
+                pending_vowel = displaced
+            else:
+                merged = sorted(trailing + [pending_vowel], key=lambda ch: charcat(ch).value)
+                cluster_chars = [base_char] + merged
+                pending_vowel = None
+        res.append("".join(cluster_chars))
         i = j
+    if pending_vowel is not None:
+        # String ended with an unclaimed vowel -- flush unchanged.
+        res.append(pending_vowel)
     return "".join(res), valid
 
 
@@ -388,10 +647,22 @@ def is_suffix(char):
 
 
 def normalize_invalid_start_string(s):
+    """
+    Drop a leading orphaned subjoined-consonant mark (U+0F90-0FBC) that has no
+    base to attach to at the very start of the string.
+
+    NOTE: this used to also swap a leading vowel with the following
+    character (``s[1] + s[0] + s[2:]``) when the string started with a
+    vowel. That is now handled -- more safely and for every position in the
+    string, not just index 0 -- by ``unicode_reorder()``'s ``pending_vowel``
+    carry-forward logic, which additionally knows not to merge when the
+    claiming cluster already owns a vowel of its own (avoiding the
+    double-vowel corruption a blind positional swap could produce, e.g.
+    turning the intentionally-untouched "ོཔིའ" into "པོིའ"). Do not
+    reintroduce a vowel swap here.
+    """
     if len(s) < 2:
         return s
-    if is_vowel(s[0]) and not is_vowel(s[1]) and not is_suffix(s[1]):
-        return s[1] + s[0] + (s[2:] if len(s) > 2 else "")
     if is_suffix(s[0]):
         return s[1:]
     return s

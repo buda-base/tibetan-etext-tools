@@ -766,6 +766,46 @@ def assign_pdf_to_ve(ve_ids: list, pdf_list: list) -> dict:
     return dict(zip(ve_ids, chunks))
 
 
+def _dedupe_prefer_patched(pdf_paths: list) -> list:
+    """
+    Collapse ``name.pdf`` / ``name.patched.pdf`` pairs to a single entry,
+    preferring the pdf-cmap-fix output.
+
+    ``pdf_extract``'s ``*.pdf`` glob matches both the original PDF and any
+    ``*.patched.pdf`` sitting next to it in the same ``to_convert`` folder,
+    so without this both get processed as separate "volumes" — the raw
+    original produces a second, un-fixed, garbled XML alongside the correct
+    one (and roughly doubles conversion time). Group by (parent dir, stem
+    with a trailing ``.patched`` stripped) and keep only the patched file
+    when both exist.
+    """
+    groups: dict[tuple, dict] = {}
+    order: list[tuple] = []
+    for p in pdf_paths:
+        name = p.name
+        if name.lower().endswith(".patched.pdf"):
+            key = (p.parent, name[: -len(".patched.pdf")].lower())
+            kind = "patched"
+        else:
+            key = (p.parent, p.stem.lower())
+            kind = "raw"
+        if key not in groups:
+            groups[key] = {}
+            order.append(key)
+        groups[key][kind] = p
+
+    result = []
+    for key in order:
+        entry = groups[key]
+        if "patched" in entry and "raw" in entry:
+            logger.info(
+                f"  Skipping raw original '{entry['raw'].name}' — using "
+                f"pdf-cmap-fix output '{entry['patched'].name}' instead."
+            )
+        result.append(entry.get("patched") or entry.get("raw"))
+    return natsorted(result, key=lambda p: str(p))
+
+
 def build_pdf_by_ve(
     ve_filter: Optional[str] = None,
     assign_flat_via_toprocess: bool = False,
@@ -779,18 +819,26 @@ def build_pdf_by_ve(
     - **Flat** ``to_convert/*.pdf``: only processed if ``assign_flat_via_toprocess`` is True and
       ``ve_ids_for_flat`` is non-empty; otherwise skipped with a short log (put PDFs under
       ``to_convert/<VE_ID>/`` instead).
+
+    When both ``name.pdf`` and ``name.patched.pdf`` (a pdf-cmap-fix output) are
+    present in the same directory, only the patched one is kept — see
+    ``_dedupe_prefer_patched``.
     """
     pdf_by_ve: dict = {}
     if not SOURCES_DIR.exists():
         return pdf_by_ve
 
     ve_ids_for_flat = list(ve_ids_for_flat or [])
-    flat_pdfs = natsorted(SOURCES_DIR.glob("*.pdf"), key=lambda p: p.name)
+    flat_pdfs = _dedupe_prefer_patched(
+        natsorted(SOURCES_DIR.glob("*.pdf"), key=lambda p: p.name)
+    )
 
     for item in natsorted([p for p in SOURCES_DIR.iterdir() if p.is_dir()], key=lambda p: p.name):
         if ve_filter and item.name != ve_filter:
             continue
-        pdfs_in_folder = natsorted(item.rglob("*.pdf"), key=lambda p: str(p))
+        pdfs_in_folder = _dedupe_prefer_patched(
+            natsorted(item.rglob("*.pdf"), key=lambda p: str(p))
+        )
         if not pdfs_in_folder:
             continue
         folder_ve = item.name
@@ -971,13 +1019,50 @@ def convert_pdf_to_tei(pdf_path: Path, ve_id: str, sequence: int) -> str:
     return tei_xml
 
 
+def _original_sibling(pdf_path: Path) -> Optional[Path]:
+    """
+    For a pdf-cmap-fix output ``name.patched.pdf``, return the sibling
+    original ``name.pdf`` in the same directory if it exists, else None.
+
+    ``_dedupe_prefer_patched()`` deliberately keeps only the patched file for
+    *conversion* (converting both would double the work and produce a second,
+    un-fixed, garbled XML) — but ``sources/`` should still preserve both the
+    original and the patched copy so the unmodified source is never lost.
+    """
+    name = pdf_path.name
+    if not name.lower().endswith(".patched.pdf"):
+        return None
+    sibling = pdf_path.with_name(name[: -len(".patched.pdf")] + ".pdf")
+    return sibling if sibling.exists() else None
+
+
 def copy_sources_to_output(ve_id: str, pdf_files: list):
-    """Copy input PDFs to output; copy matching DOC from toprocess when present."""
+    """
+    Copy input PDFs to output; copy matching DOC from toprocess when present.
+
+    For a converted ``name.patched.pdf``, also copies its unpatched sibling
+    ``name.pdf`` (if present in to_convert/) so ``sources/<VE_ID>/`` ends up
+    with both the original and the patched file — even though only the
+    patched one was actually used for conversion.
+    """
     sources_ve_dir = SOURCES_OUTPUT_DIR / ve_id
     sources_ve_dir.mkdir(parents=True, exist_ok=True)
 
     doc_copied_count = 0
     pdf_copied_count = 0
+    copied_names: set[str] = set()
+
+    def _copy_pdf(path: Path) -> None:
+        nonlocal pdf_copied_count
+        if path.name in copied_names or not path.exists():
+            return
+        pdf_dest = sources_ve_dir / path.name
+        try:
+            shutil.copy2(path, pdf_dest)
+            pdf_copied_count += 1
+            copied_names.add(path.name)
+        except Exception as e:
+            logger.warning(f"Failed to copy PDF {path.name}: {e}")
 
     for pdf_path in pdf_files:
         doc_path = find_source_doc_file(pdf_path, ve_id)
@@ -989,13 +1074,11 @@ def copy_sources_to_output(ve_id: str, pdf_files: list):
             except Exception as e:
                 logger.warning(f"Failed to copy source DOC {doc_path.name}: {e}")
 
-        if pdf_path.exists():
-            pdf_dest = sources_ve_dir / pdf_path.name
-            try:
-                shutil.copy2(pdf_path, pdf_dest)
-                pdf_copied_count += 1
-            except Exception as e:
-                logger.warning(f"Failed to copy PDF {pdf_path.name}: {e}")
+        _copy_pdf(pdf_path)
+
+        original = _original_sibling(pdf_path)
+        if original is not None:
+            _copy_pdf(original)
 
     logger.info(f"  Copied {doc_copied_count} DOC and {pdf_copied_count} PDF files to sources/{ve_id}/")
 
@@ -1021,6 +1104,21 @@ def _resolve_ve_for_single(explicit_ve: Optional[str]) -> Optional[str]:
         "or use to_convert/<VE_ID>/file.pdf."
     )
     return None
+
+
+def _xml_filename_for_source(ut_id: str, pdf_path: Path) -> str:
+    """
+    Output XML filename for *pdf_path* — always plain ``UT..._NNNN.xml``,
+    regardless of whether the converted PDF was the pdf-cmap-fix
+    ``name.patched.pdf`` or the original ``name.pdf``.
+
+    ``to_convert/<VE_ID>/`` can hold both (see ``_dedupe_prefer_patched``),
+    and ``sources/<VE_ID>/`` keeps copies of both so the original is never
+    lost — but the archive XML filename itself does not carry a ``.patched``
+    tag (kept as a passthrough helper so both call sites stay in sync if
+    this needs to change again).
+    """
+    return f"{ut_id}.xml"
 
 
 def convert_single_file(relative_path: str, ve_id: Optional[str], sequence: Optional[int]):
@@ -1076,7 +1174,7 @@ def convert_single_file(relative_path: str, ve_id: Optional[str], sequence: Opti
     archive_ve_dir = ARCHIVE_DIR / ve_id
     archive_ve_dir.mkdir(parents=True, exist_ok=True)
 
-    xml_path = archive_ve_dir / f"{ut_id}.xml"
+    xml_path = archive_ve_dir / _xml_filename_for_source(ut_id, pdf_path)
     with open(xml_path, "w", encoding="utf-8") as f:
         f.write(tei_xml)
 
@@ -1166,7 +1264,7 @@ def convert_all_files(
             try:
                 tei_xml = convert_pdf_to_tei(pdf_path, ve_id, sequence)
 
-                xml_path = archive_ve_dir / f"{ut_id}.xml"
+                xml_path = archive_ve_dir / _xml_filename_for_source(ut_id, pdf_path)
                 with open(xml_path, "w", encoding="utf-8") as f:
                     f.write(tei_xml)
 

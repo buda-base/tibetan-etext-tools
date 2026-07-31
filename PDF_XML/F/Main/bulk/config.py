@@ -28,6 +28,7 @@ checkpoint paths are nested under ``<BASE_DIR>/logs/<IE_ID>/`` and
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 from typing import Optional
 
@@ -129,10 +130,18 @@ def get_max_archive_sequence(ve_id: str) -> int:
         return 0
     sequences = []
     for path in archive_ve.glob("UT*.xml"):
-        parts = path.stem.split("_")
-        if len(parts) >= 2:
+        # path.name examples: "UT1ER1401_0001.xml", "UT1ER1401_0001.patched.xml"
+        # Path.stem only strips the final ".xml", so a trailing ".patched"
+        # tag (see _xml_filename_for_source) would land in the sequence
+        # segment and fail int() silently, undercounting the max sequence
+        # and risking a collision on the next converted file. Match the
+        # leading run of digits right after the last underscore instead of
+        # relying on stem-splitting, so any trailing ".patched"/other tag
+        # is ignored.
+        m = re.match(r".*_(\d+)", path.stem)
+        if m:
             try:
-                sequences.append(int(parts[-1]))
+                sequences.append(int(m.group(1)))
             except ValueError:
                 pass
     return max(sequences, default=0)
