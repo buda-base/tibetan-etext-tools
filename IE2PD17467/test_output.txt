@@ -1,0 +1,6 @@
+འགྲོ-བའི་ -> འགྲོ་བའི་
+  Match found at pos 3-6
+གྱུར-པས་ -> གྱུར་པས་
+  Match found at pos 3-6
+ཕྱི-ནང་ -> ཕྱི་ནང་
+  Match found at pos 2-5

@@ -280,3 +280,10 @@ When making changes:
 2. Test against Word output: `python test_word_comparison.py`
 3. Verify TEI XML is well-formed: `xmllint --noout output.xml`
 
+
+
+
+
+
+
+

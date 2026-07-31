@@ -1,0 +1,4 @@
+Tsheg character in code: '་'
+Unicode codepoint: U+0F0B
+Expected tsheg: U+0F0B
+Match: True
